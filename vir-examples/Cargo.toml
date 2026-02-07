@@ -1,0 +1,12 @@
+[package]
+name = "vir-examples"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+vir = { path = "../vir" }
+ash = { workspace = true }
+winit = { workspace = true }
+raw-window-handle = "0.6.0"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
