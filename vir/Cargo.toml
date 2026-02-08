@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 ash = { workspace = true }
 tracing = { workspace = true }
+bitflags = { workspace = true }

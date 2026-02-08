@@ -2,12 +2,13 @@ use std::sync::Arc;
 
 use ash::{khr, vk};
 
-use crate::{
-    allocator::{frame::SuperFrameAllocator, persistent::PersistentAllocator},
-    resource::swapchain::SwapChain,
-};
+pub mod command_buffer;
 
-pub struct Runtime {
+pub use command_buffer::CommandBuffer;
+
+use crate::{PersistentAllocator, SuperFrameAllocator, SwapChain};
+
+pub struct Context {
     device: Arc<ash::Device>,
     physical_device: vk::PhysicalDevice,
     instance: Arc<ash::Instance>,
@@ -15,7 +16,7 @@ pub struct Runtime {
     surface_loader: khr::surface::Instance,
 }
 
-impl Runtime {
+impl Context {
     pub fn new(
         device: Arc<ash::Device>, physical_device: vk::PhysicalDevice, instance: Arc<ash::Instance>, entry: &ash::Entry,
     ) -> Self {

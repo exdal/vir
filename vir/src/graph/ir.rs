@@ -1,4 +1,17 @@
 use ash::vk;
+use bitflags::bitflags;
+
+use crate::{DomainFlag, Image, PassCallback};
+
+bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct Access: u64 {
+        const None = 0;
+        const ColorRead = 1 << 0;
+        const ColorWrite = 1 << 1;
+        const ColorRW = Self::ColorRead.bits() | Self::ColorWrite.bits();
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ValueId(pub u32);
@@ -8,20 +21,56 @@ pub enum Constant {
     U32(u32),
     Extent2D(vk::Extent2D),
     Extent3D(vk::Extent3D),
-    Format(vk::Format),
-    ImageLayout(vk::ImageLayout),
 }
 
 pub enum IR {
     Constant(Constant),
 
     // Construct ops
-    ConstructImage {
+    ConstructBuffer {
         result: ValueId,
-        extent: ValueId,
+        size: ValueId,
     },
 
-    AcquireSwapChain(vk::SwapchainKHR),
+    ConstructImage {
+        result: ValueId,
+        image: Image,
+        image_view: vk::ImageView,
+        extent: ValueId,
+        format: vk::Format,
+        samples: vk::SampleCountFlags,
+        base_mip: ValueId,
+        mip_count: ValueId,
+        base_layer: ValueId,
+        layer_count: ValueId,
+    },
+
+    // Acquire ops
+    AcquireSwapChain {
+        result: ValueId,
+        swapchain: vk::SwapchainKHR,
+    },
+
+    Acquire {
+        result: ValueId,
+        resource: ValueId,
+        access: Access,
+    },
+
+    Release {
+        resource: ValueId,
+        src_domain: DomainFlag,
+        dst_domain: DomainFlag,
+    },
+
+    // Pass ops
+    CallOpaque {
+        result: ValueId,
+        args: Vec<ValueId>,
+        returns: Vec<ValueId>,
+        callback: PassCallback,
+        domain: DomainFlag,
+    },
 }
 
 // %attach = ImageAttachment %swap_attachment COLOR_RW

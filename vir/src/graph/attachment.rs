@@ -2,12 +2,12 @@
 
 use ash::vk;
 
-use crate::resource::image::Image;
+use crate::Image;
 
 #[derive(Default)]
 pub struct ImageAttachment {
     image: Image,
-    image_view: Option<vk::ImageView>,
+    image_view: vk::ImageView,
     format: vk::Format,
     extent: vk::Extent3D,
     layout: vk::ImageLayout,
@@ -18,7 +18,7 @@ impl ImageAttachment {
     pub fn new(image: Image, format: vk::Format, extent: vk::Extent3D, layout: vk::ImageLayout) -> Self {
         Self {
             image,
-            image_view: None,
+            image_view: vk::ImageView::null(),
             format,
             extent,
             layout,
@@ -27,7 +27,7 @@ impl ImageAttachment {
     }
 
     pub fn with_image_view(mut self, image_view: vk::ImageView) -> Self {
-        self.image_view = Some(image_view);
+        self.image_view = image_view;
         self
     }
 

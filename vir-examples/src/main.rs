@@ -4,12 +4,7 @@ use std::{error::Error, ffi::CStr, result::Result};
 
 use ash::{Entry, khr, vk};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
-use vir::{
-    allocator::AllocatorKind,
-    graph::attachment::ImageAttachment,
-    resource::{image::Image, swapchain::SwapChain},
-    runtime::Runtime,
-};
+use vir::{AllocatorKind, Context, Image, ImageAttachment, SwapChain};
 pub use winit;
 use winit::{
     application::ApplicationHandler,
@@ -94,7 +89,7 @@ struct App {
     ash_entry: Option<ash::Entry>,
     window: Option<Window>,
     swapchain: SwapChain,
-    runtime: Option<Runtime>,
+    runtime: Option<Context>,
     persistent_allocator: Option<AllocatorKind>,
 }
 
@@ -158,7 +153,7 @@ impl App {
             .set_features(features)
             .build(&instance, &physical_device)?;
 
-        let runtime = Runtime::new(device.into(), physical_device.handle, instance.into(), &ash_entry);
+        let runtime = Context::new(device.into(), physical_device.handle, instance.into(), &ash_entry);
         self.window = Some(window);
         self.ash_entry = Some(ash_entry);
         self.persistent_allocator = Some(AllocatorKind::Persistent(runtime.create_persistent_allocator()));
@@ -206,10 +201,7 @@ impl App {
         )
     }
 
-    fn run(&mut self) {
-        let device = self.runtime.as_mut().unwrap().device();
-
-    }
+    fn run(&mut self) { let device = self.runtime.as_mut().unwrap().device(); }
 }
 
 impl ApplicationHandler for App {

@@ -3,7 +3,10 @@ use ash::vk;
 pub mod frame;
 pub mod persistent;
 
-use self::{frame::FrameAllocator, persistent::PersistentAllocator};
+pub use self::{
+    frame::{FrameAllocator, SuperFrameAllocator},
+    persistent::PersistentAllocator,
+};
 
 pub trait Allocator {
     fn allocate_binary_semaphore(&mut self) -> Result<vk::Semaphore, vk::Result>;

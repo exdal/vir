@@ -6,8 +6,8 @@ use crate::{allocator::AllocatorKind, graph::attachment::ImageAttachment};
 pub struct SwapChain {
     pub handle: vk::SwapchainKHR,
     pub surface: vk::SurfaceKHR,
-    semaphores: Vec<vk::Semaphore>,
-    attachments: Vec<ImageAttachment>,
+    pub semaphores: Vec<vk::Semaphore>,
+    pub attachments: Vec<ImageAttachment>,
 }
 
 impl SwapChain {
