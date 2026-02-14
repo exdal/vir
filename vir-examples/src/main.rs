@@ -189,7 +189,13 @@ impl App {
                     .width(swapchain_extent.width)
                     .height(swapchain_extent.height);
 
-                ImageAttachment::new(image, swapchain_format, extent, vk::ImageLayout::UNDEFINED)
+                ImageAttachment::new(
+                    image,
+                    swapchain_format,
+                    extent,
+                    vk::SampleCountFlags::TYPE_1,
+                    vk::ImageLayout::UNDEFINED,
+                )
             })
             .collect::<Vec<_>>();
 

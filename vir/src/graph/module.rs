@@ -39,6 +39,8 @@ impl Module {
 
     fn lower_i32(&mut self, v: i32) -> ValueId { self.lower_constant(ir::Constant::I32(v)) }
 
+    fn lower_array(&mut self, v: Vec<ValueId>) -> ValueId { self.emit(IR::Array(v)) }
+
     fn lower_image_attachment(&mut self, attachment: &ImageAttachment) -> ValueId {
         let extent = self.lower_constant(ir::Constant::Extent3D(attachment.extent()));
         let base_level = self.lower_u32(attachment.base_level());
@@ -59,7 +61,18 @@ impl Module {
         })
     }
 
-    fn acquire_swapchain(&mut self, swapchain: &SwapChain) {}
+    fn acquire_swapchain(&mut self, swapchain: &SwapChain) -> ValueId {
+        let attach_values = swapchain
+            .attachments
+            .iter()
+            .map(|attach| self.lower_image_attachment(attach))
+            .collect::<Vec<_>>();
+        let attachments = self.lower_array(attach_values);
+        self.emit(IR::AcquireSwapChain {
+            swapchain: swapchain.handle,
+            attachments,
+        })
+    }
 }
 
 pub fn acquire_swapchain(swapchain: &SwapChain) { MODULE.with_borrow_mut(|x| x.acquire_swapchain(swapchain)); }
