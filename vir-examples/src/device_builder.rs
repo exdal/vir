@@ -57,6 +57,16 @@ impl InstanceBuilder {
         self
     }
 
+    #[cfg(target_os = "linux")]
+    pub fn require_surface_extensions(self) -> Self {
+        self.require_extension(khr::wayland_surface::NAME.to_owned())
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn require_surface_extensions(self) -> Self {
+        self.require_extension(khr::win32_surface::NAME.to_owned())
+    }
+
     pub fn build(&self, entry: &ash::Entry) -> Result<ash::Instance, vk::Result> {
         let app_info = vk::ApplicationInfo::default()
             .application_name(self.app_name.as_c_str())

@@ -110,7 +110,7 @@ impl App {
             .require_extension(khr::get_surface_capabilities2::NAME.to_owned())
             .require_extension(get_surface_extension(Some(raw_window_handle))?.to_owned())
             .require_extension(khr::get_physical_device_properties2::NAME.to_owned())
-            .require_extension(khr::wayland_surface::NAME.to_owned())
+            .require_surface_extensions()
             .set_app_name(c"Example".to_owned())
             .set_app_version(0, 0, 0)
             .set_engine_name(c"vir".to_owned())

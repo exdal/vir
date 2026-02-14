@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use ash::vk::{self};
+use ash::vk;
 
 use super::{Allocator, persistent::PersistentAllocator};
 
