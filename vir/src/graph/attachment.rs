@@ -10,17 +10,21 @@ pub struct ImageAttachment {
     image_view: vk::ImageView,
     format: vk::Format,
     extent: vk::Extent3D,
+    samples: vk::SampleCountFlags,
     layout: vk::ImageLayout,
     subresource: vk::ImageSubresourceRange,
 }
 
 impl ImageAttachment {
-    pub fn new(image: Image, format: vk::Format, extent: vk::Extent3D, layout: vk::ImageLayout) -> Self {
+    pub fn new(
+        image: Image, format: vk::Format, extent: vk::Extent3D, samples: vk::SampleCountFlags, layout: vk::ImageLayout,
+    ) -> Self {
         Self {
             image,
             image_view: vk::ImageView::null(),
             format,
             extent,
+            samples,
             layout,
             subresource: vk::ImageSubresourceRange::default(),
         }
@@ -35,6 +39,16 @@ impl ImageAttachment {
         self.subresource = subresource;
         self
     }
+
+    pub fn image(&self) -> &Image { &self.image }
+
+    pub fn image_view(&self) -> vk::ImageView { self.image_view }
+
+    pub fn format(&self) -> vk::Format { self.format }
+
+    pub fn extent(&self) -> vk::Extent3D { self.extent }
+
+    pub fn samples(&self) -> vk::SampleCountFlags { self.samples }
 
     pub fn base_level(&self) -> u32 { self.subresource.base_mip_level }
 

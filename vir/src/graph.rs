@@ -1,6 +1,7 @@
 pub mod attachment;
 pub mod executor;
 pub mod ir;
+pub mod module;
 pub mod pass;
 
 pub use attachment::ImageAttachment;
