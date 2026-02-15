@@ -1,7 +1,7 @@
 use ash::vk;
 use bitflags::bitflags;
 
-use crate::{DomainFlag, Image, PassCallback};
+use crate::{DomainFlag, PassCallback};
 
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -22,6 +22,11 @@ pub enum Constant {
     U32(u32),
     Extent2D(vk::Extent2D),
     Extent3D(vk::Extent3D),
+}
+
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+pub enum Variable {
+    U32(u32),
 }
 
 pub enum IR {
@@ -53,6 +58,10 @@ pub enum IR {
         attachments: ValueId,
     },
 
+    AcquireNextImage {
+        swapchain: ValueId,
+    },
+
     Acquire {
         resource: ValueId,
         access: Access,
@@ -61,7 +70,6 @@ pub enum IR {
     Release {
         resource: ValueId,
         access: Access,
-        src_domain: DomainFlag,
         dst_domain: DomainFlag,
     },
 
@@ -72,4 +80,9 @@ pub enum IR {
         callback: PassCallback,
         domain: DomainFlag,
     },
+
+    Clear {
+        attachment: ValueId,
+        color: vk::ClearValue,
+    }
 }

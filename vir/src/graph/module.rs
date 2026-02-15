@@ -1,14 +1,28 @@
 use std::{cell::RefCell, collections::HashMap};
 
-use crate::{IR, ImageAttachment, SwapChain, ValueId, graph::ir};
+use crate::{Access, DomainFlag, IR, ImageAttachment, SwapChain, ValueId, graph::ir};
 
 thread_local! {
     static MODULE: RefCell<Module> = RefCell::new(Module::default());
 }
 
+pub struct Value {
+    ir: IR,
+    deps: Vec<ValueId>,
+}
+
+impl Value {
+    pub fn new(ir: IR) -> Self {
+        Self {
+            ir,
+            deps: Vec::default(),
+        }
+    }
+}
+
 struct Module {
     constants: HashMap<ir::Constant, ValueId>,
-    nodes: Vec<IR>,
+    nodes: Vec<Value>,
 }
 
 impl Module {
@@ -19,9 +33,11 @@ impl Module {
         }
     }
 
+    fn add_dep(&mut self, src: ValueId, dep: ValueId) { self.nodes[src.0 as usize].deps.push(dep); }
+
     fn emit(&mut self, ir: IR) -> ValueId {
         let id = ValueId(self.nodes.len() as u32);
-        self.nodes.push(ir);
+        self.nodes.push(Value::new(ir));
         id
     }
 
@@ -61,7 +77,7 @@ impl Module {
         })
     }
 
-    fn acquire_swapchain(&mut self, swapchain: &SwapChain) -> ValueId {
+    fn lower_acquire_swapchain(&mut self, swapchain: &SwapChain) -> ValueId {
         let attach_values = swapchain
             .attachments
             .iter()
@@ -73,6 +89,28 @@ impl Module {
             attachments,
         })
     }
+
+    fn lower_acquire_next_image(&mut self, swapchain: ValueId) -> ValueId {
+        self.emit(IR::AcquireNextImage { swapchain })
+    }
+
+    fn lower_release(&mut self, value: ValueId, access: Access, dst_domain: DomainFlag) -> ValueId {
+        self.emit(IR::Release {
+            resource: value,
+            access,
+            dst_domain,
+        })
+    }
 }
 
-pub fn acquire_swapchain(swapchain: &SwapChain) { MODULE.with_borrow_mut(|x| x.acquire_swapchain(swapchain)); }
+pub fn acquire_swapchain(swapchain: &SwapChain) -> ValueId {
+    MODULE.with_borrow_mut(|x| x.lower_acquire_swapchain(swapchain))
+}
+
+pub fn acquire_next_image(swapchain: ValueId) -> ValueId {
+    MODULE.with_borrow_mut(|x| x.lower_acquire_next_image(swapchain))
+}
+
+pub fn release(value: ValueId, access: Access, dst_domain: DomainFlag) -> ValueId {
+    MODULE.with_borrow_mut(|x| x.lower_release(value, access, dst_domain))
+}
