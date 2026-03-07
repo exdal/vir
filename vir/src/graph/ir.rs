@@ -16,7 +16,7 @@ bitflags! {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ValueId(pub u32);
 
-#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub enum Constant {
     I32(i32),
     U32(u32),
@@ -28,7 +28,6 @@ pub enum Constant {
 pub enum Variable {
     U32(u32),
 }
-
 pub enum IR {
     Constant(Constant),
 
@@ -84,5 +83,104 @@ pub enum IR {
     Clear {
         attachment: ValueId,
         color: vk::ClearValue,
+    },
+}
+
+impl std::fmt::Display for IR {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IR::Constant(c) => match c {
+                Constant::I32(v) => write!(f, "const i32 {}", v),
+                Constant::U32(v) => write!(f, "const u32 {}", v),
+                Constant::Extent2D(e) => write!(f, "const Extent2D {{{}x{}}}", e.width, e.height),
+                Constant::Extent3D(e) => write!(f, "const Extent3D {{{}x{}x{}}}", e.width, e.height, e.depth),
+            },
+            IR::Array(ids) => {
+                write!(f, "[")?;
+                for (i, id) in ids.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "%{}", id.0)?;
+                }
+                write!(f, "]")
+            },
+            IR::ConstructBuffer { buffer, size } => {
+                write!(f, "construct buffer={{mem: {:?}}} size=%{}", buffer, size.0)
+            },
+            IR::ConstructImage {
+                image,
+                image_view,
+                extent,
+                format,
+                samples,
+                base_level,
+                level_count,
+                base_layer,
+                layer_count,
+            } => {
+                write!(
+                    f,
+                    "construct image={{mem: {:?}}} view={{mem: {:?}}} extent=%{} format={:?} samples={:?} levels=[%{}..%{}] \
+                     layers=[%{}..%{}]",
+                    image,
+                    image_view,
+                    extent.0,
+                    format,
+                    samples,
+                    base_level.0,
+                    level_count.0,
+                    base_layer.0,
+                    layer_count.0,
+                )
+            },
+            IR::AcquireSwapChain { swapchain, attachments } => {
+                write!(f, "acquire_swapchain={{mem: {:?}}} attachments=%{}", swapchain, attachments.0)
+            },
+            IR::AcquireNextImage { swapchain } => {
+                write!(f, "acquire_next_image swapchain=%{}", swapchain.0)
+            },
+            IR::Acquire { resource, access } => {
+                write!(f, "acquire resource=%{} access={:?}", resource.0, access)
+            },
+            IR::Release {
+                resource,
+                access,
+                dst_domain,
+            } => {
+                write!(
+                    f,
+                    "release resource=%{} access={:?} domain={:?}",
+                    resource.0, access, dst_domain
+                )
+            },
+            IR::CallOpaque {
+                args, returns, domain, ..
+            } => {
+                write!(f, "call.opaque domain={:?} args=[", domain)?;
+                for (i, id) in args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "%{}", id.0)?;
+                }
+                write!(f, "] returns=[")?;
+                for (i, id) in returns.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "%{}", id.0)?;
+                }
+                write!(f, "]")
+            },
+            IR::Clear { attachment, color } => {
+                let rgba = unsafe { color.color.float32 };
+                write!(
+                    f,
+                    "clear attachment=%{} color=({:.2}, {:.2}, {:.2}, {:.2})",
+                    attachment.0, rgba[0], rgba[1], rgba[2], rgba[3]
+                )
+            },
+        }
     }
 }

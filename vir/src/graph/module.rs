@@ -1,13 +1,11 @@
-use std::{cell::RefCell, collections::HashMap};
+use std::collections::HashMap;
+
+use ash::vk;
 
 use crate::{Access, DomainFlag, IR, ImageAttachment, SwapChain, ValueId, graph::ir};
 
-thread_local! {
-    static MODULE: RefCell<Module> = RefCell::new(Module::default());
-}
-
 pub struct Value {
-    ir: IR,
+    pub ir: IR,
     deps: Vec<ValueId>,
 }
 
@@ -20,28 +18,100 @@ impl Value {
     }
 }
 
-struct Module {
+pub struct Module {
     constants: HashMap<ir::Constant, ValueId>,
     nodes: Vec<Value>,
 }
 
 impl Module {
-    fn default() -> Self {
+    pub fn default() -> Self {
         Self {
             constants: HashMap::new(),
             nodes: Vec::new(),
         }
     }
 
-    fn add_dep(&mut self, src: ValueId, dep: ValueId) { self.nodes[src.0 as usize].deps.push(dep); }
+    pub fn get(&self, id: ValueId) -> &Value { return &self.nodes[id.0 as usize]; }
 
-    fn emit(&mut self, ir: IR) -> ValueId {
+    pub fn topo_sort(&self, value_id: ValueId) -> Vec<ValueId> {
+        let mut values = Vec::new();
+        let mut stack = vec![value_id];
+        let mut visited = std::collections::HashSet::new();
+        let mut processed = std::collections::HashSet::new();
+
+        while let Some(id) = stack.pop() {
+            if processed.contains(&id) {
+                continue;
+            }
+
+            if visited.insert(id) {
+                stack.push(id);
+
+                let value = self.get(id);
+                match &value.ir {
+                    IR::Constant(_) => {},
+                    IR::Array(value_ids) => {
+                        value_ids.iter().rev().for_each(|v| stack.push(*v));
+                    },
+                    IR::ConstructBuffer { size, .. } => {
+                        stack.push(*size);
+                    },
+                    IR::ConstructImage {
+                        extent,
+                        base_level,
+                        level_count,
+                        base_layer,
+                        layer_count,
+                        ..
+                    } => {
+                        stack.push(*layer_count);
+                        stack.push(*base_layer);
+                        stack.push(*level_count);
+                        stack.push(*base_level);
+                        stack.push(*extent);
+                    },
+                    IR::AcquireSwapChain { attachments, .. } => {
+                        stack.push(*attachments);
+                    },
+                    IR::AcquireNextImage { swapchain } => {
+                        stack.push(*swapchain);
+                    },
+                    IR::Acquire { resource, .. } => {
+                        stack.push(*resource);
+                    },
+                    IR::Release { resource, .. } => {
+                        stack.push(*resource);
+                    },
+                    IR::CallOpaque { args, returns, .. } => {
+                        stack.extend(returns);
+                        stack.extend(args);
+                    },
+                    IR::Clear { attachment, .. } => {
+                        stack.push(*attachment);
+                    },
+                }
+
+                for &dep in &value.deps {
+                    stack.push(dep);
+                }
+            } else {
+                processed.insert(id);
+                values.push(id);
+            }
+        }
+
+        values
+    }
+
+    pub fn add_dep(&mut self, src: ValueId, dep: ValueId) { self.nodes[src.0 as usize].deps.push(dep); }
+
+    pub fn emit(&mut self, ir: IR) -> ValueId {
         let id = ValueId(self.nodes.len() as u32);
         self.nodes.push(Value::new(ir));
         id
     }
 
-    fn lower_constant(&mut self, constant: ir::Constant) -> ValueId {
+    pub fn lower_constant(&mut self, constant: ir::Constant) -> ValueId {
         if let Some(&id) = self.constants.get(&constant) {
             return id;
         }
@@ -51,13 +121,13 @@ impl Module {
         id
     }
 
-    fn lower_u32(&mut self, v: u32) -> ValueId { self.lower_constant(ir::Constant::U32(v)) }
+    pub fn lower_u32(&mut self, v: u32) -> ValueId { self.lower_constant(ir::Constant::U32(v)) }
 
-    fn lower_i32(&mut self, v: i32) -> ValueId { self.lower_constant(ir::Constant::I32(v)) }
+    pub fn lower_i32(&mut self, v: i32) -> ValueId { self.lower_constant(ir::Constant::I32(v)) }
 
-    fn lower_array(&mut self, v: Vec<ValueId>) -> ValueId { self.emit(IR::Array(v)) }
+    pub fn lower_array(&mut self, v: Vec<ValueId>) -> ValueId { self.emit(IR::Array(v)) }
 
-    fn lower_image_attachment(&mut self, attachment: &ImageAttachment) -> ValueId {
+    pub fn lower_image_attachment(&mut self, attachment: &ImageAttachment) -> ValueId {
         let extent = self.lower_constant(ir::Constant::Extent3D(attachment.extent()));
         let base_level = self.lower_u32(attachment.base_level());
         let level_count = self.lower_u32(attachment.level_count());
@@ -77,7 +147,7 @@ impl Module {
         })
     }
 
-    fn lower_acquire_swapchain(&mut self, swapchain: &SwapChain) -> ValueId {
+    pub fn lower_acquire_swapchain(&mut self, swapchain: &SwapChain) -> ValueId {
         let attach_values = swapchain
             .attachments
             .iter()
@@ -90,27 +160,19 @@ impl Module {
         })
     }
 
-    fn lower_acquire_next_image(&mut self, swapchain: ValueId) -> ValueId {
+    pub fn lower_acquire_next_image(&mut self, swapchain: ValueId) -> ValueId {
         self.emit(IR::AcquireNextImage { swapchain })
     }
 
-    fn lower_release(&mut self, value: ValueId, access: Access, dst_domain: DomainFlag) -> ValueId {
+    pub fn lower_release(&mut self, value: ValueId, access: Access, dst_domain: DomainFlag) -> ValueId {
         self.emit(IR::Release {
             resource: value,
             access,
             dst_domain,
         })
     }
-}
 
-pub fn acquire_swapchain(swapchain: &SwapChain) -> ValueId {
-    MODULE.with_borrow_mut(|x| x.lower_acquire_swapchain(swapchain))
-}
-
-pub fn acquire_next_image(swapchain: ValueId) -> ValueId {
-    MODULE.with_borrow_mut(|x| x.lower_acquire_next_image(swapchain))
-}
-
-pub fn release(value: ValueId, access: Access, dst_domain: DomainFlag) -> ValueId {
-    MODULE.with_borrow_mut(|x| x.lower_release(value, access, dst_domain))
+    pub fn lower_clear(&mut self, attachment: ValueId, color: vk::ClearValue) -> ValueId {
+        self.emit(IR::Clear { attachment, color })
+    }
 }

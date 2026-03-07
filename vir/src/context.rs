@@ -1,10 +1,12 @@
 use std::sync::Arc;
 
-use ash::{khr, vk};
+use ash::{khr, prelude::VkResult, vk};
 
 pub mod command_buffer;
+pub mod command_queue;
 
 pub use command_buffer::CommandBuffer;
+pub use command_queue::{CommandQueue, DomainFlag};
 
 use crate::{PersistentAllocator, SuperFrameAllocator, SwapChain};
 
@@ -12,6 +14,7 @@ pub struct Context {
     device: Arc<ash::Device>,
     physical_device: vk::PhysicalDevice,
     instance: Arc<ash::Instance>,
+    command_queues: Vec<CommandQueue>,
     swapchain_loader: khr::swapchain::Device,
     surface_loader: khr::surface::Instance,
 }
@@ -26,6 +29,7 @@ impl Context {
             device,
             physical_device,
             instance,
+            command_queues: Vec::new(),
             swapchain_loader,
             surface_loader,
         }
@@ -48,6 +52,20 @@ impl Context {
         }?;
 
         Ok(image_index)
+    }
+
+    pub fn create_command_queue(&mut self, queue_family_index: u32, domain_flags: DomainFlag) {
+        let queue_handle = unsafe { self.device.get_device_queue(queue_family_index, 0) };
+
+        let mut type_info = vk::SemaphoreTypeCreateInfo::default()
+            .semaphore_type(vk::SemaphoreType::TIMELINE)
+            .initial_value(0);
+        let semaphore_create_info = vk::SemaphoreCreateInfo::default().push_next(&mut type_info);
+        let timeline_semaphore = unsafe { self.device.create_semaphore(&semaphore_create_info, None) }
+            .expect("Failed to create timeline semaphore for queue!");
+
+        let queue = CommandQueue::new(queue_handle, domain_flags, timeline_semaphore);
+        self.command_queues.push(queue);
     }
 
     pub fn create_persistent_allocator(&self) -> PersistentAllocator { PersistentAllocator::new(self.device.clone()) }

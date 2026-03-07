@@ -58,14 +58,10 @@ impl InstanceBuilder {
     }
 
     #[cfg(target_os = "linux")]
-    pub fn require_surface_extensions(self) -> Self {
-        self.require_extension(khr::wayland_surface::NAME.to_owned())
-    }
+    pub fn require_surface_extensions(self) -> Self { self.require_extension(khr::wayland_surface::NAME.to_owned()) }
 
     #[cfg(target_os = "windows")]
-    pub fn require_surface_extensions(self) -> Self {
-        self.require_extension(khr::win32_surface::NAME.to_owned())
-    }
+    pub fn require_surface_extensions(self) -> Self { self.require_extension(khr::win32_surface::NAME.to_owned()) }
 
     pub fn build(&self, entry: &ash::Entry) -> Result<ash::Instance, vk::Result> {
         let app_info = vk::ApplicationInfo::default()
@@ -94,6 +90,12 @@ pub struct PhysicalDevice {
     pub properties: vk::PhysicalDeviceProperties,
     pub queue_family_properties: Vec<vk::QueueFamilyProperties>,
     pub extensions_to_enable: Vec<CString>,
+}
+
+impl PhysicalDevice {
+    pub fn get_queue_index(&self, queue_flags: vk::QueueFlags) -> Option<u32> {
+        get_first_queue_index(&self.queue_family_properties, queue_flags)
+    }
 }
 
 fn get_first_queue_index(families: &[vk::QueueFamilyProperties], desired_flags: vk::QueueFlags) -> Option<u32> {

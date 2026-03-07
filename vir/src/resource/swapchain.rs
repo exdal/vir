@@ -1,6 +1,6 @@
 use ash::vk::{self};
 
-use crate::{allocator::AllocatorKind, graph::attachment::ImageAttachment};
+use crate::{ImageAttachment, PersistentAllocator, allocator::Allocator};
 
 #[derive(Default)]
 pub struct SwapChain {
@@ -13,7 +13,7 @@ pub struct SwapChain {
 impl SwapChain {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        allocator: &mut AllocatorKind, handle: vk::SwapchainKHR, surface: vk::SurfaceKHR,
+        allocator: &mut PersistentAllocator, handle: vk::SwapchainKHR, surface: vk::SurfaceKHR,
         attachments: Vec<ImageAttachment>,
     ) -> Result<Self, vk::Result> {
         let semaphores = (0..attachments.len())

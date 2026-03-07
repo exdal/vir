@@ -1,10 +1,11 @@
-use std::sync::Arc;
+use std::{ops::Add, sync::Arc};
 
 use ash::vk;
 
 use super::{Allocator, persistent::PersistentAllocator};
 
 pub struct FrameAllocator {
+    issued_frame: usize,
     upstream: PersistentAllocator,
     semaphores: Vec<vk::Semaphore>,
 }
@@ -12,9 +13,19 @@ pub struct FrameAllocator {
 impl FrameAllocator {
     fn new(upstream: PersistentAllocator) -> Self {
         Self {
+            issued_frame: 0,
             upstream,
             semaphores: Vec::default(),
         }
+    }
+
+    fn deallocate(&mut self, issued_frame: usize) {
+        self.semaphores
+            .iter()
+            .for_each(|sema| self.upstream.deallocate_semaphore(*sema));
+        self.semaphores.clear();
+
+        self.issued_frame = issued_frame;
     }
 }
 
@@ -46,16 +57,23 @@ impl SuperFrameAllocator {
             .map(|_| FrameAllocator::new(PersistentAllocator::new(device.clone())))
             .collect::<Vec<FrameAllocator>>();
 
-        SuperFrameAllocator {
+        Self {
             frames,
             frame_counter: 0,
             frames_in_flight,
         }
     }
 
-    fn get_last_frame(&self) -> &FrameAllocator { self.frames.get(self.frame_counter % self.frames_in_flight).unwrap() }
-
-    fn get_last_frame_mut(&mut self) -> &mut FrameAllocator {
+    fn get_last_frame(&mut self) -> &mut FrameAllocator {
         self.frames.get_mut(self.frame_counter % self.frames_in_flight).unwrap()
+    }
+
+    fn get_next_frame(&mut self) -> &mut FrameAllocator {
+        let issued_frame = self.frame_counter.add(1);
+        let frame = self.get_last_frame();
+        // wait for frame here
+        frame.deallocate(issued_frame);
+
+        frame
     }
 }

@@ -4,7 +4,16 @@ use std::{error::Error, ffi::CStr, result::Result};
 
 use ash::{Entry, khr, vk};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
-use vir::{AllocatorKind, Context, Image, ImageAttachment, SwapChain};
+use vir::{
+    AllocatorKind,
+    Context,
+    Image,
+    ImageAttachment,
+    PersistentAllocator,
+    RenderGraph,
+    SuperFrameAllocator,
+    SwapChain,
+};
 pub use winit;
 use winit::{
     application::ApplicationHandler,
@@ -89,8 +98,9 @@ struct App {
     ash_entry: Option<ash::Entry>,
     window: Option<Window>,
     swapchain: SwapChain,
-    runtime: Option<Context>,
-    persistent_allocator: Option<AllocatorKind>,
+    ctx: Option<Context>,
+    super_frame_allocator: Option<SuperFrameAllocator>,
+    persistent_allocator: Option<PersistentAllocator>,
 }
 
 impl App {
@@ -153,11 +163,16 @@ impl App {
             .set_features(features)
             .build(&instance, &physical_device)?;
 
-        let runtime = Context::new(device.into(), physical_device.handle, instance.into(), &ash_entry);
+        let mut ctx = Context::new(device.into(), physical_device.handle, instance.into(), &ash_entry);
+        let graphics_queue_index = physical_device
+            .get_queue_index(vk::QueueFlags::GRAPHICS)
+            .expect("No graphics queue");
+        ctx.create_command_queue(graphics_queue_index, vir::DomainFlag::Graphics);
         self.window = Some(window);
         self.ash_entry = Some(ash_entry);
-        self.persistent_allocator = Some(AllocatorKind::Persistent(runtime.create_persistent_allocator()));
-        self.runtime = Some(runtime);
+        self.persistent_allocator = Some(ctx.create_persistent_allocator());
+        self.super_frame_allocator = Some(ctx.create_super_frame_allocator(3));
+        self.ctx = Some(ctx);
         self.swapchain = self.create_swapchain(window_extent, raw_window_handle, raw_display_handle)?;
 
         Ok(())
@@ -166,7 +181,7 @@ impl App {
     fn create_swapchain(
         &mut self, extent: vk::Extent2D, raw_window_handle: RawWindowHandle, raw_display_handle: RawDisplayHandle,
     ) -> Result<SwapChain, vk::Result> {
-        let runtime = self.runtime.as_ref().unwrap();
+        let runtime = self.ctx.as_ref().unwrap();
 
         let ash_entry = self.ash_entry.as_ref().unwrap();
         let instance = runtime.instance();
@@ -207,7 +222,18 @@ impl App {
         )
     }
 
-    fn run(&mut self) { let device = self.runtime.as_mut().unwrap().device(); }
+    fn run(&mut self) {
+        let frame_allocator = self.super_frame_allocator.as_mut().unwrap();
+
+        let mut graph = vir::RenderGraph::new();
+        let attachment = graph.acquire_next_image(&self.swapchain);
+        let attachment = graph.clear(attachment, <f32 as vir::ClearColor>::WHITE);
+        let attachment = graph.present(attachment);
+        graph.compile(attachment);
+        graph.dump();
+
+        panic!();
+    }
 }
 
 impl ApplicationHandler for App {
