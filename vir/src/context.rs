@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use ash::{khr, prelude::VkResult, vk};
+use ash::{khr, vk};
 
 pub mod command_buffer;
 pub mod command_queue;
@@ -8,7 +8,7 @@ pub mod command_queue;
 pub use command_buffer::CommandBuffer;
 pub use command_queue::{CommandQueue, DomainFlag};
 
-use crate::{PersistentAllocator, SuperFrameAllocator, SwapChain};
+use crate::{PersistentAllocator, SuperFrameAllocator};
 
 pub struct Context {
     device: Arc<ash::Device>,
@@ -45,10 +45,10 @@ impl Context {
 
     pub fn surface_loader(&self) -> &khr::surface::Instance { &self.surface_loader }
 
-    pub fn acquire_next_frame(&self, swapchain: &SwapChain, semaphore: vk::Semaphore) -> Result<u32, vk::Result> {
+    pub fn acquire_next_image(&self, swapchain: vk::SwapchainKHR, semaphore: vk::Semaphore) -> Result<u32, vk::Result> {
         let (image_index, _) = unsafe {
             self.swapchain_loader
-                .acquire_next_image(swapchain.handle, u64::MAX, semaphore, vk::Fence::null())
+                .acquire_next_image(swapchain, u64::MAX, semaphore, vk::Fence::null())
         }?;
 
         Ok(image_index)

@@ -68,7 +68,7 @@ impl SuperFrameAllocator {
         self.frames.get_mut(self.frame_counter % self.frames_in_flight).unwrap()
     }
 
-    fn get_next_frame(&mut self) -> &mut FrameAllocator {
+    pub fn get_next_frame(&mut self) -> &mut FrameAllocator {
         let issued_frame = self.frame_counter.add(1);
         let frame = self.get_last_frame();
         // wait for frame here

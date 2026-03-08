@@ -14,12 +14,12 @@ pub trait Allocator {
     fn deallocate_semaphore(&self, semaphore: vk::Semaphore);
 }
 
-pub enum AllocatorKind {
-    Persistent(PersistentAllocator),
-    Frame(FrameAllocator),
+pub enum AllocatorKind<'a> {
+    Persistent(&'a mut PersistentAllocator),
+    Frame(&'a mut FrameAllocator),
 }
 
-impl AllocatorKind {
+impl<'a> AllocatorKind<'a> {
     pub fn allocate_binary_semaphore(&mut self) -> Result<vk::Semaphore, vk::Result> {
         match self {
             AllocatorKind::Persistent(persistent_allocator) => persistent_allocator.allocate_binary_semaphore(),

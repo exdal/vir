@@ -223,14 +223,18 @@ impl App {
     }
 
     fn run(&mut self) {
-        let frame_allocator = self.super_frame_allocator.as_mut().unwrap();
+        let ctx = self.ctx.as_ref().unwrap();
+        let super_frame_allocator = self.super_frame_allocator.as_mut().unwrap();
+        let mut frame_allocator = AllocatorKind::Frame(super_frame_allocator.get_next_frame());
 
-        let mut graph = vir::RenderGraph::new();
-        let attachment = graph.acquire_next_image(&self.swapchain);
-        let attachment = graph.clear(attachment, <f32 as vir::ClearColor>::WHITE);
-        let attachment = graph.present(attachment);
-        graph.compile(attachment);
+        let mut module = vir::Module::default();
+        let attachment = module.acquire_next_image(&self.swapchain);
+        let attachment = module.clear(attachment, vir::clear::f32::WHITE);
+        let attachment = module.present(attachment);
+
+        let graph = vir::RenderGraph::new(ctx, module.compile(attachment));
         graph.dump();
+        graph.submit(&mut frame_allocator);
 
         panic!();
     }

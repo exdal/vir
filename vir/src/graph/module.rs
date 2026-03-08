@@ -4,23 +4,9 @@ use ash::vk;
 
 use crate::{Access, DomainFlag, IR, ImageAttachment, SwapChain, ValueId, graph::ir};
 
-pub struct Value {
-    pub ir: IR,
-    deps: Vec<ValueId>,
-}
-
-impl Value {
-    pub fn new(ir: IR) -> Self {
-        Self {
-            ir,
-            deps: Vec::default(),
-        }
-    }
-}
-
 pub struct Module {
     constants: HashMap<ir::Constant, ValueId>,
-    nodes: Vec<Value>,
+    nodes: Vec<IR>,
 }
 
 impl Module {
@@ -31,10 +17,12 @@ impl Module {
         }
     }
 
-    pub fn get(&self, id: ValueId) -> &Value { return &self.nodes[id.0 as usize]; }
+    pub fn compile(&self, id: ValueId) -> Vec<IR> { self.topo_sort(id) }
 
-    pub fn topo_sort(&self, value_id: ValueId) -> Vec<ValueId> {
-        let mut values = Vec::new();
+    fn get(&self, id: ValueId) -> &IR { return &self.nodes[id.0 as usize]; }
+
+    fn topo_sort(&self, value_id: ValueId) -> Vec<IR> {
+        let mut nodes = Vec::new();
         let mut stack = vec![value_id];
         let mut visited = std::collections::HashSet::new();
         let mut processed = std::collections::HashSet::new();
@@ -44,11 +32,11 @@ impl Module {
                 continue;
             }
 
+            let ir = self.get(id);
             if visited.insert(id) {
                 stack.push(id);
 
-                let value = self.get(id);
-                match &value.ir {
+                match &ir {
                     IR::Constant(_) => {},
                     IR::Array(value_ids) => {
                         value_ids.iter().rev().for_each(|v| stack.push(*v));
@@ -70,11 +58,8 @@ impl Module {
                         stack.push(*base_level);
                         stack.push(*extent);
                     },
-                    IR::AcquireSwapChain { attachments, .. } => {
+                    IR::AcquireNextImage { attachments, .. } => {
                         stack.push(*attachments);
-                    },
-                    IR::AcquireNextImage { swapchain } => {
-                        stack.push(*swapchain);
                     },
                     IR::Acquire { resource, .. } => {
                         stack.push(*resource);
@@ -90,28 +75,22 @@ impl Module {
                         stack.push(*attachment);
                     },
                 }
-
-                for &dep in &value.deps {
-                    stack.push(dep);
-                }
             } else {
                 processed.insert(id);
-                values.push(id);
+                nodes.push(ir.clone());
             }
         }
 
-        values
+        nodes
     }
 
-    pub fn add_dep(&mut self, src: ValueId, dep: ValueId) { self.nodes[src.0 as usize].deps.push(dep); }
-
-    pub fn emit(&mut self, ir: IR) -> ValueId {
+    fn emit(&mut self, ir: IR) -> ValueId {
         let id = ValueId(self.nodes.len() as u32);
-        self.nodes.push(Value::new(ir));
+        self.nodes.push(ir);
         id
     }
 
-    pub fn lower_constant(&mut self, constant: ir::Constant) -> ValueId {
+    fn lower_constant(&mut self, constant: ir::Constant) -> ValueId {
         if let Some(&id) = self.constants.get(&constant) {
             return id;
         }
@@ -121,13 +100,13 @@ impl Module {
         id
     }
 
-    pub fn lower_u32(&mut self, v: u32) -> ValueId { self.lower_constant(ir::Constant::U32(v)) }
+    fn lower_u32(&mut self, v: u32) -> ValueId { self.lower_constant(ir::Constant::U32(v)) }
 
-    pub fn lower_i32(&mut self, v: i32) -> ValueId { self.lower_constant(ir::Constant::I32(v)) }
+    fn lower_i32(&mut self, v: i32) -> ValueId { self.lower_constant(ir::Constant::I32(v)) }
 
-    pub fn lower_array(&mut self, v: Vec<ValueId>) -> ValueId { self.emit(IR::Array(v)) }
+    fn lower_array(&mut self, v: Vec<ValueId>) -> ValueId { self.emit(IR::Array(v)) }
 
-    pub fn lower_image_attachment(&mut self, attachment: &ImageAttachment) -> ValueId {
+    fn lower_image_attachment(&mut self, attachment: &ImageAttachment) -> ValueId {
         let extent = self.lower_constant(ir::Constant::Extent3D(attachment.extent()));
         let base_level = self.lower_u32(attachment.base_level());
         let level_count = self.lower_u32(attachment.level_count());
@@ -147,24 +126,20 @@ impl Module {
         })
     }
 
-    pub fn lower_acquire_swapchain(&mut self, swapchain: &SwapChain) -> ValueId {
+    pub fn acquire_next_image(&mut self, swapchain: &SwapChain) -> ValueId {
         let attach_values = swapchain
             .attachments
             .iter()
             .map(|attach| self.lower_image_attachment(attach))
             .collect::<Vec<_>>();
         let attachments = self.lower_array(attach_values);
-        self.emit(IR::AcquireSwapChain {
+        self.emit(IR::AcquireNextImage {
             swapchain: swapchain.handle,
             attachments,
         })
     }
 
-    pub fn lower_acquire_next_image(&mut self, swapchain: ValueId) -> ValueId {
-        self.emit(IR::AcquireNextImage { swapchain })
-    }
-
-    pub fn lower_release(&mut self, value: ValueId, access: Access, dst_domain: DomainFlag) -> ValueId {
+    pub fn release(&mut self, value: ValueId, access: Access, dst_domain: DomainFlag) -> ValueId {
         self.emit(IR::Release {
             resource: value,
             access,
@@ -172,7 +147,11 @@ impl Module {
         })
     }
 
-    pub fn lower_clear(&mut self, attachment: ValueId, color: vk::ClearValue) -> ValueId {
+    pub fn present(&mut self, attachment: ValueId) -> ValueId {
+        self.release(attachment, Access::None, DomainFlag::Present)
+    }
+
+    pub fn clear(&mut self, attachment: ValueId, color: vk::ClearValue) -> ValueId {
         self.emit(IR::Clear { attachment, color })
     }
 }

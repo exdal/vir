@@ -24,10 +24,7 @@ pub enum Constant {
     Extent3D(vk::Extent3D),
 }
 
-#[derive(Clone, Copy, Hash, PartialEq, Eq)]
-pub enum Variable {
-    U32(u32),
-}
+#[derive(Clone)]
 pub enum IR {
     Constant(Constant),
 
@@ -52,13 +49,9 @@ pub enum IR {
     },
 
     // Acquire ops
-    AcquireSwapChain {
+    AcquireNextImage {
         swapchain: vk::SwapchainKHR,
         attachments: ValueId,
-    },
-
-    AcquireNextImage {
-        swapchain: ValueId,
     },
 
     Acquire {
@@ -121,8 +114,8 @@ impl std::fmt::Display for IR {
             } => {
                 write!(
                     f,
-                    "construct image={{mem: {:?}}} view={{mem: {:?}}} extent=%{} format={:?} samples={:?} levels=[%{}..%{}] \
-                     layers=[%{}..%{}]",
+                    "construct image={{mem: {:?}}} view={{mem: {:?}}} extent=%{} format={:?} samples={:?} \
+                     levels=[%{}..%{}] layers=[%{}..%{}]",
                     image,
                     image_view,
                     extent.0,
@@ -134,11 +127,12 @@ impl std::fmt::Display for IR {
                     layer_count.0,
                 )
             },
-            IR::AcquireSwapChain { swapchain, attachments } => {
-                write!(f, "acquire_swapchain={{mem: {:?}}} attachments=%{}", swapchain, attachments.0)
-            },
-            IR::AcquireNextImage { swapchain } => {
-                write!(f, "acquire_next_image swapchain=%{}", swapchain.0)
+            IR::AcquireNextImage { swapchain, attachments } => {
+                write!(
+                    f,
+                    "acquire_next_image swapchain={{mem: {:?}}} attachments=%{}",
+                    swapchain, attachments.0
+                )
             },
             IR::Acquire { resource, access } => {
                 write!(f, "acquire resource=%{} access={:?}", resource.0, access)

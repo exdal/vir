@@ -1,69 +1,82 @@
+use std::collections::HashMap;
+
 use ash::vk;
 
-use crate::{Access, AllocatorKind, DomainFlag, SwapChain, ValueId, graph::module::Module};
+use crate::{Access, AllocatorKind, Context, DomainFlag, IR, SwapChain, Value, ValueId};
 
-/// ```
-/// let mut graph = RenderGraph::new();
-/// let swapchain_attachment = graph.acquire_next_image(swapchain);
-/// let swapchain_attachment = graph.clear(swapchain_attachment, vir::White::<f32>);
-/// let swapchain_attachment = graph.present(swapchain_attachment);
-/// graph.compile(swapchain_attachment);
-/// graph.optimize();
-/// graph.submit();
-/// ```
-pub struct RenderGraph {
-    module: Module,
-    compiled: Vec<ValueId>,
+pub struct RenderGraph<'a> {
+    ctx: &'a Context,
+    nodes: Vec<IR>,
+    values: HashMap<ValueId, Value>,
 }
 
-impl RenderGraph {
-    pub fn new() -> Self {
+impl<'a> RenderGraph<'a> {
+    pub fn new(ctx: &'a Context, nodes: Vec<IR>) -> Self {
         return Self {
-            module: Module::default(),
-            compiled: Vec::new(),
+            ctx,
+            nodes,
+            values: HashMap::new(),
         };
     }
 
-    pub fn acquire_next_image(&mut self, swapchain: &SwapChain) -> ValueId {
-        let swapchain_value = self.module.lower_acquire_swapchain(swapchain);
-        return self.module.lower_acquire_next_image(swapchain_value);
-    }
+    fn node(&self, id: ValueId) -> &IR { return &self.nodes[id.0 as usize]; }
 
-    pub fn clear(&mut self, attachment: ValueId, color: vk::ClearValue) -> ValueId {
-        self.module.lower_clear(attachment, color)
-    }
+    pub fn submit(&self, allocator: &mut AllocatorKind) -> Result<(), vk::Result> {
+        for node in &self.nodes {
+            self.execute(node, allocator)?;
+        }
 
-    pub fn present(&mut self, attachment: ValueId) -> ValueId {
-        self.module.lower_release(attachment, Access::None, DomainFlag::Present)
-    }
-
-    pub fn compile(&mut self, value_id: ValueId) {
-        let values = self.module.topo_sort(value_id);
-        self.compiled = values;
-    }
-
-    pub fn submit(&self, allocator: &mut AllocatorKind) {
-        self.compiled.iter().for_each(|&value_id| {
-            let value = self.module.get(value_id);
-            match &value.ir {
-                super::IR::Constant(constant) => todo!(),
-                super::IR::Array(value_ids) => todo!(),
-                super::IR::ConstructBuffer { buffer, size } => todo!(),
-                super::IR::ConstructImage { image, image_view, extent, format, samples, base_level, level_count, base_layer, layer_count } => todo!(),
-                super::IR::AcquireSwapChain { swapchain, attachments } => todo!(),
-                super::IR::AcquireNextImage { swapchain } => todo!(),
-                super::IR::Acquire { resource, access } => todo!(),
-                super::IR::Release { resource, access, dst_domain } => todo!(),
-                super::IR::CallOpaque { args, returns, callback, domain } => todo!(),
-                super::IR::Clear { attachment, color } => todo!(),
-            }
-        });
+        Ok(())
     }
 
     pub fn dump(&self) {
-        for &id in &self.compiled {
-            let value = self.module.get(id);
-            println!("%{} = {}", id.0, value.ir);
+        self.nodes.iter().enumerate().for_each(|(id, node)| {
+            println!("%{} = {}", id, node);
+        });
+    }
+
+    fn execute(&self, ir: &IR, allocator: &mut AllocatorKind) -> Result<(), vk::Result> {
+        match ir {
+            IR::Constant(constant) => todo!(),
+            IR::Array(value_ids) => todo!(),
+            IR::ConstructBuffer { buffer, size } => todo!(),
+            IR::ConstructImage {
+                image,
+                image_view,
+                extent,
+                format,
+                samples,
+                base_level,
+                level_count,
+                base_layer,
+                layer_count,
+            } => todo!(),
+            IR::AcquireNextImage { swapchain, attachments } => {
+                let acquire_semaphore = allocator.allocate_binary_semaphore()?;
+                let image_index = self.ctx.acquire_next_image(*swapchain, acquire_semaphore)?;
+                allocator.deallocate_semaphore(acquire_semaphore);
+
+                let attachments = self.node(*attachments);
+                match &attachments {
+                    IR::Array(values) => {},
+                    _ => panic!(),
+                };
+            },
+            IR::Acquire { resource, access } => todo!(),
+            IR::Release {
+                resource,
+                access,
+                dst_domain,
+            } => todo!(),
+            IR::CallOpaque {
+                args,
+                returns,
+                callback,
+                domain,
+            } => todo!(),
+            IR::Clear { attachment, color } => todo!(),
         }
+
+        Ok(())
     }
 }
