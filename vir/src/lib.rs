@@ -1,12 +1,13 @@
 pub mod allocator;
 
 pub mod context;
+pub mod core;
 pub mod graph;
 pub mod resource;
 
 pub use allocator::{AllocatorKind, FrameAllocator, PersistentAllocator, SuperFrameAllocator};
-pub use context::{CommandBuffer, Context, DomainFlag};
-pub use graph::{Access, IR, ImageAttachment, Module, PassCallback, RenderGraph, Value, ValueId};
+pub use context::{Access, CommandBuffer, Context, DomainFlag};
+pub use graph::{IR, ImageAttachment, Module, PassCallback, RenderGraph, Value, ValueId};
 pub use resource::{Image, SwapChain};
 
 pub mod clear {

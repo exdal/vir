@@ -2,9 +2,11 @@ use std::sync::Arc;
 
 use ash::{khr, vk};
 
+pub mod access;
 pub mod command_buffer;
 pub mod command_queue;
 
+pub use access::Access;
 pub use command_buffer::CommandBuffer;
 pub use command_queue::{CommandQueue, DomainFlag};
 
@@ -64,7 +66,7 @@ impl Context {
         let timeline_semaphore = unsafe { self.device.create_semaphore(&semaphore_create_info, None) }
             .expect("Failed to create timeline semaphore for queue!");
 
-        let queue = CommandQueue::new(queue_handle, domain_flags, timeline_semaphore);
+        let queue = CommandQueue::new(queue_handle, queue_family_index, domain_flags, timeline_semaphore);
         self.command_queues.push(queue);
     }
 

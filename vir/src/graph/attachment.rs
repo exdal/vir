@@ -4,7 +4,7 @@ use ash::vk;
 
 use crate::Image;
 
-#[derive(Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ImageAttachment {
     image: Image,
     image_view: vk::ImageView,

@@ -8,10 +8,12 @@ pub use self::{
     persistent::PersistentAllocator,
 };
 
-pub trait Allocator {
+pub trait Allocator: std::fmt::Debug {
     fn allocate_binary_semaphore(&mut self) -> Result<vk::Semaphore, vk::Result>;
     fn allocate_timeline_semaphore(&mut self) -> Result<vk::Semaphore, vk::Result>;
     fn deallocate_semaphore(&self, semaphore: vk::Semaphore);
+    fn allocate_command_pool(&mut self, queue_family: u32) -> Result<vk::CommandPool, vk::Result>;
+    fn deallocate_command_pool(&self, cmd_pool: vk::CommandPool);
 }
 
 pub enum AllocatorKind<'a> {
@@ -38,6 +40,20 @@ impl<'a> AllocatorKind<'a> {
         match self {
             AllocatorKind::Persistent(persistent_allocator) => persistent_allocator.deallocate_semaphore(semaphore),
             AllocatorKind::Frame(frame_allocator) => frame_allocator.deallocate_semaphore(semaphore),
+        }
+    }
+
+    pub fn allocate_command_pool(&mut self, queue_family: u32) -> Result<vk::CommandPool, vk::Result> {
+        match self {
+            AllocatorKind::Persistent(persistent_allocator) => persistent_allocator.allocate_command_pool(queue_family),
+            AllocatorKind::Frame(frame_allocator) => todo!(),
+        }
+    }
+
+    pub fn deallocate_command_pool(&self, cmd_pool: vk::CommandPool) {
+        match self {
+            AllocatorKind::Persistent(persistent_allocator) => todo!(),
+            AllocatorKind::Frame(frame_allocator) => todo!(),
         }
     }
 }

@@ -1,17 +1,6 @@
 use ash::vk;
-use bitflags::bitflags;
 
-use crate::{DomainFlag, PassCallback};
-
-bitflags! {
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-    pub struct Access: u64 {
-        const None = 0;
-        const ColorRead = 1 << 0;
-        const ColorWrite = 1 << 1;
-        const ColorRW = Self::ColorRead.bits() | Self::ColorWrite.bits();
-    }
-}
+use crate::{DomainFlag, Image, PassCallback, Access};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ValueId(pub u32);
@@ -37,7 +26,7 @@ pub enum IR {
     },
 
     ConstructImage {
-        image: vk::Image,
+        image: Image,
         image_view: vk::ImageView,
         extent: ValueId,
         format: vk::Format,
@@ -48,7 +37,7 @@ pub enum IR {
         layer_count: ValueId,
     },
 
-    // Acquire ops
+    // AcqRel ops
     AcquireNextImage {
         swapchain: vk::SwapchainKHR,
         attachments: ValueId,
@@ -76,6 +65,20 @@ pub enum IR {
     Clear {
         attachment: ValueId,
         color: vk::ClearValue,
+    },
+
+    // Sync ops
+    MemoryBarrier {
+        src_access_flags: Access,
+        dst_access_flags: Access,
+    },
+
+    ImageBarrier {
+        src_access_flags: Access,
+        dst_access_flags: Access,
+        old_layout: vk::ImageLayout,
+        new_layout: vk::ImageLayout,
+        value: ValueId,
     },
 }
 
@@ -116,7 +119,7 @@ impl std::fmt::Display for IR {
                     f,
                     "construct image={{mem: {:?}}} view={{mem: {:?}}} extent=%{} format={:?} samples={:?} \
                      levels=[%{}..%{}] layers=[%{}..%{}]",
-                    image,
+                    image.handle,
                     image_view,
                     extent.0,
                     format,
@@ -175,6 +178,25 @@ impl std::fmt::Display for IR {
                     attachment.0, rgba[0], rgba[1], rgba[2], rgba[3]
                 )
             },
+            IR::MemoryBarrier {
+                src_access_flags,
+                dst_access_flags,
+            } => write!(
+                f,
+                "barrier.memory src={:?} dst={:?}",
+                src_access_flags, dst_access_flags
+            ),
+            IR::ImageBarrier {
+                src_access_flags,
+                dst_access_flags,
+                old_layout,
+                new_layout,
+                value,
+            } => write!(
+                f,
+                "barrier.image src={:?} dst={:?} old_layout={:?} new_layout={:?} value=%{:?}",
+                src_access_flags, dst_access_flags, old_layout, new_layout, value.0
+            ),
         }
     }
 }

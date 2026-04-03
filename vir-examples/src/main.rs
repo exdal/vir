@@ -232,7 +232,7 @@ impl App {
         let attachment = module.clear(attachment, vir::clear::f32::WHITE);
         let attachment = module.present(attachment);
 
-        let graph = vir::RenderGraph::new(ctx, module.compile(attachment));
+        let mut graph = vir::RenderGraph::new(ctx, module.compile(attachment));
         graph.dump();
         graph.submit(&mut frame_allocator);
 

@@ -4,9 +4,11 @@ use ash::vk;
 
 use super::{Allocator, persistent::PersistentAllocator};
 
+#[derive(Debug)]
 pub struct FrameAllocator {
     issued_frame: usize,
     upstream: PersistentAllocator,
+    cmd_pool: vk::CommandPool,
     semaphores: Vec<vk::Semaphore>,
 }
 
@@ -15,11 +17,13 @@ impl FrameAllocator {
         Self {
             issued_frame: 0,
             upstream,
+            cmd_pool: vk::CommandPool::null(),
             semaphores: Vec::default(),
         }
     }
 
     fn deallocate(&mut self, issued_frame: usize) {
+        self.upstream.deallocate_command_pool(self.cmd_pool);
         self.semaphores
             .iter()
             .for_each(|sema| self.upstream.deallocate_semaphore(*sema));
@@ -43,6 +47,12 @@ impl Allocator for FrameAllocator {
     }
 
     fn deallocate_semaphore(&self, _: vk::Semaphore) {}
+
+    fn allocate_command_pool(&mut self, queue_family: u32) -> Result<vk::CommandPool, vk::Result> {
+        self.upstream.allocate_command_pool(queue_family)
+    }
+
+    fn deallocate_command_pool(&self, _: vk::CommandPool) {}
 }
 
 pub struct SuperFrameAllocator {

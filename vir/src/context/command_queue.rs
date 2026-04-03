@@ -15,18 +15,22 @@ bitflags! {
 
 pub struct CommandQueue {
     inner: vk::Queue,
+    family_index: u32,
     domain_flags: DomainFlag,
     timeline: vk::Semaphore,
 }
 
 impl CommandQueue {
-    pub fn new(inner: vk::Queue, domain_flags: DomainFlag, timeline: vk::Semaphore) -> Self {
+    pub fn new(inner: vk::Queue, family_index: u32, domain_flags: DomainFlag, timeline: vk::Semaphore) -> Self {
         Self {
             inner,
+            family_index,
             domain_flags,
             timeline,
         }
     }
+
+    pub fn family_index(&self) -> u32 { self.family_index }
 
     pub fn semaphore(&self) -> &vk::Semaphore { &self.timeline }
 }

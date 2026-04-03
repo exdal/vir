@@ -31,4 +31,24 @@ impl Allocator for PersistentAllocator {
     fn deallocate_semaphore(&self, semaphore: vk::Semaphore) {
         unsafe { self.device.destroy_semaphore(semaphore, None) };
     }
+
+    fn allocate_command_pool(&mut self, queue_family: u32) -> Result<vk::CommandPool, vk::Result> {
+        let create_info = vk::CommandPoolCreateInfo::default()
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
+            .queue_family_index(queue_family);
+
+        unsafe { self.device.create_command_pool(&create_info, None) }
+    }
+
+    fn deallocate_command_pool(&self, cmd_pool: vk::CommandPool) {
+        unsafe {
+            self.device.destroy_command_pool(cmd_pool, None);
+        }
+    }
+}
+
+impl std::fmt::Debug for PersistentAllocator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PersistentAllocator").finish_non_exhaustive()
+    }
 }
