@@ -1,19 +1,52 @@
 use ash::vk;
 
 use crate::{
-    AllocatorKind,
-    Context,
-    IR,
-    ImageAttachment,
-    Value,
-    ValueId,
-    graph::{ir, value::FromValue},
+    Access, AllocatorKind, CommandBuffer, Context, DomainFlag, IR, ImageAttachment, Value, ValueId, graph::{ir, value::FromValue}
 };
+
+struct SemaphoreSubmitInfo {
+    semaphore: vk::Semaphore,
+    value: u64,
+    access: Access,
+}
+
+impl SemaphoreSubmitInfo {
+    fn default() -> Self {
+        Self {
+            semaphore: vk::Semaphore::null(),
+            value: 0,
+            access: Access::None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct SubmitInfo {
+    wait_semas: Vec<SemaphoreSubmitInfo>,
+    cmd_buffers: Vec<CommandBuffer>,
+    signal_semas: Vec<SemaphoreSubmitInfo>,
+}
+
+struct OngoingSubmit {
+    info: SubmitInfo,
+    cmd_buf: Option<CommandBuffer>,
+}
+
+impl OngoingSubmit {
+    fn new() -> Self {
+        Self {
+            info: SubmitInfo::default(),
+            cmd_buf: None,
+        }
+    }
+}
 
 pub struct RenderGraph<'a> {
     ctx: &'a Context,
     nodes: &'a [(ValueId, IR)],
     values: Vec<Value>,
+    submits: Vec<SubmitInfo>,
+    ongoing_submit: OngoingSubmit,
 }
 
 impl<'a> RenderGraph<'a> {
@@ -22,6 +55,8 @@ impl<'a> RenderGraph<'a> {
             ctx,
             nodes,
             values: Vec::new(),
+            submits: Vec::new(),
+            ongoing_submit: OngoingSubmit::new(),
         };
     }
 
@@ -34,6 +69,22 @@ impl<'a> RenderGraph<'a> {
     fn get<T: FromValue>(&self, id: &ValueId) -> T { T::from_value(self.get_value(id)) }
 
     fn get_value(&self, value_id: &ValueId) -> &Value { self.values.get(value_id.0 as usize).unwrap() }
+
+    fn current_submit(&mut self) -> &SubmitInfo {
+        if self.submits.is_empty() {
+            self.submits.push(SubmitInfo::default());
+        }
+
+        self.submits.last().unwrap()
+    }
+
+    fn cmd_buf(&mut self, domain: DomainFlag) -> &CommandBuffer {
+        if self.ongoing_submit.cmd_buf.is_none() {
+
+        }
+
+        todo!()
+    }
 
     pub fn submit(&mut self, allocator: &mut AllocatorKind) -> Result<(), vk::Result> {
         let nodes = std::mem::take(&mut self.nodes);

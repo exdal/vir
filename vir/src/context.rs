@@ -47,6 +47,10 @@ impl Context {
 
     pub fn surface_loader(&self) -> &khr::surface::Instance { &self.surface_loader }
 
+    pub fn command_queue_by_domain(&self, domain: DomainFlag) -> Option<&CommandQueue> {
+        self.command_queues.iter().find(|queue| queue.domain_flags() == domain)
+    }
+
     pub fn acquire_next_image(&self, swapchain: vk::SwapchainKHR, semaphore: vk::Semaphore) -> Result<u32, vk::Result> {
         let (image_index, _) = unsafe {
             self.swapchain_loader
@@ -54,6 +58,10 @@ impl Context {
         }?;
 
         Ok(image_index)
+    }
+
+    pub fn present(&self, queue: &CommandQueue, present_info: &vk::PresentInfoKHR) -> Result<bool, vk::Result> {
+        unsafe { self.swapchain_loader.queue_present(queue.inner(), present_info) }
     }
 
     pub fn create_command_queue(&mut self, queue_family_index: u32, domain_flags: DomainFlag) {
@@ -66,7 +74,13 @@ impl Context {
         let timeline_semaphore = unsafe { self.device.create_semaphore(&semaphore_create_info, None) }
             .expect("Failed to create timeline semaphore for queue!");
 
-        let queue = CommandQueue::new(queue_handle, queue_family_index, domain_flags, timeline_semaphore);
+        let queue = CommandQueue::new(
+            queue_handle,
+            NonNull::from(self.device.as_ref()),
+            queue_family_index,
+            domain_flags,
+            timeline_semaphore,
+        );
         self.command_queues.push(queue);
     }
 
