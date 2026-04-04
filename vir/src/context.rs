@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{ptr::NonNull, sync::Arc};
 
 use ash::{khr, vk};
 
@@ -23,14 +23,14 @@ pub struct Context {
 
 impl Context {
     pub fn new(
-        device: Arc<ash::Device>, physical_device: vk::PhysicalDevice, instance: Arc<ash::Instance>, entry: &ash::Entry,
+        device: ash::Device, physical_device: vk::PhysicalDevice, instance: ash::Instance, entry: &ash::Entry,
     ) -> Self {
         let swapchain_loader = khr::swapchain::Device::new(&instance, &device);
         let surface_loader = khr::surface::Instance::new(entry, &instance);
         Self {
-            device,
+            device: Arc::new(device),
             physical_device,
-            instance,
+            instance: Arc::new(instance),
             command_queues: Vec::new(),
             swapchain_loader,
             surface_loader,
@@ -70,9 +70,11 @@ impl Context {
         self.command_queues.push(queue);
     }
 
-    pub fn create_persistent_allocator(&self) -> PersistentAllocator { PersistentAllocator::new(self.device.clone()) }
+    pub fn create_persistent_allocator(&self) -> PersistentAllocator {
+        PersistentAllocator::new(NonNull::from(self.device.as_ref()))
+    }
 
-    pub fn create_super_frame_allocator(&self, frames_in_flight: usize) -> SuperFrameAllocator {
-        SuperFrameAllocator::new(self.device.clone(), frames_in_flight)
+    pub fn create_super_frame_allocator(&self) -> SuperFrameAllocator {
+        SuperFrameAllocator::new(NonNull::from(self.device.as_ref()), 3)
     }
 }

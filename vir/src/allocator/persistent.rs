@@ -1,22 +1,57 @@
-use std::sync::Arc;
+use std::ptr::NonNull;
 
-use ash::vk;
+use ash::vk::{self, Handle};
 
 use super::Allocator;
+use crate::CommandBuffer;
 
 pub struct PersistentAllocator {
-    device: Arc<ash::Device>,
+    device: NonNull<ash::Device>,
+    cmd_pool: vk::CommandPool,
 }
 
 impl PersistentAllocator {
-    pub fn new(device: Arc<ash::Device>) -> Self { PersistentAllocator { device } }
+    pub fn new(device: NonNull<ash::Device>) -> Self {
+        PersistentAllocator {
+            device,
+            cmd_pool: vk::CommandPool::null(),
+        }
+    }
+
+    pub fn allocate_command_pool(&self, queue_family: u32) -> Result<vk::CommandPool, vk::Result> {
+        let create_info = vk::CommandPoolCreateInfo::default()
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
+            .queue_family_index(queue_family);
+
+        unsafe { self.device.as_ref().create_command_pool(&create_info, None) }
+    }
+
+    pub fn reset_command_pool(&self, cmd_pool: vk::CommandPool, release_resources: bool) -> Result<(), vk::Result> {
+        let flags = if release_resources {
+            vk::CommandPoolResetFlags::RELEASE_RESOURCES
+        } else {
+            vk::CommandPoolResetFlags::empty()
+        };
+
+        unsafe { self.device.as_ref().reset_command_pool(cmd_pool, flags) }
+    }
+
+    fn ensure_cmd_pool(&mut self, queue_family: u32) -> Result<(), vk::Result> {
+        if !self.cmd_pool.is_null() {
+            return Ok(());
+        }
+
+        self.cmd_pool = self.allocate_command_pool(queue_family)?;
+
+        Ok(())
+    }
 }
 
 impl Allocator for PersistentAllocator {
     fn allocate_binary_semaphore(&mut self) -> Result<vk::Semaphore, vk::Result> {
         let create_info = vk::SemaphoreCreateInfo::default();
 
-        unsafe { self.device.create_semaphore(&create_info, None) }
+        unsafe { self.device.as_ref().create_semaphore(&create_info, None) }
     }
 
     fn allocate_timeline_semaphore(&mut self) -> Result<vk::Semaphore, vk::Result> {
@@ -25,25 +60,24 @@ impl Allocator for PersistentAllocator {
             .initial_value(0);
         let create_info = vk::SemaphoreCreateInfo::default().push_next(&mut type_info);
 
-        unsafe { self.device.create_semaphore(&create_info, None) }
+        unsafe { self.device.as_ref().create_semaphore(&create_info, None) }
     }
 
     fn deallocate_semaphore(&self, semaphore: vk::Semaphore) {
-        unsafe { self.device.destroy_semaphore(semaphore, None) };
+        unsafe { self.device.as_ref().destroy_semaphore(semaphore, None) };
     }
 
-    fn allocate_command_pool(&mut self, queue_family: u32) -> Result<vk::CommandPool, vk::Result> {
-        let create_info = vk::CommandPoolCreateInfo::default()
-            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
-            .queue_family_index(queue_family);
+    fn allocate_command_buffer(&mut self, queue_family: u32) -> Result<CommandBuffer, vk::Result> {
+        self.ensure_cmd_pool(queue_family)?;
 
-        unsafe { self.device.create_command_pool(&create_info, None) }
-    }
+        let alloc_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(self.cmd_pool)
+            .command_buffer_count(1)
+            .level(vk::CommandBufferLevel::PRIMARY);
 
-    fn deallocate_command_pool(&self, cmd_pool: vk::CommandPool) {
-        unsafe {
-            self.device.destroy_command_pool(cmd_pool, None);
-        }
+        let cmd_buffer = unsafe { self.device.as_ref().allocate_command_buffers(&alloc_info) }?[0];
+
+        Ok(CommandBuffer::new(self.device, cmd_buffer))
     }
 }
 

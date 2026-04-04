@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::ptr::NonNull;
 
 use ash::vk;
 
@@ -6,20 +6,30 @@ use crate::Access;
 
 #[derive(Clone)]
 pub struct CommandBuffer {
-    device: Rc<ash::Device>,
+    device: NonNull<ash::Device>,
     handle: vk::CommandBuffer,
 }
 
 impl CommandBuffer {
-    pub fn new(device: Rc<ash::Device>, handle: vk::CommandBuffer) -> Self { Self { device, handle } }
+    pub fn new(device: NonNull<ash::Device>, handle: vk::CommandBuffer) -> Self { Self { device, handle } }
+
+    pub fn reset(&self, release: bool) -> Result<(), vk::Result> {
+        let flags = if release {
+            vk::CommandBufferResetFlags::RELEASE_RESOURCES
+        } else {
+            vk::CommandBufferResetFlags::empty()
+        };
+
+        unsafe { self.device.as_ref().reset_command_buffer(self.handle, flags) }
+    }
 
     pub fn begin(&self) -> Result<(), vk::Result> {
         let begin_info = vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
 
-        unsafe { self.device.begin_command_buffer(self.handle, &begin_info) }
+        unsafe { self.device.as_ref().begin_command_buffer(self.handle, &begin_info) }
     }
 
-    pub fn end(&self) -> Result<(), vk::Result> { unsafe { self.device.end_command_buffer(self.handle) } }
+    pub fn end(&self) -> Result<(), vk::Result> { unsafe { self.device.as_ref().end_command_buffer(self.handle) } }
 
     pub fn memory_barrier(&self, src_access: Access, dst_access: Access) {
         let memory_barrier = [vk::MemoryBarrier2::default()
@@ -28,7 +38,11 @@ impl CommandBuffer {
             .dst_stage_mask(dst_access.into())
             .dst_access_mask(dst_access.into())];
         let dependency_info = vk::DependencyInfo::default().memory_barriers(&memory_barrier);
-        unsafe { self.device.cmd_pipeline_barrier2(self.handle, &dependency_info) }
+        unsafe {
+            self.device
+                .as_ref()
+                .cmd_pipeline_barrier2(self.handle, &dependency_info)
+        }
     }
 
     pub fn clear(
@@ -37,6 +51,7 @@ impl CommandBuffer {
     ) {
         unsafe {
             self.device
+                .as_ref()
                 .cmd_clear_color_image(self.handle, image, image_layout, &clear_color_value, ranges);
         }
     }

@@ -10,7 +10,6 @@ use vir::{
     Image,
     ImageAttachment,
     PersistentAllocator,
-    RenderGraph,
     SuperFrameAllocator,
     SwapChain,
 };
@@ -93,25 +92,23 @@ fn create_surface(
     }
 }
 
-#[derive(Default)]
 struct App {
-    ash_entry: Option<ash::Entry>,
-    window: Option<Window>,
-    swapchain: SwapChain,
-    ctx: Option<Context>,
-    super_frame_allocator: Option<SuperFrameAllocator>,
-    persistent_allocator: Option<PersistentAllocator>,
+    ash_entry: ash::Entry,
+    window: Window,
+    swapchain: Option<SwapChain>,
+    ctx: Context,
+    super_frame_allocator: SuperFrameAllocator,
+    persistent_allocator: PersistentAllocator,
+}
+
+#[derive(Default)]
+struct AppWrapper {
+    app: Option<App>,
 }
 
 impl App {
-    fn init(&mut self, window: Window) -> Result<(), Box<dyn Error>> {
+    fn new(window: Window) -> Result<Self, Box<dyn Error>> {
         let raw_window_handle = window.raw_window_handle();
-        let raw_display_handle = window.raw_display_handle();
-        let window_inner_size = window.handle.inner_size();
-        let window_extent = vk::Extent2D {
-            width: window_inner_size.width,
-            height: window_inner_size.height,
-        };
         let ash_entry = unsafe { Entry::load()? };
 
         let instance = InstanceBuilder::default()
@@ -163,36 +160,37 @@ impl App {
             .set_features(features)
             .build(&instance, &physical_device)?;
 
-        let mut ctx = Context::new(device.into(), physical_device.handle, instance.into(), &ash_entry);
+        let mut ctx = Context::new(device, physical_device.handle, instance, &ash_entry);
         let graphics_queue_index = physical_device
             .get_queue_index(vk::QueueFlags::GRAPHICS)
             .expect("No graphics queue");
         ctx.create_command_queue(graphics_queue_index, vir::DomainFlag::Graphics);
-        self.window = Some(window);
-        self.ash_entry = Some(ash_entry);
-        self.persistent_allocator = Some(ctx.create_persistent_allocator());
-        self.super_frame_allocator = Some(ctx.create_super_frame_allocator(3));
-        self.ctx = Some(ctx);
-        self.swapchain = self.create_swapchain(window_extent, raw_window_handle, raw_display_handle)?;
+        let super_frame_allocator = ctx.create_super_frame_allocator();
+        let persistent_allocator = ctx.create_persistent_allocator();
 
-        Ok(())
+        Ok(Self {
+            window,
+            ash_entry,
+            swapchain: None,
+            ctx,
+            super_frame_allocator,
+            persistent_allocator,
+        })
     }
 
     fn create_swapchain(
         &mut self, extent: vk::Extent2D, raw_window_handle: RawWindowHandle, raw_display_handle: RawDisplayHandle,
     ) -> Result<SwapChain, vk::Result> {
-        let runtime = self.ctx.as_ref().unwrap();
+        let instance = self.ctx.instance();
+        let physical_device = self.ctx.physical_device();
+        let swapchain_loader = self.ctx.swapchain_loader();
+        let surface_loader = self.ctx.surface_loader();
 
-        let ash_entry = self.ash_entry.as_ref().unwrap();
-        let instance = runtime.instance();
-        let physical_device = runtime.physical_device();
-        let swapchain_loader = runtime.swapchain_loader();
-        let surface_loader = runtime.surface_loader();
-
-        let surface = create_surface(ash_entry, instance, raw_window_handle, raw_display_handle)?;
+        let surface = create_surface(&self.ash_entry, instance, raw_window_handle, raw_display_handle)?;
+        let old_swapchain = self.swapchain.as_ref().map_or(vk::SwapchainKHR::null(), |s| s.handle);
         let (swapchain_handle, swapchain_format, swapchain_extent) = SwapChainBuilder::new(*physical_device)
             .set_desired_extent(extent.width, extent.height)
-            .set_old_swapchain(self.swapchain.handle)
+            .set_old_swapchain(old_swapchain)
             .build(surface_loader, &surface, swapchain_loader)?;
 
         let swapchain_images = unsafe { swapchain_loader.get_swapchain_images(swapchain_handle) }?;
@@ -214,33 +212,32 @@ impl App {
             })
             .collect::<Vec<_>>();
 
-        SwapChain::new(
-            self.persistent_allocator.as_mut().unwrap(),
-            swapchain_handle,
-            surface,
-            attachments,
-        )
+        SwapChain::new(&mut self.persistent_allocator, swapchain_handle, surface, attachments)
     }
 
-    fn run(&mut self) {
-        let ctx = self.ctx.as_ref().unwrap();
-        let super_frame_allocator = self.super_frame_allocator.as_mut().unwrap();
-        let mut frame_allocator = AllocatorKind::Frame(super_frame_allocator.get_next_frame());
+    fn run(&mut self) -> Result<(), vk::Result> {
+        let Some(ref swapchain) = self.swapchain else {
+            return Err(vk::Result::ERROR_SURFACE_LOST_KHR);
+        };
+
+        let next_frame = self.super_frame_allocator.get_next_frame()?;
+        let mut frame_allocator = AllocatorKind::Frame(next_frame);
 
         let mut module = vir::Module::default();
-        let attachment = module.acquire_next_image(&self.swapchain);
+        let attachment = module.acquire_next_image(swapchain);
         let attachment = module.clear(attachment, vir::clear::f32::WHITE);
         let attachment = module.present(attachment);
+        let executable = module.compile(attachment);
 
-        let mut graph = vir::RenderGraph::new(ctx, module.compile(attachment));
+        let mut graph = vir::RenderGraph::new(&self.ctx, executable.as_slice());
         graph.dump();
-        graph.submit(&mut frame_allocator);
+        graph.submit(&mut frame_allocator)?;
 
         panic!();
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler for AppWrapper {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let window = Window::new(
             event_loop,
@@ -251,17 +248,33 @@ impl ApplicationHandler for App {
             },
         )
         .expect("Cannot create new window");
-        self.init(window).expect("Cannot create new app");
+
+        let mut app = App::new(window).expect("Cannot create new app");
+
+        let raw_window_handle = app.window.raw_window_handle();
+        let raw_display_handle = app.window.raw_display_handle();
+        let window_inner_size = app.window.handle.inner_size();
+        let window_extent = vk::Extent2D {
+            width: window_inner_size.width,
+            height: window_inner_size.height,
+        };
+
+        app.swapchain = Some(
+            app.create_swapchain(window_extent, raw_window_handle, raw_display_handle)
+                .expect("Failed to create swapchain"),
+        );
+
+        self.app = Some(app);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
-        let window = self.window.as_mut().unwrap();
+        let app = self.app.as_mut().unwrap();
         match event {
             WindowEvent::Resized(physical_size) => {
-                let raw_window_handle = window.raw_window_handle();
-                let raw_display_handle = window.raw_display_handle();
-                self.swapchain = self
-                    .create_swapchain(
+                let raw_window_handle = app.window.raw_window_handle();
+                let raw_display_handle = app.window.raw_display_handle();
+                app.swapchain = Some(
+                    app.create_swapchain(
                         vk::Extent2D {
                             width: physical_size.width,
                             height: physical_size.height,
@@ -269,12 +282,13 @@ impl ApplicationHandler for App {
                         raw_window_handle,
                         raw_display_handle,
                     )
-                    .expect("Failed to create swaphcain");
+                    .expect("Failed to create swapchain"),
+                );
             },
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::RedrawRequested => {
-                window.handle.request_redraw();
-                self.run()
+                app.window.handle.request_redraw();
+                app.run().unwrap();
             },
             _ => (),
         };
@@ -309,8 +323,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
 
-    let mut app = App::default();
-    let _ = event_loop.run_app(&mut app);
+    let mut app_wrapper = AppWrapper::default();
+    let _ = event_loop.run_app(&mut app_wrapper);
 
     Ok(())
 }

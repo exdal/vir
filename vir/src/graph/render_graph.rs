@@ -12,12 +12,12 @@ use crate::{
 
 pub struct RenderGraph<'a> {
     ctx: &'a Context,
-    nodes: Vec<(ValueId, IR)>,
+    nodes: &'a [(ValueId, IR)],
     values: Vec<Value>,
 }
 
 impl<'a> RenderGraph<'a> {
-    pub fn new(ctx: &'a Context, nodes: Vec<(ValueId, IR)>) -> Self {
+    pub fn new(ctx: &'a Context, nodes: &'a [(ValueId, IR)]) -> Self {
         return Self {
             ctx,
             nodes,
@@ -37,7 +37,7 @@ impl<'a> RenderGraph<'a> {
 
     pub fn submit(&mut self, allocator: &mut AllocatorKind) -> Result<(), vk::Result> {
         let nodes = std::mem::take(&mut self.nodes);
-        for (value_id, node) in &nodes {
+        for (value_id, node) in nodes {
             self.execute(value_id, node, allocator)?;
         }
         self.nodes = nodes;

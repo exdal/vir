@@ -390,7 +390,7 @@ impl SwapChainBuilder {
             desired_height: 256,
             desired_min_image_count: 0,
             required_min_image_count: 0,
-            old_swapchain: vk::SwapchainKHR::default(),
+            old_swapchain: vk::SwapchainKHR::null(),
             physical_device,
         }
     }

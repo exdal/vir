@@ -1,35 +1,53 @@
-use std::{ops::Add, sync::Arc};
+use std::{ops::Add, ptr::NonNull};
 
-use ash::vk;
+use ash::vk::{self, Handle};
 
 use super::{Allocator, persistent::PersistentAllocator};
+use crate::CommandBuffer;
 
 #[derive(Debug)]
 pub struct FrameAllocator {
     issued_frame: usize,
+    device: NonNull<ash::Device>,
     upstream: PersistentAllocator,
     cmd_pool: vk::CommandPool,
     semaphores: Vec<vk::Semaphore>,
 }
 
 impl FrameAllocator {
-    fn new(upstream: PersistentAllocator) -> Self {
+    fn new(device: NonNull<ash::Device>, upstream: PersistentAllocator) -> Self {
         Self {
             issued_frame: 0,
+            device,
             upstream,
             cmd_pool: vk::CommandPool::null(),
             semaphores: Vec::default(),
         }
     }
 
-    fn deallocate(&mut self, issued_frame: usize) {
-        self.upstream.deallocate_command_pool(self.cmd_pool);
+    fn ensure_cmd_pool(&mut self, queue_family: u32) -> Result<(), vk::Result> {
+        if !self.cmd_pool.is_null() {
+            return Ok(());
+        }
+
+        self.cmd_pool = self.upstream.allocate_command_pool(queue_family)?;
+
+        Ok(())
+    }
+
+    fn deallocate(&mut self, issued_frame: usize) -> Result<(), vk::Result> {
+        if !self.cmd_pool.is_null() {
+            self.upstream.reset_command_pool(self.cmd_pool, false)?;
+        }
+
         self.semaphores
             .iter()
             .for_each(|sema| self.upstream.deallocate_semaphore(*sema));
         self.semaphores.clear();
 
         self.issued_frame = issued_frame;
+
+        Ok(())
     }
 }
 
@@ -48,11 +66,18 @@ impl Allocator for FrameAllocator {
 
     fn deallocate_semaphore(&self, _: vk::Semaphore) {}
 
-    fn allocate_command_pool(&mut self, queue_family: u32) -> Result<vk::CommandPool, vk::Result> {
-        self.upstream.allocate_command_pool(queue_family)
-    }
+    fn allocate_command_buffer(&mut self, queue_family: u32) -> Result<CommandBuffer, vk::Result> {
+        self.ensure_cmd_pool(queue_family)?;
 
-    fn deallocate_command_pool(&self, _: vk::CommandPool) {}
+        let alloc_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(self.cmd_pool)
+            .command_buffer_count(1)
+            .level(vk::CommandBufferLevel::PRIMARY);
+
+        let cmd_buffer = unsafe { self.device.as_ref().allocate_command_buffers(&alloc_info) }?[0];
+
+        Ok(CommandBuffer::new(self.device, cmd_buffer))
+    }
 }
 
 pub struct SuperFrameAllocator {
@@ -62,9 +87,9 @@ pub struct SuperFrameAllocator {
 }
 
 impl SuperFrameAllocator {
-    pub fn new(device: Arc<ash::Device>, frames_in_flight: usize) -> Self {
+    pub fn new(device: NonNull<ash::Device>, frames_in_flight: usize) -> Self {
         let frames = (0..frames_in_flight)
-            .map(|_| FrameAllocator::new(PersistentAllocator::new(device.clone())))
+            .map(|_| FrameAllocator::new(device, PersistentAllocator::new(device)))
             .collect::<Vec<FrameAllocator>>();
 
         Self {
@@ -78,12 +103,12 @@ impl SuperFrameAllocator {
         self.frames.get_mut(self.frame_counter % self.frames_in_flight).unwrap()
     }
 
-    pub fn get_next_frame(&mut self) -> &mut FrameAllocator {
+    pub fn get_next_frame(&mut self) -> Result<&mut FrameAllocator, vk::Result> {
         let issued_frame = self.frame_counter.add(1);
         let frame = self.get_last_frame();
         // wait for frame here
-        frame.deallocate(issued_frame);
+        frame.deallocate(issued_frame)?;
 
-        frame
+        Ok(frame)
     }
 }
