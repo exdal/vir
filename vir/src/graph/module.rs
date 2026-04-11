@@ -66,10 +66,13 @@ impl Module {
                     IR::Array(value_ids) => {
                         value_ids.iter().rev().for_each(|v| stack.push(*v));
                     },
-                    IR::ConstructBuffer { size, .. } => {
+                    IR::DeclareBuffer { size, .. } => {
                         stack.push(*size);
                     },
-                    IR::ConstructImage {
+                    IR::ConstructBuffer { buffer } => {
+                        stack.push(*buffer);
+                    },
+                    IR::DeclareImage {
                         extent,
                         base_level,
                         level_count,
@@ -82,6 +85,9 @@ impl Module {
                         stack.push(*level_count);
                         stack.push(*base_level);
                         stack.push(*extent);
+                    },
+                    IR::ConstructImage { image } => {
+                        stack.push(*image);
                     },
                     IR::AcquireNextImage { attachments, .. } => {
                         stack.push(*attachments);
@@ -226,7 +232,7 @@ impl Module {
         let base_layer = self.lower_u32(attachment.base_layer());
         let layer_count = self.lower_u32(attachment.layer_count());
 
-        self.emit(IR::ConstructImage {
+        self.emit(IR::DeclareImage {
             image: attachment.image().clone(),
             image_view: attachment.image_view(),
             extent,
@@ -236,6 +242,7 @@ impl Module {
             level_count,
             base_layer,
             layer_count,
+            usage: attachment.usage(),
         })
     }
 
@@ -249,6 +256,7 @@ impl Module {
         self.emit(IR::AcquireNextImage {
             swapchain: swapchain.handle,
             attachments,
+            present_semaphores: swapchain.semaphores.clone(),
         })
     }
 

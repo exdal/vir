@@ -79,6 +79,25 @@ impl Allocator for PersistentAllocator {
 
         Ok(CommandBuffer::new(self.device, cmd_buffer))
     }
+
+    fn allocate_image_view(
+        &mut self, image: vk::Image, format: vk::Format, view_type: vk::ImageViewType,
+        subresource_range: vk::ImageSubresourceRange,
+    ) -> Result<vk::ImageView, vk::Result> {
+        let create_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .format(format)
+            .view_type(view_type)
+            .subresource_range(subresource_range);
+
+        unsafe { self.device.as_ref().create_image_view(&create_info, None) }
+    }
+
+    fn deallocate_image_view(&mut self, image_view: vk::ImageView) {
+        unsafe {
+            self.device.as_ref().destroy_image_view(image_view, None);
+        }
+    }
 }
 
 impl std::fmt::Debug for PersistentAllocator {

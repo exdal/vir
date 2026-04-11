@@ -1,6 +1,6 @@
 use ash::vk;
 
-use crate::{DomainFlag, Image, PassCallback, Access};
+use crate::{Access, DomainFlag, Image, PassCallback};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ValueId(pub u32);
@@ -20,12 +20,16 @@ pub enum IR {
     Array(Vec<ValueId>),
 
     // Construct ops
-    ConstructBuffer {
+    DeclareBuffer {
         buffer: vk::Buffer,
         size: ValueId,
     },
 
-    ConstructImage {
+    ConstructBuffer {
+        buffer: ValueId,
+    },
+
+    DeclareImage {
         image: Image,
         image_view: vk::ImageView,
         extent: ValueId,
@@ -35,12 +39,18 @@ pub enum IR {
         level_count: ValueId,
         base_layer: ValueId,
         layer_count: ValueId,
+        usage: vk::ImageUsageFlags,
+    },
+
+    ConstructImage {
+        image: ValueId,
     },
 
     // AcqRel ops
     AcquireNextImage {
         swapchain: vk::SwapchainKHR,
         attachments: ValueId,
+        present_semaphores: Vec<vk::Semaphore>,
     },
 
     Acquire {
@@ -101,10 +111,13 @@ impl std::fmt::Display for IR {
                 }
                 write!(f, "]")
             },
-            IR::ConstructBuffer { buffer, size } => {
-                write!(f, "construct buffer={{mem: {:?}}} size=%{}", buffer, size.0)
+            IR::DeclareBuffer { buffer, size } => {
+                write!(f, "declare buffer={{mem: {:?}}} size=%{}", buffer, size.0)
             },
-            IR::ConstructImage {
+            IR::ConstructBuffer { buffer } => {
+                write!(f, "construct buffer=%{}", buffer.0)
+            },
+            IR::DeclareImage {
                 image,
                 image_view,
                 extent,
@@ -114,11 +127,12 @@ impl std::fmt::Display for IR {
                 level_count,
                 base_layer,
                 layer_count,
+                usage,
             } => {
                 write!(
                     f,
-                    "construct image={{mem: {:?}}} view={{mem: {:?}}} extent=%{} format={:?} samples={:?} \
-                     levels=[%{}..%{}] layers=[%{}..%{}]",
+                    "declare image={{mem: {:?}}} view={{mem: {:?}}} extent=%{} format={:?} samples={:?} \
+                     levels=[%{}..%{}] layers=[%{}..%{}] usage={:?}",
                     image.handle,
                     image_view,
                     extent.0,
@@ -128,13 +142,21 @@ impl std::fmt::Display for IR {
                     level_count.0,
                     base_layer.0,
                     layer_count.0,
+                    usage,
                 )
             },
-            IR::AcquireNextImage { swapchain, attachments } => {
+            IR::ConstructImage { image } => {
+                write!(f, "construct image=%{}", image.0)
+            },
+            IR::AcquireNextImage {
+                swapchain,
+                attachments,
+                present_semaphores,
+            } => {
                 write!(
                     f,
-                    "acquire_next_image swapchain={{mem: {:?}}} attachments=%{}",
-                    swapchain, attachments.0
+                    "acquire_next_image swapchain={{mem: {:?}}} attachments=%{} present_semaphores=%{:?}",
+                    swapchain, attachments.0, present_semaphores
                 )
             },
             IR::Acquire { resource, access } => {

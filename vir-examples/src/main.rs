@@ -4,15 +4,7 @@ use std::{error::Error, ffi::CStr, result::Result};
 
 use ash::{Entry, khr, vk};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
-use vir::{
-    AllocatorKind,
-    Context,
-    Image,
-    ImageAttachment,
-    PersistentAllocator,
-    SuperFrameAllocator,
-    SwapChain,
-};
+use vir::{AllocatorKind, Context, Image, ImageAttachment, PersistentAllocator, SuperFrameAllocator, SwapChain};
 pub use winit;
 use winit::{
     application::ApplicationHandler,
@@ -95,9 +87,10 @@ fn create_surface(
 struct App {
     ash_entry: ash::Entry,
     window: Window,
+    surface: vk::SurfaceKHR,
     swapchain: Option<SwapChain>,
     ctx: Context,
-    super_frame_allocator: SuperFrameAllocator,
+    super_frame_allocator: Option<SuperFrameAllocator>,
     persistent_allocator: PersistentAllocator,
 }
 
@@ -107,8 +100,24 @@ struct AppWrapper {
 }
 
 impl App {
-    fn new(window: Window) -> Result<Self, Box<dyn Error>> {
+    fn new(
+        window: Window, surface: vk::SurfaceKHR, ash_entry: ash::Entry, ctx: Context,
+        persistent_allocator: PersistentAllocator,
+    ) -> Self {
+        Self {
+            window,
+            ash_entry,
+            surface,
+            swapchain: None,
+            ctx,
+            super_frame_allocator: None,
+            persistent_allocator,
+        }
+    }
+
+    fn init(window: Window) -> Result<Self, Box<dyn Error>> {
         let raw_window_handle = window.raw_window_handle();
+        let raw_display_handle = window.raw_display_handle();
         let ash_entry = unsafe { Entry::load()? };
 
         let instance = InstanceBuilder::default()
@@ -165,33 +174,24 @@ impl App {
             .get_queue_index(vk::QueueFlags::GRAPHICS)
             .expect("No graphics queue");
         ctx.create_command_queue(graphics_queue_index, vir::DomainFlag::Graphics);
-        let super_frame_allocator = ctx.create_super_frame_allocator();
+
         let persistent_allocator = ctx.create_persistent_allocator();
 
-        Ok(Self {
-            window,
-            ash_entry,
-            swapchain: None,
-            ctx,
-            super_frame_allocator,
-            persistent_allocator,
-        })
+        let surface = create_surface(&ash_entry, ctx.instance(), raw_window_handle, raw_display_handle)?;
+
+        Ok(Self::new(window, surface, ash_entry, ctx, persistent_allocator))
     }
 
-    fn create_swapchain(
-        &mut self, extent: vk::Extent2D, raw_window_handle: RawWindowHandle, raw_display_handle: RawDisplayHandle,
-    ) -> Result<SwapChain, vk::Result> {
-        let instance = self.ctx.instance();
+    fn create_swapchain(&mut self, extent: vk::Extent2D) -> Result<SwapChain, vk::Result> {
         let physical_device = self.ctx.physical_device();
         let swapchain_loader = self.ctx.swapchain_loader();
         let surface_loader = self.ctx.surface_loader();
 
-        let surface = create_surface(&self.ash_entry, instance, raw_window_handle, raw_display_handle)?;
         let old_swapchain = self.swapchain.as_ref().map_or(vk::SwapchainKHR::null(), |s| s.handle);
         let (swapchain_handle, swapchain_format, swapchain_extent) = SwapChainBuilder::new(*physical_device)
             .set_desired_extent(extent.width, extent.height)
             .set_old_swapchain(old_swapchain)
-            .build(surface_loader, &surface, swapchain_loader)?;
+            .build(surface_loader, &self.surface, swapchain_loader)?;
 
         let swapchain_images = unsafe { swapchain_loader.get_swapchain_images(swapchain_handle) }?;
         let attachments = swapchain_images
@@ -201,6 +201,10 @@ impl App {
                 let extent = vk::Extent3D::default()
                     .width(swapchain_extent.width)
                     .height(swapchain_extent.height);
+                let subresource_range = vk::ImageSubresourceRange::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .layer_count(1)
+                    .level_count(1);
 
                 ImageAttachment::new(
                     image,
@@ -209,10 +213,30 @@ impl App {
                     vk::SampleCountFlags::TYPE_1,
                     vk::ImageLayout::UNDEFINED,
                 )
+                .with_subresource_range(subresource_range)
+                .with_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_DST)
             })
             .collect::<Vec<_>>();
 
-        SwapChain::new(&mut self.persistent_allocator, swapchain_handle, surface, attachments)
+        let image_count = attachments.len();
+        let swapchain = SwapChain::new(
+            &mut self.persistent_allocator,
+            swapchain_handle,
+            self.surface,
+            attachments,
+        )?;
+        self.super_frame_allocator = Some(self.ctx.create_super_frame_allocator(image_count));
+        Ok(swapchain)
+    }
+
+    fn recreate_swapchain(&mut self) -> Result<(), vk::Result> {
+        let size = self.window.handle.inner_size();
+        let extent = vk::Extent2D {
+            width: size.width,
+            height: size.height,
+        };
+        self.swapchain = Some(self.create_swapchain(extent)?);
+        Ok(())
     }
 
     fn run(&mut self) -> Result<(), vk::Result> {
@@ -220,7 +244,11 @@ impl App {
             return Err(vk::Result::ERROR_SURFACE_LOST_KHR);
         };
 
-        let next_frame = self.super_frame_allocator.get_next_frame()?;
+        let next_frame = self
+            .super_frame_allocator
+            .as_mut()
+            .expect("swapchain must be created before rendering")
+            .get_next_frame()?;
         let mut frame_allocator = AllocatorKind::Frame(next_frame);
 
         let mut module = vir::Module::default();
@@ -230,10 +258,9 @@ impl App {
         let executable = module.compile(attachment);
 
         let mut graph = vir::RenderGraph::new(&self.ctx, executable.as_slice());
-        graph.dump();
-        graph.submit(&mut frame_allocator)?;
+        // graph.dump();
 
-        panic!();
+        graph.submit(&mut frame_allocator)
     }
 }
 
@@ -249,20 +276,9 @@ impl ApplicationHandler for AppWrapper {
         )
         .expect("Cannot create new window");
 
-        let mut app = App::new(window).expect("Cannot create new app");
+        let mut app = App::init(window).expect("Cannot initialize app");
 
-        let raw_window_handle = app.window.raw_window_handle();
-        let raw_display_handle = app.window.raw_display_handle();
-        let window_inner_size = app.window.handle.inner_size();
-        let window_extent = vk::Extent2D {
-            width: window_inner_size.width,
-            height: window_inner_size.height,
-        };
-
-        app.swapchain = Some(
-            app.create_swapchain(window_extent, raw_window_handle, raw_display_handle)
-                .expect("Failed to create swapchain"),
-        );
+        app.recreate_swapchain().expect("Failed to create swapchain");
 
         self.app = Some(app);
     }
@@ -270,28 +286,25 @@ impl ApplicationHandler for AppWrapper {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
         let app = self.app.as_mut().unwrap();
         match event {
-            WindowEvent::Resized(physical_size) => {
-                let raw_window_handle = app.window.raw_window_handle();
-                let raw_display_handle = app.window.raw_display_handle();
-                app.swapchain = Some(
-                    app.create_swapchain(
-                        vk::Extent2D {
-                            width: physical_size.width,
-                            height: physical_size.height,
-                        },
-                        raw_window_handle,
-                        raw_display_handle,
-                    )
-                    .expect("Failed to create swapchain"),
-                );
+            WindowEvent::Resized(_) => {
+                // Recreate with current inner_size — physical_size from the event
+                // can be stale on some platforms.
+                app.recreate_swapchain()
+                    .expect("Failed to recreate swapchain on resize");
             },
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::RedrawRequested => {
                 app.window.handle.request_redraw();
-                app.run().unwrap();
+                match app.run() {
+                    Ok(()) => {},
+                    Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                        app.recreate_swapchain().expect("Failed to recreate swapchain");
+                    },
+                    Err(e) => panic!("Render error: {e}"),
+                }
             },
-            _ => (),
-        };
+            _ => {},
+        }
     }
 }
 
@@ -305,9 +318,9 @@ impl Window {
             .with_title(title)
             .with_inner_size(LogicalSize::new(size.width, size.height));
 
-        let handle = event_loop.create_window(window_attribs)?;
-
-        Ok(Self { handle })
+        Ok(Self {
+            handle: event_loop.create_window(window_attribs)?,
+        })
     }
 
     fn raw_window_handle(&self) -> RawWindowHandle { self.handle.window_handle().unwrap().as_raw() }
@@ -316,9 +329,7 @@ impl Window {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    tracing_subscriber::fmt() //
-        .with_max_level(tracing::Level::DEBUG)
-        .init();
+    tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).init();
 
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);

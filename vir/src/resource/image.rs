@@ -15,3 +15,7 @@ impl Image {
 
     pub fn is_null(&self) -> bool { self.handle.is_null() }
 }
+
+impl From<&Image> for vk::Image {
+    fn from(image: &Image) -> Self { image.handle }
+}

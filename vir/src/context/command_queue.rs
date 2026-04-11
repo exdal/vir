@@ -15,6 +15,10 @@ bitflags! {
     }
 }
 
+impl Default for DomainFlag {
+    fn default() -> Self { Self::None }
+}
+
 pub struct CommandQueue {
     inner: vk::Queue,
     device: NonNull<ash::Device>,

@@ -12,7 +12,8 @@ pub struct ImageAttachment {
     extent: vk::Extent3D,
     samples: vk::SampleCountFlags,
     layout: vk::ImageLayout,
-    subresource: vk::ImageSubresourceRange,
+    usage: vk::ImageUsageFlags,
+    subresource_range: vk::ImageSubresourceRange,
 }
 
 impl ImageAttachment {
@@ -26,7 +27,8 @@ impl ImageAttachment {
             extent,
             samples,
             layout,
-            subresource: vk::ImageSubresourceRange::default(),
+            usage: vk::ImageUsageFlags::default(),
+            subresource_range: vk::ImageSubresourceRange::default(),
         }
     }
 
@@ -35,8 +37,13 @@ impl ImageAttachment {
         self
     }
 
-    pub fn with_subresource(mut self, subresource: vk::ImageSubresourceRange) -> Self {
-        self.subresource = subresource;
+    pub fn with_subresource_range(mut self, subresource: vk::ImageSubresourceRange) -> Self {
+        self.subresource_range = subresource;
+        self
+    }
+
+    pub fn with_usage(mut self, usage: vk::ImageUsageFlags) -> Self {
+        self.usage = usage;
         self
     }
 
@@ -50,11 +57,15 @@ impl ImageAttachment {
 
     pub fn samples(&self) -> vk::SampleCountFlags { self.samples }
 
-    pub fn base_level(&self) -> u32 { self.subresource.base_mip_level }
+    pub fn base_level(&self) -> u32 { self.subresource_range.base_mip_level }
 
-    pub fn level_count(&self) -> u32 { self.subresource.level_count }
+    pub fn level_count(&self) -> u32 { self.subresource_range.level_count }
 
-    pub fn base_layer(&self) -> u32 { self.subresource.base_array_layer }
+    pub fn base_layer(&self) -> u32 { self.subresource_range.base_array_layer }
 
-    pub fn layer_count(&self) -> u32 { self.subresource.layer_count }
+    pub fn layer_count(&self) -> u32 { self.subresource_range.layer_count }
+
+    pub fn usage(&self) -> vk::ImageUsageFlags { self.usage }
+
+    pub fn subresource_range(&self) -> vk::ImageSubresourceRange { self.subresource_range }
 }

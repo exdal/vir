@@ -9,6 +9,7 @@ pub enum Value {
     Extent3D(vk::Extent3D),
     ImageAttachment(ImageAttachment),
     Slice(Vec<ValueId>),
+    Reference(ValueId),
 }
 
 pub trait FromValue {
@@ -47,6 +48,15 @@ impl FromValue for Vec<ValueId> {
         match value {
             Value::Slice(v) => v.clone(),
             _ => panic!("expected Slice, got {:?}", value),
+        }
+    }
+}
+
+impl FromValue for ValueId {
+    fn from_value(value: &Value) -> Self {
+        match value {
+            Value::Reference(v) => v.clone(),
+            _ => panic!("expected Reference, got {:?}", value),
         }
     }
 }

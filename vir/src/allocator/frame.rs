@@ -12,6 +12,7 @@ pub struct FrameAllocator {
     upstream: PersistentAllocator,
     cmd_pool: vk::CommandPool,
     semaphores: Vec<vk::Semaphore>,
+    image_views: Vec<vk::ImageView>,
 }
 
 impl FrameAllocator {
@@ -22,6 +23,7 @@ impl FrameAllocator {
             upstream,
             cmd_pool: vk::CommandPool::null(),
             semaphores: Vec::default(),
+            image_views: Vec::default(),
         }
     }
 
@@ -44,6 +46,11 @@ impl FrameAllocator {
             .iter()
             .for_each(|sema| self.upstream.deallocate_semaphore(*sema));
         self.semaphores.clear();
+
+        self.image_views
+            .iter()
+            .for_each(|view| self.upstream.deallocate_image_view(*view));
+        self.image_views.clear();
 
         self.issued_frame = issued_frame;
 
@@ -78,6 +85,17 @@ impl Allocator for FrameAllocator {
 
         Ok(CommandBuffer::new(self.device, cmd_buffer))
     }
+
+    fn allocate_image_view(
+        &mut self, image: vk::Image, format: vk::Format, view_type: vk::ImageViewType,
+        subresource_range: vk::ImageSubresourceRange,
+    ) -> Result<vk::ImageView, vk::Result> {
+        self.upstream
+            .allocate_image_view(image, format, view_type, subresource_range)
+            .inspect(|x| self.image_views.push(*x))
+    }
+
+    fn deallocate_image_view(&mut self, _: vk::ImageView) {}
 }
 
 pub struct SuperFrameAllocator {

@@ -10,6 +10,10 @@ pub struct CommandBuffer {
     handle: vk::CommandBuffer,
 }
 
+impl From<&CommandBuffer> for vk::CommandBuffer {
+    fn from(cmd_buf: &CommandBuffer) -> Self { cmd_buf.handle }
+}
+
 impl CommandBuffer {
     pub fn new(device: NonNull<ash::Device>, handle: vk::CommandBuffer) -> Self { Self { device, handle } }
 
@@ -45,14 +49,41 @@ impl CommandBuffer {
         }
     }
 
-    pub fn clear(
-        &self, image: vk::Image, image_layout: vk::ImageLayout, clear_color_value: &vk::ClearColorValue,
-        ranges: &[vk::ImageSubresourceRange],
+    pub fn image_barrier(
+        &self, image: vk::Image, src_access: Access, dst_access: Access, old_layout: vk::ImageLayout,
+        new_layout: vk::ImageLayout, subresource_range: vk::ImageSubresourceRange,
     ) {
+        let image_barrier = [vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(src_access.into())
+            .src_access_mask(src_access.into())
+            .dst_stage_mask(dst_access.into())
+            .dst_access_mask(dst_access.into())
+            .old_layout(old_layout)
+            .new_layout(new_layout)
+            .src_queue_family_index(u32::MAX)
+            .dst_queue_family_index(u32::MAX)
+            .subresource_range(subresource_range)
+            .image(image)];
+        let dependency_info = vk::DependencyInfo::default().image_memory_barriers(&image_barrier);
         unsafe {
             self.device
                 .as_ref()
-                .cmd_clear_color_image(self.handle, image, image_layout, &clear_color_value, ranges);
+                .cmd_pipeline_barrier2(self.handle, &dependency_info)
+        }
+    }
+
+    pub fn clear_color(
+        &self, image: vk::Image, image_layout: vk::ImageLayout, clear_color_value: &vk::ClearValue,
+        ranges: &[vk::ImageSubresourceRange],
+    ) {
+        unsafe {
+            self.device.as_ref().cmd_clear_color_image(
+                self.handle,
+                image,
+                image_layout,
+                &clear_color_value.color,
+                ranges,
+            );
         }
     }
 }

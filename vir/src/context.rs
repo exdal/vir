@@ -88,7 +88,7 @@ impl Context {
         PersistentAllocator::new(NonNull::from(self.device.as_ref()))
     }
 
-    pub fn create_super_frame_allocator(&self) -> SuperFrameAllocator {
-        SuperFrameAllocator::new(NonNull::from(self.device.as_ref()), 3)
+    pub fn create_super_frame_allocator(&self, frame_count: usize) -> SuperFrameAllocator {
+        SuperFrameAllocator::new(NonNull::from(self.device.as_ref()), frame_count)
     }
 }
