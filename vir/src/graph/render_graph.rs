@@ -247,9 +247,10 @@ impl<'a> RenderGraph<'a> {
             },
             IR::Array(v) => self.set_value(value_id, Value::Slice(v.clone())),
             IR::ConstructBuffer { .. } => todo!(),
-            IR::ConstructImage {
+            IR::DeclareImage {
                 image,
                 image_view,
+                view_type,
                 extent,
                 format,
                 samples,
@@ -267,17 +268,15 @@ impl<'a> RenderGraph<'a> {
                     layer_count: self.get::<u32>(layer_count),
                     ..Default::default()
                 };
-                // let image_view = if image_view.is_null() {
-                //     allocator.allocate_image_view(image.handle, *format, view_type, subresource_range)?
-                // } else {
-                //     *image_view
-                // };
+                let image_view = if image_view.is_null() {
+                    allocator.allocate_image_view(image.handle, *format, *view_type, subresource_range)?
+                } else {
+                    *image_view
+                };
 
-                let attachment =
-                    ImageAttachment::new(image.clone(), *format, extent, *samples, vk::ImageLayout::UNDEFINED)
+                let attachment = ImageAttachment::new(image.clone(), *format, extent, *samples, vk::ImageLayout::UNDEFINED)
                         // .with_image_view(image_view)
-                        .with_subresource_range(subresource_range)
-                        .with_usage(*usage);
+                        .with_subresource_range(subresource_range);
                 self.set_value(value_id, Value::ImageAttachment(attachment));
             },
             IR::AcquireNextImage {
