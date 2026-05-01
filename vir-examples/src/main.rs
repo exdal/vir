@@ -214,7 +214,6 @@ impl App {
                     vk::ImageLayout::UNDEFINED,
                 )
                 .with_subresource_range(subresource_range)
-                .with_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_DST)
             })
             .collect::<Vec<_>>();
 
@@ -258,7 +257,9 @@ impl App {
         let executable = module.compile(attachment);
 
         let mut graph = vir::RenderGraph::new(&self.ctx, executable.as_slice());
-        // graph.dump();
+        graph.dump();
+
+        panic!();
 
         graph.submit(&mut frame_allocator)
     }

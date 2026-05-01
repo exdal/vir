@@ -1,6 +1,18 @@
+use std::fmt;
+
 use ash::vk;
 
-use crate::{ImageAttachment, ValueId};
+use crate::{Access, ClearValue, ImageAttachment};
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ValueId(pub u32);
+
+impl fmt::Display for ValueId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "%{}", self.0) }
+}
+impl fmt::Debug for ValueId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { fmt::Display::fmt(self, f) }
+}
 
 #[derive(Debug, Clone)]
 pub enum Value {
@@ -10,6 +22,8 @@ pub enum Value {
     ImageAttachment(ImageAttachment),
     Slice(Vec<ValueId>),
     Reference(ValueId),
+    Access(Access),
+    ClearValue(ClearValue),
 }
 
 pub trait FromValue {
@@ -57,6 +71,24 @@ impl FromValue for ValueId {
         match value {
             Value::Reference(v) => v.clone(),
             _ => panic!("expected Reference, got {:?}", value),
+        }
+    }
+}
+
+impl FromValue for Access {
+    fn from_value(value: &Value) -> Self {
+        match value {
+            Value::Access(v) => v.clone(),
+            _ => panic!("expected Access, got {:?}", value),
+        }
+    }
+}
+
+impl FromValue for ClearValue {
+    fn from_value(value: &Value) -> Self {
+        match value {
+            Value::ClearValue(v) => v.clone(),
+            _ => panic!("expected ClearValue, got {:?}", value),
         }
     }
 }

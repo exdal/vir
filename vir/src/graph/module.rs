@@ -19,13 +19,13 @@ fn layout_for_domain(domain: DomainFlag) -> vk::ImageLayout {
 
 #[derive(Default)]
 pub struct Module {
+    types: HashMap<ir::Type, ValueId>,
     constants: HashMap<ir::Constant, ValueId>,
-    declares: HashMap<IR, ValueId>,
-    nodes: Vec<IR>,
+    instructions: Vec<IR>,
 }
 
 impl Module {
-    fn get(&self, id: ValueId) -> &IR { &self.nodes[id.0 as usize] }
+    fn get(&self, id: ValueId) -> &IR { &self.instructions[id.0 as usize] }
 
     fn resolve_access(&self, id: ValueId) -> Access {
         match self.get(id) {
@@ -35,8 +35,17 @@ impl Module {
     }
 
     fn emit(&mut self, ir: IR) -> ValueId {
-        let id = ValueId(self.nodes.len() as u32);
-        self.nodes.push(ir);
+        let id = ValueId(self.instructions.len() as u32);
+        self.instructions.push(ir);
+        id
+    }
+
+    fn lower_type(&mut self, ty: ir::Type) -> ValueId {
+        if let Some(&id) = self.types.get(&ty) {
+            return id;
+        }
+        let id = self.emit(IR::Type(ty));
+        self.types.insert(ty, id);
         id
     }
 
@@ -55,15 +64,20 @@ impl Module {
 
     fn lower_access(&mut self, access: Access) -> ValueId { self.lower_constant(ir::Constant::Access(access)) }
 
-    fn lower_array(&mut self, v: Vec<ValueId>) -> ValueId { self.emit(IR::Array(v)) }
+    fn lower_array(&mut self, ty: ValueId, elements: Vec<ValueId>) -> ValueId { self.emit(IR::Array { ty, elements }) }
 
-    fn lower_image_attachment(&mut self, attachment: &ImageAttachment) -> ValueId {
+    fn lower_image_attachment(&mut self, attachment: &ImageAttachment) -> (ValueId, ValueId) {
         let extent = self.lower_constant(ir::Constant::Extent3D(attachment.extent()));
         let base_level = self.lower_u32(attachment.base_level());
         let level_count = self.lower_u32(attachment.level_count());
         let base_layer = self.lower_u32(attachment.base_layer());
         let layer_count = self.lower_u32(attachment.layer_count());
-        let declare_image = IR::DeclareImage {
+
+        let ty_instr = self.lower_type(ir::Type::Image {
+            format: attachment.format(),
+            samples: attachment.samples(),
+        });
+        let construct_instr = self.emit(IR::ConstructImage {
             image: attachment.image().clone(),
             image_view: attachment.image_view(),
             view_type: vk::ImageViewType::from_raw(-1),
@@ -75,26 +89,22 @@ impl Module {
             base_layer,
             layer_count,
             usage: vk::ImageUsageFlags::empty(),
-        };
+        });
 
-        let declare_id = if let Some(&existing) = self.declares.get(&declare_image) {
-            existing
-        } else {
-            let id = self.emit(declare_image.clone());
-            self.declares.insert(declare_image, id);
-            id
-        };
-
-        self.emit(IR::ConstructImage { image: declare_id })
+        (ty_instr, construct_instr)
     }
 
     pub fn acquire_next_image(&mut self, swapchain: &SwapChain) -> ValueId {
-        let attach_values = swapchain
+        let (ty_instr, attach_instr): (Vec<_>, Vec<_>) = swapchain
             .attachments
             .iter()
-            .map(|a| self.lower_image_attachment(a))
-            .collect::<Vec<_>>();
-        let attachments = self.lower_array(attach_values);
+            .map(|attach| self.lower_image_attachment(attach))
+            .unzip();
+
+        let ty = ty_instr[0];
+        assert!(ty_instr.iter().all(|&i| i == ty));
+        let attachments = self.lower_array(ty, attach_instr);
+
         self.emit(IR::AcquireNextImage {
             swapchain: swapchain.handle,
             attachments,
@@ -102,10 +112,10 @@ impl Module {
         })
     }
 
-    pub fn release(&mut self, value: ValueId, access: Access, dst_domain: DomainFlag) -> ValueId {
+    pub fn release(&mut self, resource: ValueId, access: Access, dst_domain: DomainFlag) -> ValueId {
         let access = self.lower_access(access);
         self.emit(IR::Release {
-            resource: value,
+            resource,
             access,
             dst_domain,
         })
@@ -120,12 +130,13 @@ impl Module {
         self.emit(IR::Clear { attachment, color })
     }
 
-    pub fn compile(&self, id: ValueId) -> Vec<(ValueId, IR)> {
+    pub fn compile(&self, id: ValueId) -> Vec<ir::Instr> {
         let linearized = self.topo_sort(id);
-        self.sync(linearized)
+        let synced = self.sync(linearized);
+        self.infer(synced)
     }
 
-    fn topo_sort(&self, value_id: ValueId) -> Vec<(ValueId, IR)> {
+    fn topo_sort(&self, value_id: ValueId) -> Vec<ir::Instr> {
         let mut nodes = Vec::new();
         let mut stack = vec![value_id];
         let mut visited = std::collections::HashSet::new();
@@ -141,14 +152,15 @@ impl Module {
                 stack.push(id);
                 match ir {
                     IR::Constant(_) => {},
-                    IR::Array(ids) => ids.iter().rev().for_each(|v| stack.push(*v)),
-                    IR::DeclareBuffer { size, .. } => {
+                    IR::Type(_) => {},
+                    IR::Array { ty, elements } => {
+                        stack.push(*ty);
+                        elements.iter().rev().for_each(|v| stack.push(*v));
+                    },
+                    IR::ConstructBuffer { size, .. } => {
                         stack.push(*size);
                     },
-                    IR::ConstructBuffer { buffer } => {
-                        stack.push(*buffer);
-                    },
-                    IR::DeclareImage {
+                    IR::ConstructImage {
                         extent,
                         base_level,
                         level_count,
@@ -161,9 +173,6 @@ impl Module {
                         stack.push(*level_count);
                         stack.push(*base_level);
                         stack.push(*extent);
-                    },
-                    IR::ConstructImage { image } => {
-                        stack.push(*image);
                     },
                     IR::AcquireNextImage { attachments, .. } => {
                         stack.push(*attachments);
@@ -184,22 +193,19 @@ impl Module {
                         stack.push(*color);
                         stack.push(*attachment);
                     },
-                    IR::MemoryBarrier {
-                        src_access_flags,
-                        dst_access_flags,
-                    } => {
-                        stack.push(*dst_access_flags);
-                        stack.push(*src_access_flags);
+                    IR::MemoryBarrier { src_access, dst_access } => {
+                        stack.push(*dst_access);
+                        stack.push(*src_access);
                     },
                     IR::ImageBarrier {
-                        src_access_flags,
-                        dst_access_flags,
+                        src_access,
+                        dst_access,
                         value,
                         ..
                     } => {
                         stack.push(*value);
-                        stack.push(*dst_access_flags);
-                        stack.push(*src_access_flags);
+                        stack.push(*dst_access);
+                        stack.push(*src_access);
                     },
                 }
             } else {
@@ -211,10 +217,10 @@ impl Module {
         nodes
     }
 
-    fn sync(&self, nodes: Vec<(ValueId, IR)>) -> Vec<(ValueId, IR)> {
+    fn sync(&self, nodes: Vec<ir::Instr>) -> Vec<ir::Instr> {
         let mut result = Vec::with_capacity(nodes.len() * 2);
         let mut states: HashMap<ValueId, ResourceState> = HashMap::new();
-        let mut next_id = self.nodes.len() as u32;
+        let mut next_id = self.instructions.len() as u32;
 
         macro_rules! alloc {
             () => {{
@@ -236,8 +242,8 @@ impl Module {
                 result.push((
                     id,
                     IR::ImageBarrier {
-                        src_access_flags: $src,
-                        dst_access_flags: $dst,
+                        src_access: $src,
+                        dst_access: $dst,
                         old_layout: $old,
                         new_layout: $new,
                         value: $res,
@@ -313,4 +319,6 @@ impl Module {
 
         result
     }
+
+    fn infer(&self, mut nodes: Vec<ir::Instr>) -> Vec<ir::Instr> { nodes }
 }

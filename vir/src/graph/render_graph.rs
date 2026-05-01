@@ -5,6 +5,7 @@ use ash::vk::{self, Handle};
 use crate::{
     Access,
     AllocatorKind,
+    ClearValue,
     CommandBuffer,
     Context,
     DomainFlag,
@@ -102,7 +103,7 @@ impl PresentInfo {
 
 pub struct RenderGraph<'a> {
     ctx: &'a Context,
-    nodes: &'a [(ValueId, IR)],
+    instructions: &'a [ir::Instr],
     values: Vec<Value>,
     current_batch: Option<Batch>,
     current_submit: Submit,
@@ -112,10 +113,10 @@ pub struct RenderGraph<'a> {
 }
 
 impl<'a> RenderGraph<'a> {
-    pub fn new(ctx: &'a Context, nodes: &'a [(ValueId, IR)]) -> Self {
+    pub fn new(ctx: &'a Context, instructions: &'a [ir::Instr]) -> Self {
         Self {
             ctx,
-            nodes,
+            instructions,
             values: Vec::new(),
             current_batch: None,
             current_submit: Submit::default(),
@@ -181,7 +182,7 @@ impl<'a> RenderGraph<'a> {
     }
 
     pub fn submit(&mut self, allocator: &mut AllocatorKind) -> Result<(), vk::Result> {
-        for (value_id, node) in self.nodes {
+        for (value_id, node) in self.instructions {
             self.execute(value_id, node, allocator)?;
         }
 
@@ -230,7 +231,7 @@ impl<'a> RenderGraph<'a> {
     }
 
     pub fn dump(&self) {
-        self.nodes.iter().for_each(|(id, node)| {
+        self.instructions.iter().for_each(|(id, node)| {
             println!("%{} = {}", id.0, node);
         });
     }
@@ -239,15 +240,18 @@ impl<'a> RenderGraph<'a> {
         self.ensure_batch(allocator)?;
 
         match ir {
+            IR::Type(_) => todo!(),
             IR::Constant(c) => match c {
                 ir::Constant::I32(_) => todo!(),
                 ir::Constant::U32(v) => self.set_value(value_id, Value::U32(*v)),
                 ir::Constant::Extent2D(_) => todo!(),
                 ir::Constant::Extent3D(v) => self.set_value(value_id, Value::Extent3D(*v)),
+                ir::Constant::Access(v) => self.set_value(value_id, Value::Access(*v)),
+                ir::Constant::ClearValue(v) => self.set_value(value_id, Value::ClearValue(*v)),
             },
-            IR::Array(v) => self.set_value(value_id, Value::Slice(v.clone())),
+            IR::Array { ty: _, elements } => self.set_value(value_id, Value::Slice(elements.clone())),
             IR::ConstructBuffer { .. } => todo!(),
-            IR::DeclareImage {
+            IR::ConstructImage {
                 image,
                 image_view,
                 view_type,
@@ -274,8 +278,9 @@ impl<'a> RenderGraph<'a> {
                     *image_view
                 };
 
-                let attachment = ImageAttachment::new(image.clone(), *format, extent, *samples, vk::ImageLayout::UNDEFINED)
-                        // .with_image_view(image_view)
+                let attachment =
+                    ImageAttachment::new(image.clone(), *format, extent, *samples, vk::ImageLayout::UNDEFINED)
+                        .with_image_view(image_view)
                         .with_subresource_range(subresource_range);
                 self.set_value(value_id, Value::ImageAttachment(attachment));
             },
@@ -290,10 +295,6 @@ impl<'a> RenderGraph<'a> {
 
                 let attachments = self.get::<Vec<ValueId>>(attachments);
                 let attachment_value_id = attachments[image_index as usize];
-                self.resource_to_swapchain.insert(
-                    attachment_value_id,
-                    PresentInfo::new(image_index, *swapchain, present_semaphores[image_index as usize]),
-                );
                 self.set_value(value_id, Value::Reference(attachment_value_id));
             },
             IR::Acquire { .. } => todo!(),
@@ -302,6 +303,7 @@ impl<'a> RenderGraph<'a> {
                 access,
                 dst_domain,
             } => {
+                let access = self.get::<Access>(access);
                 let resolved = self.resolve_id(resource);
                 if dst_domain.contains(DomainFlag::Present) {
                     let present = self
@@ -312,7 +314,7 @@ impl<'a> RenderGraph<'a> {
                     self.flush_submit(Some(SemaphoreSubmitInfo {
                         semaphore: present.semaphore,
                         value: 0,
-                        access: *access,
+                        access,
                     }))?;
 
                     self.presents.push(present);
@@ -324,33 +326,35 @@ impl<'a> RenderGraph<'a> {
             IR::Clear { attachment, color } => {
                 self.set_value(value_id, Value::Reference(*attachment));
                 let attachment = self.get::<ImageAttachment>(attachment);
+                let color = self.get::<ClearValue>(color);
                 let subresource_range = attachment.subresource_range();
                 self.batch()?.clear_color(
                     attachment.image().into(),
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    color,
+                    &color,
                     &[subresource_range],
                 );
             },
-            IR::MemoryBarrier {
-                src_access_flags,
-                dst_access_flags,
-            } => {
-                self.batch()?.memory_barrier(*src_access_flags, *dst_access_flags);
+            IR::MemoryBarrier { src_access, dst_access } => {
+                let src_access_flags = self.get::<Access>(src_access);
+                let dst_access_flags = self.get::<Access>(dst_access);
+                self.batch()?.memory_barrier(src_access_flags, dst_access_flags);
             },
             IR::ImageBarrier {
-                src_access_flags,
-                dst_access_flags,
+                src_access,
+                dst_access,
                 old_layout,
                 new_layout,
                 value,
             } => {
+                let src_access_flags = self.get::<Access>(src_access);
+                let dst_access_flags = self.get::<Access>(dst_access);
                 let attachment = self.get::<ImageAttachment>(value);
                 let subresource_range = attachment.subresource_range();
                 self.batch()?.image_barrier(
                     attachment.image().into(),
-                    *src_access_flags,
-                    *dst_access_flags,
+                    src_access_flags,
+                    dst_access_flags,
                     *old_layout,
                     *new_layout,
                     subresource_range,

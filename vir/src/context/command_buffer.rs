@@ -2,7 +2,7 @@ use std::ptr::NonNull;
 
 use ash::vk;
 
-use crate::Access;
+use crate::{Access, ClearValue};
 
 #[derive(Clone)]
 pub struct CommandBuffer {
@@ -73,7 +73,7 @@ impl CommandBuffer {
     }
 
     pub fn clear_color(
-        &self, image: vk::Image, image_layout: vk::ImageLayout, clear_color_value: &vk::ClearValue,
+        &self, image: vk::Image, image_layout: vk::ImageLayout, clear_color_value: &ClearValue,
         ranges: &[vk::ImageSubresourceRange],
     ) {
         unsafe {
@@ -81,7 +81,7 @@ impl CommandBuffer {
                 self.handle,
                 image,
                 image_layout,
-                &clear_color_value.color,
+                &clear_color_value.0.color,
                 ranges,
             );
         }

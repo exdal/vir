@@ -352,3 +352,37 @@ impl From<Access> for vk::ImageLayout {
         vk::ImageLayout::UNDEFINED
     }
 }
+
+impl From<Access> for vk::ImageUsageFlags {
+    fn from(access: Access) -> Self {
+        let mut usage = vk::ImageUsageFlags::empty();
+
+        if access.intersects(Access::MemoryRW | Access::ColorRW) {
+            usage |= vk::ImageUsageFlags::COLOR_ATTACHMENT;
+        }
+        if access.intersects(
+            Access::MemoryRW
+                | Access::FragmentSampled
+                | Access::ComputeSampled
+                | Access::RayTracingSampled
+                | Access::VertexSampled
+                | Access::TessellationSampled,
+        ) {
+            usage |= vk::ImageUsageFlags::SAMPLED;
+        }
+        if access.intersects(Access::MemoryRW | Access::DepthStencilRW) {
+            usage |= vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT;
+        }
+        if access.intersects(Access::MemoryRW | Access::TransferRead) {
+            usage |= vk::ImageUsageFlags::TRANSFER_SRC;
+        }
+        if access.intersects(Access::MemoryRW | Access::TransferWrite) {
+            usage |= vk::ImageUsageFlags::TRANSFER_DST;
+        }
+        if access.intersects(Access::MemoryRW | Access::FragmentRW | Access::ComputeRW | Access::RayTracingRW) {
+            usage |= vk::ImageUsageFlags::STORAGE;
+        }
+
+        usage
+    }
+}
