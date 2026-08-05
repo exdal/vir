@@ -3,14 +3,22 @@ use std::{env, error::Error, path::PathBuf};
 use shader_slang as slang;
 use slang::Downcast;
 
-const ENTRY_POINTS: [(&str, &str); 3] = [
-    ("vs_main", "triangle.vert.spv"),
-    ("fs_main", "triangle.frag.spv"),
-    ("vs_buffer", "triangle_buffer.vert.spv"),
+/// Every Slang module, with the entry points to pull out of it and the file each one is
+/// written to. A module is linked on its own, so entry point names only have to be unique
+/// within their module.
+const MODULES: [(&str, &[(&str, &str)]); 2] = [
+    ("triangle.slang", &[
+        ("vs_main", "triangle.vert.spv"),
+        ("fs_main", "triangle.frag.spv"),
+        ("vs_buffer", "triangle_buffer.vert.spv"),
+    ]),
+    ("egui.slang", &[("vs_main", "egui.vert.spv"), ("fs_main", "egui.frag.spv")]),
 ];
 
 fn main() -> Result<(), Box<dyn Error>> {
-    println!("cargo:rerun-if-changed=shaders/triangle.slang");
+    for (module, _) in MODULES {
+        println!("cargo:rerun-if-changed=shaders/{module}");
+    }
     println!("cargo:rerun-if-changed=build.rs");
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
@@ -39,24 +47,26 @@ fn main() -> Result<(), Box<dyn Error>> {
         .create_session(&session_desc)
         .ok_or("failed to create Slang session")?;
 
-    let module = session.load_module("triangle.slang")?;
+    for (module_name, entry_points) in MODULES {
+        let module = session.load_module(module_name)?;
 
-    // Link the module together with every entry point once, so they share a single
-    // layout, then pull the per-stage SPIR-V back out.
-    let mut components = vec![module.downcast().clone()];
-    for (entry_point, _) in ENTRY_POINTS {
-        let entry_point = module
-            .find_entry_point_by_name(entry_point)
-            .ok_or_else(|| format!("entry point `{entry_point}` not found in triangle.slang"))?;
-        components.push(entry_point.downcast().clone());
-    }
+        // Link the module together with every entry point once, so they share a single
+        // layout, then pull the per-stage SPIR-V back out.
+        let mut components = vec![module.downcast().clone()];
+        for (entry_point, _) in entry_points {
+            let entry_point = module
+                .find_entry_point_by_name(entry_point)
+                .ok_or_else(|| format!("entry point `{entry_point}` not found in {module_name}"))?;
+            components.push(entry_point.downcast().clone());
+        }
 
-    let program = session.create_composite_component_type(&components)?;
-    let linked = program.link()?;
+        let program = session.create_composite_component_type(&components)?;
+        let linked = program.link()?;
 
-    for (index, (_, file_name)) in ENTRY_POINTS.iter().enumerate() {
-        let code = linked.entry_point_code(index as i64, 0)?;
-        std::fs::write(out_dir.join(file_name), code.as_slice())?;
+        for (index, (_, file_name)) in entry_points.iter().enumerate() {
+            let code = linked.entry_point_code(index as i64, 0)?;
+            std::fs::write(out_dir.join(file_name), code.as_slice())?;
+        }
     }
 
     Ok(())

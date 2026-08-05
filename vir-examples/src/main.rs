@@ -1,4 +1,5 @@
 mod device_builder;
+mod egui_pass;
 
 use std::{error::Error, ffi::CStr, io::Cursor, result::Result, time::Instant};
 
@@ -36,7 +37,10 @@ use winit::{
     window::{Window as WinitWindow, WindowId},
 };
 
-use crate::device_builder::{DeviceBuilder, InstanceBuilder, PhysicalDeviceSelector, SwapChainBuilder};
+use crate::{
+    device_builder::{DeviceBuilder, InstanceBuilder, PhysicalDeviceSelector, SwapChainBuilder},
+    egui_pass::EguiPass,
+};
 
 fn get_surface_extension(handle: Option<RawWindowHandle>) -> Result<&'static CStr, vk::Result> {
     Ok(match handle {
@@ -108,6 +112,8 @@ fn create_surface(
 const TRIANGLE_VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/triangle.vert.spv"));
 const TRIANGLE_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/triangle.frag.spv"));
 const TRIANGLE_BUFFER_VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/triangle_buffer.vert.spv"));
+const EGUI_VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/egui.vert.spv"));
+const EGUI_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/egui.frag.spv"));
 
 /// One vertex as `vs_buffer` reads it: `float2 position` then `float3 color`, which is exactly
 /// what reflection packs into binding 0.
@@ -179,6 +185,21 @@ struct App {
     offscreen: Option<ImageAttachment>,
     dumped_ir: bool,
     start_time: Instant,
+    egui_ctx: egui::Context,
+    egui_state: egui_winit::State,
+    egui_pass: EguiPass,
+    ui: UiState,
+}
+
+/// What the debug panel is driving. Text does not render until the font atlas lands, so the
+/// panel is deliberately built out of shapes and widget frames.
+struct UiState {
+    spin: bool,
+    tint: f32,
+}
+
+impl Default for UiState {
+    fn default() -> Self { Self { spin: true, tint: 0.0 } }
 }
 
 /// Fully saturated rainbow color for `hue` in [0, 1).
@@ -196,6 +217,20 @@ fn rainbow(hue: f32) -> ClearValue {
     };
 
     ClearValue::rgba_f32(r, g, b, 1.0)
+}
+
+fn build_ui(ctx: &egui::Context, ui_state: &mut UiState) {
+    egui::Window::new("vir")
+        .default_pos([24.0, 24.0])
+        .default_size([260.0, 160.0])
+        .show(ctx, |ui| {
+            ui.checkbox(&mut ui_state.spin, "spin");
+            ui.add(egui::Slider::new(&mut ui_state.tint, 0.0..=1.0));
+            ui.separator();
+            if ui.button("reset").clicked() {
+                *ui_state = UiState::default();
+            }
+        });
 }
 
 fn read_spirv(bytes: &[u8]) -> Vec<u32> {
@@ -230,6 +265,17 @@ impl App {
             .allocate_buffer(&BufferInfo::vertex(size_of_val(&STATIC_TRIANGLE) as u64).with_name("static triangle"))?;
         static_vertices.write(0, &STATIC_TRIANGLE)?;
 
+        let egui_pass = EguiPass::new(&mut graph, &read_spirv(EGUI_VERT_SPV), &read_spirv(EGUI_FRAG_SPV))?;
+        let egui_ctx = egui::Context::default();
+        let egui_state = egui_winit::State::new(
+            egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            &window.handle,
+            Some(window.handle.scale_factor() as f32),
+            None,
+            None,
+        );
+
         Ok(Self {
             window,
             ash_entry,
@@ -245,6 +291,10 @@ impl App {
             offscreen: None,
             dumped_ir: false,
             start_time: Instant::now(),
+            egui_ctx,
+            egui_state,
+            egui_pass,
+            ui: UiState::default(),
         })
     }
 
@@ -420,14 +470,40 @@ impl App {
             return Err(vk::Result::ERROR_SURFACE_LOST_KHR);
         };
 
+        let target_extent = vk::Extent2D {
+            width: swapchain.attachments[0].extent().width,
+            height: swapchain.attachments[0].extent().height,
+        };
+
+        let raw_input = self.egui_state.take_egui_input(&self.window.handle);
+        let ui = &mut self.ui;
+        let mut egui_output = self.egui_ctx.run_ui(raw_input, |root| build_ui(root.ctx(), ui));
+        self.egui_state
+            .handle_platform_output(&self.window.handle, egui_output.platform_output);
+
+        egui_output.textures_delta.clear();
+
+        let pixels_per_point = egui_output.pixels_per_point;
+        let primitives = self.egui_ctx.tessellate(egui_output.shapes, pixels_per_point);
+
         let next_frame = self
             .super_frame_allocator
             .as_mut()
             .expect("swapchain must be created before rendering")
             .get_next_frame()?;
 
+        let egui_frame = self
+            .egui_pass
+            .prepare(next_frame, &primitives, pixels_per_point, target_extent)?;
+        tracing::trace!(
+            primitives = primitives.len(),
+            draws = egui_frame.draw_count(),
+            pixels_per_point,
+            "egui frame"
+        );
+
         let elapsed = self.start_time.elapsed().as_secs_f32();
-        let spinning = spinning_triangle(elapsed);
+        let spinning = spinning_triangle(if self.ui.spin { elapsed } else { 0.0 });
         let mut spinning_vertices = next_frame
             .allocate_buffer(&BufferInfo::vertex(size_of_val(&spinning) as u64).with_name("spinning triangle"))?;
         spinning_vertices.write(0, &spinning)?;
@@ -495,7 +571,7 @@ impl App {
             .push_constants_at(TINT_OFFSET, &0.0f32)
             .bind_vertex_buffer(0, static_vertices)
             .draw(3, 1)
-            .push_constants_at(TINT_OFFSET, &(0.5 + 0.5 * elapsed.sin()))
+            .push_constants_at(TINT_OFFSET, &self.ui.tint)
             .bind_vertex_buffer(0, spinning_vertices)
             .draw(3, 1)
             .end_rendering();
@@ -510,11 +586,13 @@ impl App {
         let scratch = module.blit(attachment, scratch);
         let swapchain_image = module.blit(scratch, swapchain_image);
 
+        let swapchain_image = self.egui_pass.record(&mut module, swapchain_image, &egui_frame);
+
         let present = module.present(swapchain_image);
         let resting = module.release(attachment, OFFSCREEN_RESTING_ACCESS, vir::DomainFlag::Graphics);
         let executable = module.compile_all(&[present, resting]);
 
-        if !self.dumped_ir {
+        if !self.dumped_ir && !egui_frame.is_empty() {
             RenderGraph::dump(executable.as_slice());
             self.dumped_ir = true;
         }
@@ -550,8 +628,10 @@ impl ApplicationHandler for AppWrapper {
             return;
         };
 
+        let _ = app.egui_state.on_window_event(&app.window.handle, &event);
+
         match event {
-            WindowEvent::Resized(_) => {
+            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
                 app.recreate_swapchain()
                     .expect("Failed to recreate swapchain on resize");
             },
@@ -643,6 +723,54 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// The whole egui backend rests on this: `epaint::Vertex` is `[f32;2], [f32;2], [u8;4]`, and
+    /// reflection only derives 32-bit attribute formats, so the shader declares the packed
+    /// `Color32` as a `uint`. That has to land on the same 20 bytes epaint uploads. An egui bump
+    /// that changes `Vertex` should fail here rather than render garbage.
+    #[test]
+    fn the_reflected_egui_vertex_layout_matches_epaint() {
+        let reflections = [
+            shader::reflect(&read_spirv(EGUI_VERT_SPV)).expect("vertex shader should reflect"),
+            shader::reflect(&read_spirv(EGUI_FRAG_SPV)).expect("fragment shader should reflect"),
+        ];
+
+        let layout = VertexLayout::interleaved(&reflections);
+        assert_eq!(layout.stride as usize, size_of::<egui::epaint::Vertex>());
+        assert_eq!(
+            layout.attributes,
+            vec![
+                VertexAttribute {
+                    location: 0,
+                    format: vk::Format::R32G32_SFLOAT,
+                    offset: 0,
+                },
+                VertexAttribute {
+                    location: 1,
+                    format: vk::Format::R32G32_SFLOAT,
+                    offset: 8,
+                },
+                VertexAttribute {
+                    location: 2,
+                    format: vk::Format::R32_UINT,
+                    offset: 16,
+                },
+            ]
+        );
+    }
+
+    /// Only the vertex stage reads the block, so the range has to be vertex-only and exactly the
+    /// struct the pass pushes.
+    #[test]
+    fn the_egui_push_constant_range_covers_only_the_vertex_stage() {
+        let reflect = |spirv| shader::reflect(&read_spirv(spirv)).expect("shader should reflect");
+
+        let ranges = push_constant_ranges(&[reflect(EGUI_VERT_SPV), reflect(EGUI_FRAG_SPV)]);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].stage_flags, vk::ShaderStageFlags::VERTEX);
+        assert_eq!(ranges[0].offset, 0);
+        assert_eq!(ranges[0].size as usize, size_of::<egui_pass::PushConstants>());
     }
 
     /// The SV_VertexID triangle must keep compiling to a pipeline with no vertex input at all.
