@@ -4,13 +4,15 @@ use ash::vk::{self, Handle};
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme};
 
 use super::{Allocator, MemoryAllocator, map_allocation_error};
-use crate::{Buffer, BufferInfo, CommandBuffer};
+use crate::{Buffer, BufferInfo, CommandBuffer, Image, ImageInfo};
 
 pub struct PersistentAllocator {
     device: NonNull<ash::Device>,
     memory: MemoryAllocator,
     cmd_pool: vk::CommandPool,
+    cmd_buffers: Vec<vk::CommandBuffer>,
     allocations: HashMap<vk::Buffer, Allocation>,
+    image_allocations: HashMap<vk::Image, Allocation>,
 }
 
 impl PersistentAllocator {
@@ -19,7 +21,9 @@ impl PersistentAllocator {
             device,
             memory,
             cmd_pool: vk::CommandPool::null(),
+            cmd_buffers: Vec::new(),
             allocations: HashMap::new(),
+            image_allocations: HashMap::new(),
         }
     }
 
@@ -39,6 +43,21 @@ impl PersistentAllocator {
         };
 
         unsafe { self.device.as_ref().reset_command_pool(cmd_pool, flags) }
+    }
+
+    /// Hands every command buffer this allocator gave out back to its pool. Only call it once the
+    /// GPU is done with them: nothing here waits.
+    pub fn free_command_buffers(&mut self) {
+        if self.cmd_pool.is_null() || self.cmd_buffers.is_empty() {
+            return;
+        }
+
+        unsafe {
+            self.device
+                .as_ref()
+                .free_command_buffers(self.cmd_pool, &self.cmd_buffers)
+        };
+        self.cmd_buffers.clear();
     }
 
     fn ensure_cmd_pool(&mut self, queue_family: u32) -> Result<(), vk::Result> {
@@ -81,6 +100,7 @@ impl Allocator for PersistentAllocator {
             .level(vk::CommandBufferLevel::PRIMARY);
 
         let cmd_buffer = unsafe { self.device.as_ref().allocate_command_buffers(&alloc_info) }?[0];
+        self.cmd_buffers.push(cmd_buffer);
 
         Ok(CommandBuffer::new(self.device, cmd_buffer))
     }
@@ -163,6 +183,63 @@ impl Allocator for PersistentAllocator {
 
         unsafe { self.device.as_ref().destroy_buffer(buffer.handle(), None) };
     }
+
+    fn allocate_image(&mut self, info: &ImageInfo) -> Result<Image, vk::Result> {
+        let device = unsafe { self.device.as_ref() };
+
+        let create_info = vk::ImageCreateInfo::default()
+            .image_type(info.image_type)
+            .format(info.format)
+            .extent(info.extent)
+            .mip_levels(info.mip_levels)
+            .array_layers(info.array_layers)
+            .samples(info.samples)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(info.usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let handle = unsafe { device.create_image(&create_info, None) }?;
+
+        let requirements = unsafe { device.get_image_memory_requirements(handle) };
+        let allocation = self.memory.borrow_mut().allocate(&AllocationCreateDesc {
+            name: &info.name,
+            requirements,
+            location: info.location,
+            linear: false,
+            allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+        });
+
+        let allocation = match allocation {
+            Ok(allocation) => allocation,
+            Err(err) => {
+                unsafe { device.destroy_image(handle, None) };
+                return Err(map_allocation_error(err));
+            },
+        };
+
+        if let Err(err) = unsafe { device.bind_image_memory(handle, allocation.memory(), allocation.offset()) } {
+            let _ = self.memory.borrow_mut().free(allocation);
+            unsafe { device.destroy_image(handle, None) };
+            return Err(err);
+        }
+
+        self.image_allocations.insert(handle, allocation);
+
+        Ok(Image::new(handle, info))
+    }
+
+    fn deallocate_image(&mut self, image: Image) {
+        let Some(allocation) = self.image_allocations.remove(&image.handle()) else {
+            tracing::error!(handle = ?image.handle(), "image was not allocated by this allocator");
+            return;
+        };
+
+        if let Err(err) = self.memory.borrow_mut().free(allocation) {
+            tracing::error!(%err, "failed to free an image allocation");
+        }
+
+        unsafe { self.device.as_ref().destroy_image(image.handle(), None) };
+    }
 }
 
 impl Drop for PersistentAllocator {
@@ -175,6 +252,14 @@ impl Drop for PersistentAllocator {
             }
 
             unsafe { device.destroy_buffer(handle, None) };
+        }
+
+        for (handle, allocation) in self.image_allocations.drain() {
+            if let Err(err) = self.memory.borrow_mut().free(allocation) {
+                tracing::error!(%err, "failed to free an image allocation during teardown");
+            }
+
+            unsafe { device.destroy_image(handle, None) };
         }
 
         if !self.cmd_pool.is_null() {

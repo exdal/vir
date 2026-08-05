@@ -65,6 +65,7 @@ pub enum IR {
         base_layer: ValueId,
         layer_count: ValueId,
         usage: vk::ImageUsageFlags,
+        initial_layout: vk::ImageLayout,
     },
 
     AcquireNextImage {
@@ -90,6 +91,11 @@ pub enum IR {
     Clear {
         attachment: ValueId,
         color: ValueId,
+    },
+    Blit {
+        src: ValueId,
+        dst: ValueId,
+        filter: vk::Filter,
     },
 
     BeginRendering {
@@ -196,12 +202,13 @@ impl fmt::Display for IR {
                 base_layer,
                 layer_count,
                 usage,
+                initial_layout,
             } => write!(
                 f,
                 "declare image={{mem: {:?}}} view={{mem: {image_view:?}}} view_type={view_type:?} extent={extent} \
                  format={format:?} samples={samples:?} levels=[{base_level}..{level_count}] \
-                 layers=[{base_layer}..{layer_count}] usage={}",
-                image.handle,
+                 layers=[{base_layer}..{layer_count}] usage={} layout={initial_layout:?}",
+                image.handle(),
                 fmt_usage(*usage)
             ),
             IR::AcquireNextImage {
@@ -223,6 +230,7 @@ impl fmt::Display for IR {
                 args, returns, domain, ..
             } => write!(f, "call.opaque domain={domain:?} args={args} returns={returns}"),
             IR::Clear { attachment, color } => write!(f, "clear attachment={attachment} color={color}"),
+            IR::Blit { src, dst, filter } => write!(f, "blit src={src} dst={dst} filter={filter:?}"),
             IR::BeginRendering {
                 color_attachments,
                 render_area,

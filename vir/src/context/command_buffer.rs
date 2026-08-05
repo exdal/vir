@@ -133,6 +133,18 @@ impl CommandBuffer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn blit_image(
+        &self, src: vk::Image, src_layout: vk::ImageLayout, dst: vk::Image, dst_layout: vk::ImageLayout,
+        regions: &[vk::ImageBlit], filter: vk::Filter,
+    ) {
+        unsafe {
+            self.device
+                .as_ref()
+                .cmd_blit_image(self.handle, src, src_layout, dst, dst_layout, regions, filter);
+        }
+    }
+
     pub fn clear_color(
         &self, image: vk::Image, image_layout: vk::ImageLayout, clear_color_value: &ClearValue,
         ranges: &[vk::ImageSubresourceRange],

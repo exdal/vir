@@ -5,6 +5,7 @@ use std::{error::Error, ffi::CStr, io::Cursor, result::Result, time::Instant};
 use ash::{Entry, khr, vk};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
 use vir::{
+    Access,
     AllocatorKind,
     BlendPreset,
     Buffer,
@@ -15,6 +16,7 @@ use vir::{
     GraphicsPipelineInfo,
     Image,
     ImageAttachment,
+    ImageInfo,
     PersistentAllocator,
     PipelineId,
     RasterizationState,
@@ -128,6 +130,10 @@ struct PushConstants {
 /// Where `tint` sits in the block, for the draws that push nothing else.
 const TINT_OFFSET: u32 = 12;
 
+/// The last thing a frame does to the offscreen target is blit out of it, so that is the layout it
+/// is created in and handed back in.
+const OFFSCREEN_RESTING_ACCESS: Access = Access::BlitRead;
+
 const STATIC_TRIANGLE: [Vertex; 3] = [
     Vertex {
         position: [-0.9, -0.1],
@@ -163,7 +169,6 @@ struct App {
     window: Window,
     surface: vk::SurfaceKHR,
     swapchain: Option<SwapChain>,
-    // everything below borrows the device and the memory allocator from ctx, so it has to drop first
     graph: RenderGraph,
     super_frame_allocator: Option<SuperFrameAllocator>,
     persistent_allocator: PersistentAllocator,
@@ -171,6 +176,7 @@ struct App {
     triangle_pipeline: PipelineId,
     vertex_pipeline: PipelineId,
     static_vertices: Buffer,
+    offscreen: Option<ImageAttachment>,
     dumped_ir: bool,
     start_time: Instant,
 }
@@ -236,6 +242,7 @@ impl App {
             triangle_pipeline,
             vertex_pipeline,
             static_vertices,
+            offscreen: None,
             dumped_ir: false,
             start_time: Instant::now(),
         })
@@ -325,11 +332,16 @@ impl App {
         let attachments = swapchain_images
             .into_iter()
             .map(|image_handle| {
-                let image = Image::new(image_handle, None);
                 let extent = vk::Extent3D::default()
                     .width(swapchain_extent.width)
                     .height(swapchain_extent.height)
                     .depth(1);
+                let image = Image::imported(
+                    image_handle,
+                    swapchain_format,
+                    extent,
+                    vk::SampleCountFlags::TYPE_1,
+                );
                 let subresource_range = vk::ImageSubresourceRange::default()
                     .aspect_mask(vk::ImageAspectFlags::COLOR)
                     .layer_count(1)
@@ -354,8 +366,43 @@ impl App {
             attachments,
         )?;
         self.super_frame_allocator = Some(self.ctx.create_super_frame_allocator(image_count));
+        self.recreate_offscreen(swapchain_extent, swapchain_format)?;
 
         Ok(swapchain)
+    }
+
+    fn recreate_offscreen(&mut self, extent: vk::Extent2D, format: vk::Format) -> Result<(), vk::Result> {
+        if let Some(previous) = self.offscreen.take() {
+            unsafe { self.ctx.device().device_wait_idle() }?;
+            self.persistent_allocator.deallocate_image_view(previous.image_view());
+            self.persistent_allocator.deallocate_image(*previous.image());
+        }
+
+        let info = ImageInfo::color_target(extent, format)
+            .with_usage(vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST)
+            .with_name("offscreen target");
+        let image = self.persistent_allocator.allocate_image(&info)?;
+        let view = self.persistent_allocator.allocate_image_view(
+            image.handle(),
+            format,
+            vk::ImageViewType::TYPE_2D,
+            image.subresource_range(),
+        )?;
+
+        let attachment = ImageAttachment::from_image(&image, vk::ImageLayout::UNDEFINED).with_image_view(view);
+
+        let mut module = vir::Module::default();
+        let target = module.import_attachment(&attachment);
+        let ready = module.release(target, OFFSCREEN_RESTING_ACCESS, vir::DomainFlag::Graphics);
+        self.graph.execute_blocking(
+            &self.ctx,
+            &module.compile(ready),
+            &mut AllocatorKind::Persistent(&mut self.persistent_allocator),
+        )?;
+
+        self.offscreen = Some(attachment.with_layout(OFFSCREEN_RESTING_ACCESS.into()));
+
+        Ok(())
     }
 
     fn recreate_swapchain(&mut self) -> Result<(), vk::Result> {
@@ -387,8 +434,15 @@ impl App {
 
         let mut frame_allocator = AllocatorKind::Frame(next_frame);
 
+        let offscreen = self
+            .offscreen
+            .as_ref()
+            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?
+            .clone();
+
         let mut module = vir::Module::default();
-        let attachment = module.acquire_next_image(swapchain);
+        let swapchain_image = module.acquire_next_image(swapchain);
+        let attachment = module.import_attachment(&offscreen);
         let attachment = module.clear(attachment, rainbow(elapsed * 0.2));
 
         let static_vertices = module.import_buffer(&self.static_vertices);
@@ -446,8 +500,19 @@ impl App {
             .draw(3, 1)
             .end_rendering();
 
-        let attachment = module.present(attachment);
-        let executable = module.compile(attachment);
+        let half = vk::Extent2D {
+            width: (offscreen.extent().width / 2).max(1),
+            height: (offscreen.extent().height / 2).max(1),
+        };
+        let scratch = module.transient_image(
+            &ImageInfo::color_target(half, offscreen.format()).with_name("half-res scratch"),
+        );
+        let scratch = module.blit(attachment, scratch);
+        let swapchain_image = module.blit(scratch, swapchain_image);
+
+        let present = module.present(swapchain_image);
+        let resting = module.release(attachment, OFFSCREEN_RESTING_ACCESS, vir::DomainFlag::Graphics);
+        let executable = module.compile_all(&[present, resting]);
 
         if !self.dumped_ir {
             RenderGraph::dump(executable.as_slice());
@@ -455,7 +520,9 @@ impl App {
         }
 
         self.graph
-            .execute(&self.ctx, executable.as_slice(), &mut frame_allocator)
+            .execute(&self.ctx, executable.as_slice(), &mut frame_allocator)?;
+
+        Ok(())
     }
 }
 
@@ -504,7 +571,6 @@ impl ApplicationHandler for AppWrapper {
     }
 
     fn exiting(&mut self, _: &ActiveEventLoop) {
-        // drops the graph, which waits for the device and tears down its pipelines
         self.app = None;
     }
 }

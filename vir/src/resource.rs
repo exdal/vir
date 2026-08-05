@@ -5,7 +5,7 @@ pub mod shader;
 pub mod swapchain;
 
 pub use buffer::{Buffer, BufferInfo, MemoryLocation};
-pub use image::{Image, aspect_mask};
+pub use image::{Image, ImageInfo, aspect_mask};
 pub use pipeline::{
     BlendPreset,
     ColorBlendAttachmentState,

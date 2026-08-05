@@ -16,6 +16,8 @@ use crate::{
     GraphicsPipelineInfo,
     IR,
     ImageAttachment,
+    ImageInfo,
+    MemoryLocation,
     PipelineId,
     PipelineLayout,
     PipelineState,
@@ -117,6 +119,31 @@ impl PresentInfo {
     }
 }
 
+fn image_type(view_type: vk::ImageViewType) -> vk::ImageType {
+    match view_type {
+        vk::ImageViewType::TYPE_1D | vk::ImageViewType::TYPE_1D_ARRAY => vk::ImageType::TYPE_1D,
+        vk::ImageViewType::TYPE_3D => vk::ImageType::TYPE_3D,
+        _ => vk::ImageType::TYPE_2D,
+    }
+}
+
+fn subresource_layers(attachment: &ImageAttachment) -> vk::ImageSubresourceLayers {
+    let range = attachment.subresource_range();
+    vk::ImageSubresourceLayers::default()
+        .aspect_mask(range.aspect_mask)
+        .mip_level(range.base_mip_level)
+        .base_array_layer(range.base_array_layer)
+        .layer_count(range.layer_count)
+}
+
+fn blit_offsets(extent: vk::Extent3D) -> [vk::Offset3D; 2] {
+    [vk::Offset3D::default(), vk::Offset3D {
+        x: extent.width as i32,
+        y: extent.height as i32,
+        z: extent.depth.max(1) as i32,
+    }]
+}
+
 struct DeclaredPipeline {
     info: GraphicsPipelineInfo,
     reflections: Vec<Reflection>,
@@ -143,6 +170,7 @@ pub struct RenderGraph {
     submits: Vec<Submit>,
     presents: Vec<PresentInfo>,
     resource_to_swapchain: HashMap<ValueId, PresentInfo>,
+    timeline_signals: Vec<(vk::Semaphore, u64)>,
 }
 
 impl RenderGraph {
@@ -163,6 +191,7 @@ impl RenderGraph {
             submits: Vec::new(),
             presents: Vec::new(),
             resource_to_swapchain: HashMap::new(),
+            timeline_signals: Vec::new(),
         }
     }
 
@@ -287,6 +316,7 @@ impl RenderGraph {
         self.submits.clear();
         self.presents.clear();
         self.resource_to_swapchain.clear();
+        self.timeline_signals.clear();
     }
 
     fn set_value(&mut self, value_id: &ValueId, value: Value) {
@@ -402,6 +432,7 @@ impl RenderGraph {
             queue.submit(&[submit_info])?;
 
             allocator.add_timeline_wait(*queue.semaphore(), timeline_value);
+            self.timeline_signals.push((*queue.semaphore(), timeline_value));
         }
 
         for present in self.presents.drain(..) {
@@ -415,6 +446,27 @@ impl RenderGraph {
                 .image_indices(std::slice::from_ref(&present.image_index));
             ctx.present(queue, &present_info)?;
         }
+
+        Ok(())
+    }
+
+    pub fn wait(&self) -> Result<(), vk::Result> {
+        if self.timeline_signals.is_empty() {
+            return Ok(());
+        }
+
+        let (semaphores, values): (Vec<_>, Vec<_>) = self.timeline_signals.iter().copied().unzip();
+        let wait_info = vk::SemaphoreWaitInfo::default().semaphores(&semaphores).values(&values);
+
+        unsafe { self.device().wait_semaphores(&wait_info, u64::MAX) }
+    }
+
+    pub fn execute_blocking(
+        &mut self, ctx: &Context, instructions: &[ir::Instr], allocator: &mut AllocatorKind,
+    ) -> Result<(), vk::Result> {
+        self.execute(ctx, instructions, allocator)?;
+        self.wait()?;
+        allocator.free_command_buffers();
 
         Ok(())
     }
@@ -501,7 +553,8 @@ impl RenderGraph {
                 level_count,
                 base_layer,
                 layer_count,
-                usage: _,
+                usage,
+                initial_layout,
             } => {
                 let extent = self.get::<vk::Extent3D>(extent);
                 let subresource_range = vk::ImageSubresourceRange {
@@ -511,16 +564,32 @@ impl RenderGraph {
                     base_array_layer: self.get::<u32>(base_layer),
                     layer_count: self.get::<u32>(layer_count),
                 };
+
+                let image = if image.is_null() {
+                    allocator.allocate_image(&ImageInfo {
+                        extent,
+                        format: *format,
+                        usage: *usage,
+                        image_type: image_type(*view_type),
+                        mip_levels: subresource_range.level_count,
+                        array_layers: subresource_range.layer_count,
+                        samples: *samples,
+                        location: MemoryLocation::GpuOnly,
+                        name: format!("transient image {value_id}"),
+                    })?
+                } else {
+                    *image
+                };
+
                 let image_view = if image_view.is_null() {
-                    allocator.allocate_image_view(image.handle, *format, *view_type, subresource_range)?
+                    allocator.allocate_image_view(image.handle(), *format, *view_type, subresource_range)?
                 } else {
                     *image_view
                 };
 
-                let attachment =
-                    ImageAttachment::new(image.clone(), *format, extent, *samples, vk::ImageLayout::UNDEFINED)
-                        .with_image_view(image_view)
-                        .with_subresource_range(subresource_range);
+                let attachment = ImageAttachment::new(image, *format, extent, *samples, *initial_layout)
+                    .with_image_view(image_view)
+                    .with_subresource_range(subresource_range);
                 self.set_value(value_id, Value::ImageAttachment(attachment));
             },
             IR::AcquireNextImage {
@@ -568,7 +637,7 @@ impl RenderGraph {
                     }))?;
 
                     self.presents.push(present);
-                } else {
+                } else if *dst_domain != self.current_submit.domain {
                     self.flush_submit(None)?;
                 }
             },
@@ -584,6 +653,27 @@ impl RenderGraph {
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                     &color,
                     &[subresource_range],
+                );
+            },
+            IR::Blit { src, dst, filter } => {
+                self.ensure_batch(ctx, allocator)?;
+                self.set_value(value_id, Value::Reference(*dst));
+
+                let src = self.get::<ImageAttachment>(src);
+                let dst = self.get::<ImageAttachment>(dst);
+                let region = vk::ImageBlit::default()
+                    .src_subresource(subresource_layers(&src))
+                    .src_offsets(blit_offsets(src.extent()))
+                    .dst_subresource(subresource_layers(&dst))
+                    .dst_offsets(blit_offsets(dst.extent()));
+
+                self.batch()?.blit_image(
+                    src.image().into(),
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    dst.image().into(),
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[region],
+                    *filter,
                 );
             },
             IR::BeginRendering {

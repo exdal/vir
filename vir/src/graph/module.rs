@@ -10,7 +10,9 @@ use crate::{
     DomainFlag,
     DynamicStateFlags,
     IR,
+    Image,
     ImageAttachment,
+    ImageInfo,
     PassState,
     PipelineId,
     RasterizationState,
@@ -27,10 +29,11 @@ use crate::{
 struct ResourceState {
     layout: vk::ImageLayout,
     last_access: ValueId,
+    access: Access,
 }
 
 #[derive(Clone, Copy)]
-struct ImageInfo {
+struct ImageType {
     format: vk::Format,
     samples: vk::SampleCountFlags,
     extent: vk::Extent2D,
@@ -100,7 +103,7 @@ impl Module {
             vk::ImageViewType::TYPE_2D
         };
         let construct_instr = self.emit(IR::ConstructImage {
-            image: attachment.image().clone(),
+            image: *attachment.image(),
             image_view: attachment.image_view(),
             view_type,
             extent,
@@ -110,10 +113,52 @@ impl Module {
             level_count,
             base_layer,
             layer_count,
-            usage: vk::ImageUsageFlags::empty(),
+            usage: attachment.image().usage(),
+            initial_layout: attachment.layout(),
         });
 
         (ty_instr, construct_instr)
+    }
+
+    pub fn transient_image(&mut self, info: &ImageInfo) -> ValueId {
+        let extent = self.lower_constant(ir::Constant::Extent3D(info.extent));
+        let base_level = self.lower_u32(0);
+        let level_count = self.lower_u32(info.mip_levels);
+        let base_layer = self.lower_u32(0);
+        let layer_count = self.lower_u32(info.array_layers);
+
+        self.lower_type(ir::Type::Image {
+            format: info.format,
+            samples: info.samples,
+        });
+        let view_type = if info.array_layers > 1 {
+            vk::ImageViewType::TYPE_2D_ARRAY
+        } else {
+            vk::ImageViewType::TYPE_2D
+        };
+
+        self.emit(IR::ConstructImage {
+            image: Image::default(),
+            image_view: vk::ImageView::null(),
+            view_type,
+            extent,
+            format: info.format,
+            samples: info.samples,
+            base_level,
+            level_count,
+            base_layer,
+            layer_count,
+            usage: info.usage,
+            initial_layout: vk::ImageLayout::UNDEFINED,
+        })
+    }
+
+    pub fn import_image(&mut self, image: &Image, layout: vk::ImageLayout) -> ValueId {
+        self.import_attachment(&ImageAttachment::from_image(image, layout))
+    }
+
+    pub fn import_attachment(&mut self, attachment: &ImageAttachment) -> ValueId {
+        self.lower_image_attachment(attachment).1
     }
 
     pub fn import_buffer(&mut self, buffer: &Buffer) -> ValueId {
@@ -158,6 +203,14 @@ impl Module {
         self.release(attachment, Access::Present, DomainFlag::Present)
     }
 
+    pub fn blit(&mut self, src: ValueId, dst: ValueId) -> ValueId {
+        self.blit_filtered(src, dst, vk::Filter::LINEAR)
+    }
+
+    pub fn blit_filtered(&mut self, src: ValueId, dst: ValueId, filter: vk::Filter) -> ValueId {
+        self.emit(IR::Blit { src, dst, filter })
+    }
+
     pub fn clear(&mut self, attachment: ValueId, color: ClearValue) -> ValueId {
         let color = self.lower_constant(ir::Constant::ClearValue(color));
         self.emit(IR::Clear { attachment, color })
@@ -180,15 +233,18 @@ impl Module {
         RenderPass { module: self, id }
     }
 
-    pub fn compile(&self, id: ValueId) -> Vec<ir::Instr> {
-        let linearized = self.topo_sort(id);
-        let synced = self.sync(linearized);
+    pub fn compile(&self, id: ValueId) -> Vec<ir::Instr> { self.compile_all(&[id]) }
+
+    pub fn compile_all(&self, ids: &[ValueId]) -> Vec<ir::Instr> {
+        let linearized = self.topo_sort(ids);
+        let mut synced = self.sync(linearized);
+        self.infer_usage(&mut synced);
         self.infer(synced)
     }
 
-    fn topo_sort(&self, value_id: ValueId) -> Vec<ir::Instr> {
+    fn topo_sort(&self, roots: &[ValueId]) -> Vec<ir::Instr> {
         let mut nodes = Vec::new();
-        let mut stack = vec![value_id];
+        let mut stack = roots.iter().rev().copied().collect::<Vec<_>>();
         let mut visited = std::collections::HashSet::new();
         let mut processed = std::collections::HashSet::new();
 
@@ -246,6 +302,10 @@ impl Module {
                     IR::Clear { color, attachment } => {
                         stack.push(*color);
                         stack.push(*attachment);
+                    },
+                    IR::Blit { src, dst, .. } => {
+                        stack.push(*dst);
+                        stack.push(*src);
                     },
                     IR::BeginRendering {
                         color_attachments,
@@ -320,8 +380,9 @@ impl Module {
                     };
                     let bound = region_buffers.entry(region).or_default();
                     for buffer in buffers {
-                        if !bound.contains(buffer) {
-                            bound.push(*buffer);
+                        let root = self.resource_root(*buffer);
+                        if !bound.contains(&root) {
+                            bound.push(root);
                         }
                     }
                 },
@@ -377,66 +438,75 @@ impl Module {
         let undefined = ResourceState {
             layout: vk::ImageLayout::UNDEFINED,
             last_access: no_access_id,
+            access: Access::None,
         };
+
+        macro_rules! transition {
+            ($resource:expr, $access_id:expr, $access:expr) => {{
+                let resource = $resource;
+                let access: Access = $access;
+                let root = self.resource_root(resource);
+                let state = states.get(&root).copied().unwrap_or(undefined);
+                let new_layout: vk::ImageLayout = access.into();
+
+                let new_state = if state.layout == new_layout && !state.access.writes() && !access.writes() {
+                    let merged = state.access | access;
+                    let last_access = if merged == state.access {
+                        state.last_access
+                    } else {
+                        emit_access!(merged)
+                    };
+                    ResourceState {
+                        layout: new_layout,
+                        last_access,
+                        access: merged,
+                    }
+                } else {
+                    emit_barrier!(state.last_access, $access_id, state.layout, new_layout, resource);
+                    ResourceState {
+                        layout: new_layout,
+                        last_access: $access_id,
+                        access,
+                    }
+                };
+
+                states.insert(root, new_state);
+            }};
+        }
 
         for (value_id, ir) in nodes {
             match &ir {
-                IR::Index { .. } | IR::ConstructImage { .. } => {
-                    states.insert(value_id, undefined);
+                IR::ConstructImage { initial_layout, .. } => {
+                    states.insert(value_id, ResourceState {
+                        layout: *initial_layout,
+                        last_access: no_access_id,
+                        access: Access::None,
+                    });
                 },
 
                 IR::Acquire { resource, access } => {
-                    let state = states.get(resource).copied().unwrap_or(undefined);
-                    let new_layout = self.resolve_access(*access).into();
-                    emit_barrier!(state.last_access, *access, state.layout, new_layout, *resource);
-                    let new_state = ResourceState {
-                        layout: new_layout,
-                        last_access: *access,
-                    };
-                    states.insert(*resource, new_state);
-                    states.insert(value_id, new_state);
+                    transition!(*resource, *access, self.resolve_access(*access));
                 },
 
                 IR::Clear { attachment, .. } => {
-                    let state = states.get(attachment).copied().unwrap_or(undefined);
                     let access_id = emit_access!(Access::Clear);
-                    emit_barrier!(
-                        state.last_access,
-                        access_id,
-                        state.layout,
-                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                        *attachment
-                    );
-                    let new_state = ResourceState {
-                        layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                        last_access: access_id,
-                    };
-                    states.insert(*attachment, new_state);
-                    states.insert(value_id, new_state);
+                    transition!(*attachment, access_id, Access::Clear);
+                },
+
+                IR::Blit { src, dst, .. } => {
+                    let read_id = emit_access!(Access::BlitRead);
+                    transition!(*src, read_id, Access::BlitRead);
+                    let write_id = emit_access!(Access::BlitWrite);
+                    transition!(*dst, write_id, Access::BlitWrite);
                 },
 
                 IR::BeginRendering { color_attachments, .. } => {
                     let access_id = emit_access!(Access::ColorRW);
-                    let new_state = ResourceState {
-                        layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                        last_access: access_id,
-                    };
-
                     for attachment in color_attachments {
-                        let state = states.get(attachment).copied().unwrap_or(undefined);
-                        emit_barrier!(
-                            state.last_access,
-                            access_id,
-                            state.layout,
-                            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                            *attachment
-                        );
-                        states.insert(*attachment, new_state);
+                        transition!(*attachment, access_id, Access::ColorRW);
                     }
 
                     for buffer in region_buffers.get(&value_id).into_iter().flatten() {
-                        // an imported buffer has no producer inside the graph, so the host is the
-                        // only thing that can have written it
                         let last = buffer_states.get(buffer).copied().unwrap_or_else(|| match host_write_id {
                             Some(id) => id,
                             None => {
@@ -455,38 +525,16 @@ impl Module {
                             },
                         };
 
-                        // already visible to vertex input from an earlier region
                         if last == read_id {
                             continue;
                         }
                         emit_memory_barrier!(last, read_id);
                         buffer_states.insert(*buffer, read_id);
                     }
-
-                    states.insert(value_id, new_state);
-                },
-
-                // the barriers these need were emitted at region entry
-                IR::BindPipeline { pass, .. }
-                | IR::SetState { pass, .. }
-                | IR::BindVertexBuffers { pass, .. }
-                | IR::Draw { pass, .. }
-                | IR::EndRendering { pass } => {
-                    let state = states.get(pass).copied().unwrap_or(undefined);
-                    states.insert(value_id, state);
                 },
 
                 IR::Release { resource, access, .. } => {
-                    let state = states.get(resource).copied().unwrap_or(undefined);
-                    let new_layout = self.resolve_access(*access).into();
-                    emit_barrier!(state.last_access, *access, state.layout, new_layout, *resource);
-                    states.insert(
-                        *resource,
-                        ResourceState {
-                            layout: new_layout,
-                            last_access: *access,
-                        },
-                    );
+                    transition!(*resource, *access, self.resolve_access(*access));
                 },
 
                 _ => {},
@@ -498,7 +546,75 @@ impl Module {
         result
     }
 
-    fn resolve_image(&self, id: ValueId) -> Option<ImageInfo> {
+    fn resource_root(&self, id: ValueId) -> ValueId {
+        let mut id = id;
+
+        for _ in 0..256 {
+            let Some(ir) = self.instructions.get(id.0 as usize) else {
+                return id;
+            };
+
+            id = match ir {
+                IR::Clear { attachment, .. } => *attachment,
+                IR::Blit { dst, .. } => *dst,
+                IR::BeginRendering { color_attachments, .. } => match color_attachments.first() {
+                    Some(first) => *first,
+                    None => return id,
+                },
+                IR::BindPipeline { pass, .. }
+                | IR::SetState { pass, .. }
+                | IR::BindVertexBuffers { pass, .. }
+                | IR::Draw { pass, .. }
+                | IR::EndRendering { pass } => *pass,
+                IR::Acquire { resource, .. } | IR::Release { resource, .. } => *resource,
+                _ => return id,
+            };
+        }
+
+        id
+    }
+
+    fn infer_usage(&self, nodes: &mut [ir::Instr]) {
+        let access_of = |id: &ValueId| {
+            nodes
+                .iter()
+                .find(|(instr_id, _)| instr_id == id)
+                .map(|(_, ir)| ir)
+                .or_else(|| self.instructions.get(id.0 as usize))
+                .and_then(|ir| match ir {
+                    IR::Constant(ir::Constant::Access(access)) => Some(*access),
+                    _ => None,
+                })
+        };
+
+        let mut usages: HashMap<ValueId, vk::ImageUsageFlags> = HashMap::new();
+        for (_, ir) in nodes.iter() {
+            let IR::ImageBarrier { dst_access, value, .. } = ir else {
+                continue;
+            };
+            let Some(access) = access_of(dst_access) else {
+                continue;
+            };
+
+            *usages.entry(self.resource_root(*value)).or_default() |= vk::ImageUsageFlags::from(access);
+        }
+
+        for (value_id, ir) in nodes.iter_mut() {
+            let IR::ConstructImage { image, usage, .. } = ir else {
+                continue;
+            };
+            if !image.is_null() {
+                continue;
+            }
+
+            *usage |= usages.get(value_id).copied().unwrap_or_default();
+            if usage.is_empty() {
+                tracing::warn!(%value_id, "transient image is never used; it will be created with no usage");
+            }
+        }
+    }
+
+    fn resolve_image(&self, id: ValueId) -> Option<ImageType> {
         let mut id = id;
 
         for _ in 0..256 {
@@ -514,7 +630,7 @@ impl Module {
                         _ => return None,
                     };
 
-                    return Some(ImageInfo {
+                    return Some(ImageType {
                         format: *format,
                         samples: *samples,
                         extent: vk::Extent2D {
@@ -527,6 +643,7 @@ impl Module {
                 IR::Array { elements, .. } => id = *elements.first()?,
                 IR::Index { array, .. } => id = *array,
                 IR::Clear { attachment, .. } => id = *attachment,
+                IR::Blit { dst, .. } => id = *dst,
                 IR::BeginRendering { color_attachments, .. } => id = *color_attachments.first()?,
                 IR::BindPipeline { pass, .. }
                 | IR::SetState { pass, .. }
@@ -781,7 +898,12 @@ mod tests {
     fn module_with_attachment() -> (Module, ValueId) {
         let mut module = Module::default();
         let attachment = ImageAttachment::new(
-            Image::new(vk::Image::null(), None),
+            Image::imported(
+                vk::Image::null(),
+                FORMAT,
+                vk::Extent3D::default().width(WIDTH).height(HEIGHT).depth(1),
+                vk::SampleCountFlags::TYPE_1,
+            ),
             FORMAT,
             vk::Extent3D::default().width(WIDTH).height(HEIGHT).depth(1),
             vk::SampleCountFlags::TYPE_1,
@@ -791,27 +913,80 @@ mod tests {
         (module, construct)
     }
 
-    fn memory_barriers(module: &Module, instructions: &[ir::Instr]) -> Vec<(Access, Access)> {
-        let access = |id: &ValueId| {
-            instructions
-                .iter()
-                .find(|(instr_id, _)| instr_id == id)
-                .map(|(_, ir)| ir)
-                .or_else(|| module.instructions.get(id.0 as usize))
-                .and_then(|ir| match ir {
-                    IR::Constant(ir::Constant::Access(a)) => Some(*a),
-                    _ => None,
-                })
-                .expect("barrier operand should be an access constant")
-        };
+    fn access_constant(module: &Module, instructions: &[ir::Instr], id: &ValueId) -> Access {
+        instructions
+            .iter()
+            .find(|(instr_id, _)| instr_id == id)
+            .map(|(_, ir)| ir)
+            .or_else(|| module.instructions.get(id.0 as usize))
+            .and_then(|ir| match ir {
+                IR::Constant(ir::Constant::Access(a)) => Some(*a),
+                _ => None,
+            })
+            .expect("barrier operand should be an access constant")
+    }
 
+    fn memory_barriers(module: &Module, instructions: &[ir::Instr]) -> Vec<(Access, Access)> {
         instructions
             .iter()
             .filter_map(|(_, ir)| match ir {
-                IR::MemoryBarrier { src_access, dst_access } => Some((access(src_access), access(dst_access))),
+                IR::MemoryBarrier { src_access, dst_access } => Some((
+                    access_constant(module, instructions, src_access),
+                    access_constant(module, instructions, dst_access),
+                )),
                 _ => None,
             })
             .collect()
+    }
+
+    struct ImageBarrier {
+        src: Access,
+        dst: Access,
+        old_layout: vk::ImageLayout,
+        new_layout: vk::ImageLayout,
+        resource: ValueId,
+    }
+
+    fn image_barriers(module: &Module, instructions: &[ir::Instr]) -> Vec<ImageBarrier> {
+        instructions
+            .iter()
+            .filter_map(|(_, ir)| match ir {
+                IR::ImageBarrier {
+                    src_access,
+                    dst_access,
+                    old_layout,
+                    new_layout,
+                    value,
+                } => Some(ImageBarrier {
+                    src: access_constant(module, instructions, src_access),
+                    dst: access_constant(module, instructions, dst_access),
+                    old_layout: *old_layout,
+                    new_layout: *new_layout,
+                    resource: module.resource_root(*value),
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn transient_info() -> ImageInfo {
+        ImageInfo::color_target(
+            vk::Extent2D {
+                width: WIDTH,
+                height: HEIGHT,
+            },
+            FORMAT,
+        )
+    }
+
+    fn image_usage(instructions: &[ir::Instr], id: ValueId) -> vk::ImageUsageFlags {
+        instructions
+            .iter()
+            .find_map(|(instr_id, ir)| match ir {
+                IR::ConstructImage { usage, .. } if *instr_id == id => Some(*usage),
+                _ => None,
+            })
+            .expect("the image should still be declared after compiling")
     }
 
     fn draws(instructions: &[ir::Instr]) -> Vec<(Option<PipelineId>, PipelineState)> {
@@ -822,6 +997,124 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn a_transient_image_is_created_with_the_usage_the_graph_implies() {
+        let (mut module, swapchain) = module_with_attachment();
+        let target = module.transient_image(&transient_info());
+
+        let rendered = module
+            .begin_rendering(&[target])
+            .bind_graphics_pipeline(PipelineId(0))
+            .draw(3, 1)
+            .end_rendering();
+        let swapchain = module.blit(rendered, swapchain);
+        let end = module.present(swapchain);
+
+        assert_eq!(
+            image_usage(&module.compile(end), target),
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC
+        );
+    }
+
+    #[test]
+    fn a_blit_puts_each_side_in_its_own_transfer_layout() {
+        let (mut module, destination) = module_with_attachment();
+        let source = module.transient_image(&transient_info());
+        let end = module.blit(source, destination);
+
+        let compiled = module.compile(end);
+        let barriers = image_barriers(&module, &compiled);
+        assert_eq!(barriers.len(), 2);
+
+        assert_eq!(barriers[0].resource, source);
+        assert_eq!(barriers[0].src, Access::None);
+        assert_eq!(barriers[0].dst, Access::BlitRead);
+        assert_eq!(barriers[0].old_layout, vk::ImageLayout::UNDEFINED);
+        assert_eq!(barriers[0].new_layout, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+
+        assert_eq!(barriers[1].resource, destination);
+        assert_eq!(barriers[1].dst, Access::BlitWrite);
+        assert_eq!(barriers[1].new_layout, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+    }
+
+    #[test]
+    fn an_imported_image_starts_in_the_layout_its_owner_left_it_in() {
+        let mut module = Module::default();
+        let image = Image::imported(
+            vk::Image::null(),
+            FORMAT,
+            vk::Extent3D::default().width(WIDTH).height(HEIGHT).depth(1),
+            vk::SampleCountFlags::TYPE_1,
+        );
+
+        let imported = module.import_image(&image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+        let end = module.clear(imported, crate::clear::f32::BLACK);
+
+        let compiled = module.compile(end);
+        let barriers = image_barriers(&module, &compiled);
+        assert_eq!(barriers.len(), 1);
+        assert_eq!(barriers[0].old_layout, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+        assert_eq!(barriers[0].new_layout, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+    }
+
+    #[test]
+    fn a_second_read_at_the_same_layout_does_not_repeat_the_barrier() {
+        let (mut module, first) = module_with_attachment();
+        let source = module.transient_image(&transient_info());
+
+        // the second blit writes what the first one produced, so both are in the graph and the
+        // source is read twice without ever leaving TRANSFER_SRC_OPTIMAL
+        let first = module.blit(source, first);
+        let end = module.blit(source, first);
+
+        let compiled = module.compile(end);
+        let barriers = image_barriers(&module, &compiled);
+        let reads = barriers.iter().filter(|b| b.resource == source).count();
+        assert_eq!(reads, 1);
+
+        // the destination is written twice, and a write always waits
+        assert_eq!(barriers.len(), 3);
+    }
+
+    #[test]
+    fn a_release_to_the_layout_an_image_already_rests_in_costs_nothing() {
+        let (mut module, destination) = module_with_attachment();
+        let source = module.transient_image(&transient_info());
+        let blit = module.blit(source, destination);
+
+        let present = module.present(blit);
+        let resting = module.release(source, Access::BlitRead, DomainFlag::Graphics);
+        let compiled = module.compile_all(&[present, resting]);
+
+        // nothing consumes the release, so only naming it as a root keeps it
+        let position = |id: ValueId| compiled.iter().position(|(instr_id, _)| *instr_id == id);
+        assert!(position(resting) > position(blit));
+        assert!(module.compile(present).iter().all(|(id, _)| *id != resting));
+
+        // and it asks for the layout the blit already left it in, so it emits no barrier
+        let barriers = image_barriers(&module, &compiled);
+        assert_eq!(barriers.iter().filter(|b| b.resource == source).count(), 1);
+    }
+
+    #[test]
+    fn a_release_that_does_change_the_layout_still_emits_its_barrier() {
+        let (mut module, destination) = module_with_attachment();
+        let source = module.transient_image(&transient_info());
+        let blit = module.blit(source, destination);
+
+        let present = module.present(blit);
+        let resting = module.release(source, Access::ColorRW, DomainFlag::Graphics);
+        let compiled = module.compile_all(&[present, resting]);
+
+        let barriers = image_barriers(&module, &compiled);
+        let last = barriers
+            .iter()
+            .rfind(|b| b.resource == source)
+            .expect("the source should have been transitioned");
+        assert_eq!(last.old_layout, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+        assert_eq!(last.new_layout, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
     }
 
     #[test]

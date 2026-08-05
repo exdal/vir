@@ -1,22 +1,144 @@
-use std::{
-    hash::{Hash, Hasher},
-    rc::Rc,
-};
+use std::hash::{Hash, Hasher};
 
 use ash::vk::{self, Handle};
+pub use gpu_allocator::MemoryLocation;
 
-use crate::allocator::Allocator;
+/// What an allocator needs to hand back an [`Image`].
+#[derive(Debug, Clone)]
+pub struct ImageInfo {
+    pub extent: vk::Extent3D,
+    pub format: vk::Format,
+    pub usage: vk::ImageUsageFlags,
+    pub image_type: vk::ImageType,
+    pub mip_levels: u32,
+    pub array_layers: u32,
+    pub samples: vk::SampleCountFlags,
+    pub location: MemoryLocation,
+    pub name: String,
+}
 
-#[derive(Debug, Default, Clone)]
+impl Default for ImageInfo {
+    fn default() -> Self {
+        Self {
+            extent: vk::Extent3D::default().depth(1),
+            format: vk::Format::UNDEFINED,
+            usage: vk::ImageUsageFlags::empty(),
+            image_type: vk::ImageType::TYPE_2D,
+            mip_levels: 1,
+            array_layers: 1,
+            samples: vk::SampleCountFlags::TYPE_1,
+            location: MemoryLocation::GpuOnly,
+            name: String::new(),
+        }
+    }
+}
+
+impl ImageInfo {
+    pub fn color_target(extent: vk::Extent2D, format: vk::Format) -> Self {
+        Self {
+            extent: vk::Extent3D::default()
+                .width(extent.width)
+                .height(extent.height)
+                .depth(1),
+            format,
+            usage: vk::ImageUsageFlags::COLOR_ATTACHMENT,
+            ..Default::default()
+        }
+    }
+
+    pub fn with_usage(mut self, usage: vk::ImageUsageFlags) -> Self {
+        self.usage |= usage;
+        self
+    }
+
+    pub fn with_mips(mut self, mip_levels: u32) -> Self {
+        self.mip_levels = mip_levels;
+        self
+    }
+
+    pub fn with_layers(mut self, array_layers: u32) -> Self {
+        self.array_layers = array_layers;
+        self
+    }
+
+    pub fn with_samples(mut self, samples: vk::SampleCountFlags) -> Self {
+        self.samples = samples;
+        self
+    }
+
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
+    }
+
+    pub fn subresource_range(&self) -> vk::ImageSubresourceRange {
+        vk::ImageSubresourceRange::default()
+            .aspect_mask(aspect_mask(self.format))
+            .level_count(self.mip_levels)
+            .layer_count(self.array_layers)
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
 pub struct Image {
-    pub handle: vk::Image,
-    pub allocation: Option<Rc<dyn Allocator>>,
+    handle: vk::Image,
+    extent: vk::Extent3D,
+    format: vk::Format,
+    samples: vk::SampleCountFlags,
+    mip_levels: u32,
+    array_layers: u32,
+    usage: vk::ImageUsageFlags,
 }
 
 impl Image {
-    pub fn new(handle: vk::Image, allocation: Option<Rc<dyn Allocator>>) -> Self { Self { handle, allocation } }
+    pub(crate) fn new(handle: vk::Image, info: &ImageInfo) -> Self {
+        Self {
+            handle,
+            extent: info.extent,
+            format: info.format,
+            samples: info.samples,
+            mip_levels: info.mip_levels,
+            array_layers: info.array_layers,
+            usage: info.usage,
+        }
+    }
+
+    pub fn imported(
+        handle: vk::Image, format: vk::Format, extent: vk::Extent3D, samples: vk::SampleCountFlags,
+    ) -> Self {
+        Self {
+            handle,
+            extent,
+            format,
+            samples,
+            mip_levels: 1,
+            array_layers: 1,
+            usage: vk::ImageUsageFlags::empty(),
+        }
+    }
+
+    pub fn handle(&self) -> vk::Image { self.handle }
+
+    pub fn extent(&self) -> vk::Extent3D { self.extent }
+
+    pub fn format(&self) -> vk::Format { self.format }
+
+    pub fn samples(&self) -> vk::SampleCountFlags { self.samples }
+
+    pub fn mip_levels(&self) -> u32 { self.mip_levels }
+
+    pub fn array_layers(&self) -> u32 { self.array_layers }
+
+    pub fn usage(&self) -> vk::ImageUsageFlags { self.usage }
 
     pub fn is_null(&self) -> bool { self.handle.is_null() }
+
+    pub fn subresource_range(&self) -> vk::ImageSubresourceRange {
+        vk::ImageSubresourceRange::default()
+            .aspect_mask(aspect_mask(self.format))
+            .level_count(self.mip_levels)
+            .layer_count(self.array_layers)
+    }
 }
 
 pub fn aspect_mask(format: vk::Format) -> vk::ImageAspectFlags {

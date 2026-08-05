@@ -9,7 +9,7 @@ pub use self::{
     frame::{FrameAllocator, SuperFrameAllocator},
     persistent::PersistentAllocator,
 };
-use crate::{Buffer, BufferInfo, CommandBuffer};
+use crate::{Buffer, BufferInfo, CommandBuffer, Image, ImageInfo};
 
 pub type MemoryAllocator = Rc<RefCell<gpu_allocator::vulkan::Allocator>>;
 
@@ -36,6 +36,8 @@ pub trait Allocator: std::fmt::Debug {
     fn deallocate_image_view(&mut self, image_view: vk::ImageView);
     fn allocate_buffer(&mut self, info: &BufferInfo) -> Result<Buffer, vk::Result>;
     fn deallocate_buffer(&mut self, buffer: Buffer);
+    fn allocate_image(&mut self, info: &ImageInfo) -> Result<Image, vk::Result>;
+    fn deallocate_image(&mut self, image: Image);
 }
 
 pub enum AllocatorKind<'a> {
@@ -100,6 +102,27 @@ impl<'a> AllocatorKind<'a> {
         match self {
             AllocatorKind::Persistent(a) => a.deallocate_buffer(buffer),
             AllocatorKind::Frame(a) => a.deallocate_buffer(buffer),
+        }
+    }
+
+    pub fn allocate_image(&mut self, info: &ImageInfo) -> Result<Image, vk::Result> {
+        match self {
+            AllocatorKind::Persistent(a) => a.allocate_image(info),
+            AllocatorKind::Frame(a) => a.allocate_image(info),
+        }
+    }
+
+    pub fn deallocate_image(&mut self, image: Image) {
+        match self {
+            AllocatorKind::Persistent(a) => a.deallocate_image(image),
+            AllocatorKind::Frame(a) => a.deallocate_image(image),
+        }
+    }
+
+    pub fn free_command_buffers(&mut self) {
+        match self {
+            AllocatorKind::Persistent(a) => a.free_command_buffers(),
+            AllocatorKind::Frame(_) => {},
         }
     }
 

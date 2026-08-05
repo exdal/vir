@@ -3,7 +3,7 @@ use std::{ops::Add, ptr::NonNull};
 use ash::vk::{self, Handle};
 
 use super::{Allocator, MemoryAllocator, persistent::PersistentAllocator};
-use crate::{Buffer, BufferInfo, CommandBuffer};
+use crate::{Buffer, BufferInfo, CommandBuffer, Image, ImageInfo};
 
 #[derive(Debug)]
 pub struct FrameAllocator {
@@ -14,6 +14,7 @@ pub struct FrameAllocator {
     semaphores: Vec<vk::Semaphore>,
     image_views: Vec<vk::ImageView>,
     buffers: Vec<Buffer>,
+    images: Vec<Image>,
     cmd_buffers: Vec<vk::CommandBuffer>,
     timeline_waits: Vec<(vk::Semaphore, u64)>,
 }
@@ -28,6 +29,7 @@ impl FrameAllocator {
             semaphores: Vec::default(),
             image_views: Vec::default(),
             buffers: Vec::default(),
+            images: Vec::default(),
             cmd_buffers: Vec::default(),
             timeline_waits: Vec::default(),
         }
@@ -89,6 +91,11 @@ impl FrameAllocator {
             self.upstream.deallocate_buffer(buffer);
         }
 
+        // after the views above, which name these images
+        for image in std::mem::take(&mut self.images) {
+            self.upstream.deallocate_image(image);
+        }
+
         self.issued_frame = issued_frame;
 
         Ok(())
@@ -97,7 +104,6 @@ impl FrameAllocator {
 
 impl Drop for FrameAllocator {
     fn drop(&mut self) {
-        // the frame's buffers and views go back to `upstream`, which drops right after this
         if let Err(err) = self.wait_idle() {
             tracing::error!(?err, "failed to wait for a frame before tearing it down");
         }
@@ -120,6 +126,10 @@ impl Drop for FrameAllocator {
 
         for buffer in std::mem::take(&mut self.buffers) {
             self.upstream.deallocate_buffer(buffer);
+        }
+
+        for image in std::mem::take(&mut self.images) {
+            self.upstream.deallocate_image(image);
         }
     }
 }
@@ -169,6 +179,12 @@ impl Allocator for FrameAllocator {
     }
 
     fn deallocate_buffer(&mut self, _: Buffer) {}
+
+    fn allocate_image(&mut self, info: &ImageInfo) -> Result<Image, vk::Result> {
+        self.upstream.allocate_image(info).inspect(|x| self.images.push(*x))
+    }
+
+    fn deallocate_image(&mut self, _: Image) {}
 }
 
 pub struct SuperFrameAllocator {

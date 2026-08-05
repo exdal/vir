@@ -24,6 +24,7 @@ pub use resource::{
     DynamicValues,
     GraphicsPipelineInfo,
     Image,
+    ImageInfo,
     MemoryLocation,
     PassState,
     PipelineId,

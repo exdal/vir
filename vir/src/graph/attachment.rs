@@ -30,6 +30,23 @@ impl ImageAttachment {
         }
     }
 
+    pub fn from_image(image: &Image, layout: vk::ImageLayout) -> Self {
+        Self {
+            image: *image,
+            image_view: vk::ImageView::null(),
+            format: image.format(),
+            extent: image.extent(),
+            samples: image.samples(),
+            layout,
+            subresource_range: image.subresource_range(),
+        }
+    }
+
+    pub fn with_layout(mut self, layout: vk::ImageLayout) -> Self {
+        self.layout = layout;
+        self
+    }
+
     pub fn with_image_view(mut self, image_view: vk::ImageView) -> Self {
         self.image_view = image_view;
         self
@@ -49,6 +66,8 @@ impl ImageAttachment {
     pub fn extent(&self) -> vk::Extent3D { self.extent }
 
     pub fn samples(&self) -> vk::SampleCountFlags { self.samples }
+
+    pub fn layout(&self) -> vk::ImageLayout { self.layout }
 
     pub fn base_level(&self) -> u32 { self.subresource_range.base_mip_level }
 

@@ -58,7 +58,23 @@ bitflags! {
         const TessellationSampled = 1 << 38;
         const TessellationRead = 1 << 39;
         const TessellationUniformRead = 1 << 40;
+        const Writes = Self::ColorWrite.bits()
+            | Self::DepthStencilWrite.bits()
+            | Self::FragmentWrite.bits()
+            | Self::ComputeWrite.bits()
+            | Self::RayTracingWrite.bits()
+            | Self::CopyWrite.bits()
+            | Self::BlitWrite.bits()
+            | Self::Clear.bits()
+            | Self::ResolveWrite.bits()
+            | Self::AccelerationStructureBuildWrite.bits()
+            | Self::HostWrite.bits()
+            | Self::MemoryWrite.bits();
     }
+}
+
+impl Access {
+    pub fn writes(self) -> bool { self.intersects(Access::Writes) }
 }
 
 impl From<Access> for vk::AccessFlags2 {
