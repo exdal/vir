@@ -17,6 +17,7 @@ impl fmt::Debug for ValueId {
 #[derive(Debug, Clone)]
 pub enum Value {
     None,
+    I32(i32),
     U32(u32),
     Extent2D(vk::Extent2D),
     Extent3D(vk::Extent3D),
@@ -30,6 +31,15 @@ pub enum Value {
 
 pub trait FromValue {
     fn from_value(value: &Value) -> Self;
+}
+
+impl FromValue for i32 {
+    fn from_value(value: &Value) -> Self {
+        match value {
+            Value::I32(v) => *v,
+            _ => panic!("expected I32, got {:?}", value),
+        }
+    }
 }
 
 impl FromValue for u32 {

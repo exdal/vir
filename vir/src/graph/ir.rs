@@ -117,11 +117,28 @@ pub enum IR {
         buffers: Vec<ValueId>,
         offsets: Vec<u64>,
     },
+    BindIndexBuffer {
+        pass: ValueId,
+        buffer: ValueId,
+        offset: u64,
+        index_type: vk::IndexType,
+    },
     Draw {
         pass: ValueId,
         vertex_count: ValueId,
         instance_count: ValueId,
         first_vertex: ValueId,
+        first_instance: ValueId,
+        pipeline: Option<PipelineId>,
+        state: PipelineState,
+        dynamic: DynamicValues,
+    },
+    DrawIndexed {
+        pass: ValueId,
+        index_count: ValueId,
+        instance_count: ValueId,
+        first_index: ValueId,
+        vertex_offset: ValueId,
         first_instance: ValueId,
         pipeline: Option<PipelineId>,
         state: PipelineState,
@@ -159,6 +176,43 @@ fn fmt_usage(usage: vk::ImageUsageFlags) -> String {
         .map(|(_, n)| *n)
         .collect();
     if s.is_empty() { "NONE".into() } else { s.join(" | ") }
+}
+
+/// The pipeline and resolved state trailer both draw instructions print.
+fn fmt_draw_state(
+    f: &mut fmt::Formatter<'_>, pipeline: &Option<PipelineId>, state: &PipelineState, dynamic: &DynamicValues,
+) -> fmt::Result {
+    write!(f, "pipeline=")?;
+    match pipeline {
+        Some(pipeline) => write!(f, "{pipeline}")?,
+        None => write!(f, "none")?,
+    }
+    write!(
+        f,
+        " formats={:?} samples={:?} topology={:?} polygon={:?} cull={:?} front={:?} blend={:?}",
+        state.rendering.color_formats,
+        state.rendering.samples,
+        state.topology,
+        state.rasterization.polygon_mode,
+        state.rasterization.cull_mode,
+        state.rasterization.front_face,
+        state.blend.iter().map(|blend| blend.blend_enable).collect::<Vec<_>>()
+    )?;
+
+    match state.viewports.is_empty() {
+        true => write!(f, " viewports=dynamic{:?}", dynamic.viewports)?,
+        false => write!(f, " viewports={:?}", state.viewports)?,
+    }
+    match state.scissors.is_empty() {
+        true => write!(f, " scissors=dynamic{:?}", dynamic.scissors)?,
+        false => write!(f, " scissors={:?}", state.scissors)?,
+    }
+
+    let push = &dynamic.push_constants;
+    match push.is_empty() {
+        true => Ok(()),
+        false => write!(f, " push_constants=[{}..{}]", push.offset, push.end()),
+    }
 }
 
 impl fmt::Display for IR {
@@ -267,6 +321,15 @@ impl fmt::Display for IR {
                 }
                 write!(f, "] offsets={offsets:?}")
             },
+            IR::BindIndexBuffer {
+                pass,
+                buffer,
+                offset,
+                index_type,
+            } => write!(
+                f,
+                "bind_index_buffer {pass} buffer={buffer} offset={offset} type={index_type:?}"
+            ),
             IR::SetState { pass, change } => {
                 write!(f, "set_state {pass} ")?;
                 match change {
@@ -301,38 +364,27 @@ impl fmt::Display for IR {
                 write!(
                     f,
                     "draw {pass} verts={vertex_count} insts={instance_count} first_vert={first_vertex} \
-                     first_inst={first_instance} pipeline="
+                     first_inst={first_instance} "
                 )?;
-                match pipeline {
-                    Some(pipeline) => write!(f, "{pipeline}")?,
-                    None => write!(f, "none")?,
-                }
+                fmt_draw_state(f, pipeline, state, dynamic)
+            },
+            IR::DrawIndexed {
+                pass,
+                index_count,
+                instance_count,
+                first_index,
+                vertex_offset,
+                first_instance,
+                pipeline,
+                state,
+                dynamic,
+            } => {
                 write!(
                     f,
-                    " formats={:?} samples={:?} topology={:?} polygon={:?} cull={:?} front={:?} blend={:?}",
-                    state.rendering.color_formats,
-                    state.rendering.samples,
-                    state.topology,
-                    state.rasterization.polygon_mode,
-                    state.rasterization.cull_mode,
-                    state.rasterization.front_face,
-                    state.blend.iter().map(|blend| blend.blend_enable).collect::<Vec<_>>()
+                    "draw_indexed {pass} indices={index_count} insts={instance_count} first_index={first_index} \
+                     vertex_offset={vertex_offset} first_inst={first_instance} "
                 )?;
-
-                match state.viewports.is_empty() {
-                    true => write!(f, " viewports=dynamic{:?}", dynamic.viewports)?,
-                    false => write!(f, " viewports={:?}", state.viewports)?,
-                }
-                match state.scissors.is_empty() {
-                    true => write!(f, " scissors=dynamic{:?}", dynamic.scissors)?,
-                    false => write!(f, " scissors={:?}", state.scissors)?,
-                }
-
-                let push = &dynamic.push_constants;
-                match push.is_empty() {
-                    true => Ok(()),
-                    false => write!(f, " push_constants=[{}..{}]", push.offset, push.end()),
-                }
+                fmt_draw_state(f, pipeline, state, dynamic)
             },
             IR::EndRendering { pass } => write!(f, "end_rendering {pass}"),
             IR::MemoryBarrier { src_access, dst_access } => {

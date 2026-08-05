@@ -80,6 +80,8 @@ impl Module {
         id
     }
 
+    fn lower_i32(&mut self, v: i32) -> ValueId { self.lower_constant(ir::Constant::I32(v)) }
+
     fn lower_u32(&mut self, v: u32) -> ValueId { self.lower_constant(ir::Constant::U32(v)) }
 
     fn lower_access(&mut self, access: Access) -> ValueId { self.lower_constant(ir::Constant::Access(access)) }
@@ -203,9 +205,7 @@ impl Module {
         self.release(attachment, Access::Present, DomainFlag::Present)
     }
 
-    pub fn blit(&mut self, src: ValueId, dst: ValueId) -> ValueId {
-        self.blit_filtered(src, dst, vk::Filter::LINEAR)
-    }
+    pub fn blit(&mut self, src: ValueId, dst: ValueId) -> ValueId { self.blit_filtered(src, dst, vk::Filter::LINEAR) }
 
     pub fn blit_filtered(&mut self, src: ValueId, dst: ValueId, filter: vk::Filter) -> ValueId {
         self.emit(IR::Blit { src, dst, filter })
@@ -321,6 +321,10 @@ impl Module {
                         buffers.iter().rev().for_each(|v| stack.push(*v));
                         stack.push(*pass);
                     },
+                    IR::BindIndexBuffer { pass, buffer, .. } => {
+                        stack.push(*buffer);
+                        stack.push(*pass);
+                    },
                     IR::Draw {
                         pass,
                         vertex_count,
@@ -333,6 +337,22 @@ impl Module {
                         stack.push(*first_vertex);
                         stack.push(*instance_count);
                         stack.push(*vertex_count);
+                        stack.push(*pass);
+                    },
+                    IR::DrawIndexed {
+                        pass,
+                        index_count,
+                        instance_count,
+                        first_index,
+                        vertex_offset,
+                        first_instance,
+                        ..
+                    } => {
+                        stack.push(*first_instance);
+                        stack.push(*vertex_offset);
+                        stack.push(*first_index);
+                        stack.push(*instance_count);
+                        stack.push(*index_count);
                         stack.push(*pass);
                     },
                     IR::EndRendering { pass } => {
@@ -368,25 +388,34 @@ impl Module {
         let mut buffer_states: HashMap<ValueId, ValueId> = HashMap::new();
         let mut next_id = self.instructions.len() as u32;
 
-        let mut region_buffers: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
+        // buffers a rendering region reads, paired with how it reads them, so the barrier that
+        // makes host writes visible can be emitted before the region opens
+        let mut region_buffers: HashMap<ValueId, Vec<(ValueId, Access)>> = HashMap::new();
         let mut open_region: Option<ValueId> = None;
         for (value_id, ir) in &nodes {
-            match ir {
-                IR::BeginRendering { .. } => open_region = Some(*value_id),
-                IR::EndRendering { .. } => open_region = None,
-                IR::BindVertexBuffers { buffers, .. } => {
-                    let Some(region) = open_region else {
-                        continue;
-                    };
-                    let bound = region_buffers.entry(region).or_default();
-                    for buffer in buffers {
-                        let root = self.resource_root(*buffer);
-                        if !bound.contains(&root) {
-                            bound.push(root);
-                        }
-                    }
+            let (buffers, access) = match ir {
+                IR::BeginRendering { .. } => {
+                    open_region = Some(*value_id);
+                    continue;
                 },
-                _ => {},
+                IR::EndRendering { .. } => {
+                    open_region = None;
+                    continue;
+                },
+                IR::BindVertexBuffers { buffers, .. } => (buffers.as_slice(), Access::AttributeRead),
+                IR::BindIndexBuffer { buffer, .. } => (std::slice::from_ref(buffer), Access::IndexRead),
+                _ => continue,
+            };
+
+            let Some(region) = open_region else {
+                continue;
+            };
+            let bound = region_buffers.entry(region).or_default();
+            for buffer in buffers {
+                let root = self.resource_root(*buffer);
+                if !bound.iter().any(|(bound, _)| *bound == root) {
+                    bound.push((root, access));
+                }
             }
         }
 
@@ -434,7 +463,7 @@ impl Module {
 
         let no_access_id = emit_access!(Access::None);
         let mut host_write_id: Option<ValueId> = None;
-        let mut attribute_read_id: Option<ValueId> = None;
+        let mut read_access_ids: HashMap<Access, ValueId> = HashMap::new();
         let undefined = ResourceState {
             layout: vk::ImageLayout::UNDEFINED,
             last_access: no_access_id,
@@ -477,11 +506,14 @@ impl Module {
         for (value_id, ir) in nodes {
             match &ir {
                 IR::ConstructImage { initial_layout, .. } => {
-                    states.insert(value_id, ResourceState {
-                        layout: *initial_layout,
-                        last_access: no_access_id,
-                        access: Access::None,
-                    });
+                    states.insert(
+                        value_id,
+                        ResourceState {
+                            layout: *initial_layout,
+                            last_access: no_access_id,
+                            access: Access::None,
+                        },
+                    );
                 },
 
                 IR::Acquire { resource, access } => {
@@ -506,21 +538,24 @@ impl Module {
                         transition!(*attachment, access_id, Access::ColorRW);
                     }
 
-                    for buffer in region_buffers.get(&value_id).into_iter().flatten() {
-                        let last = buffer_states.get(buffer).copied().unwrap_or_else(|| match host_write_id {
+                    for (buffer, access) in region_buffers.get(&value_id).cloned().into_iter().flatten() {
+                        let last = match buffer_states.get(&buffer).copied() {
                             Some(id) => id,
-                            None => {
-                                let id = emit_access!(Access::HostWrite);
-                                host_write_id = Some(id);
-                                id
+                            None => match host_write_id {
+                                Some(id) => id,
+                                None => {
+                                    let id = emit_access!(Access::HostWrite);
+                                    host_write_id = Some(id);
+                                    id
+                                },
                             },
-                        });
+                        };
 
-                        let read_id = match attribute_read_id {
+                        let read_id = match read_access_ids.get(&access).copied() {
                             Some(id) => id,
                             None => {
-                                let id = emit_access!(Access::AttributeRead);
-                                attribute_read_id = Some(id);
+                                let id = emit_access!(access);
+                                read_access_ids.insert(access, id);
                                 id
                             },
                         };
@@ -529,7 +564,7 @@ impl Module {
                             continue;
                         }
                         emit_memory_barrier!(last, read_id);
-                        buffer_states.insert(*buffer, read_id);
+                        buffer_states.insert(buffer, read_id);
                     }
                 },
 
@@ -564,7 +599,9 @@ impl Module {
                 IR::BindPipeline { pass, .. }
                 | IR::SetState { pass, .. }
                 | IR::BindVertexBuffers { pass, .. }
+                | IR::BindIndexBuffer { pass, .. }
                 | IR::Draw { pass, .. }
+                | IR::DrawIndexed { pass, .. }
                 | IR::EndRendering { pass } => *pass,
                 IR::Acquire { resource, .. } | IR::Release { resource, .. } => *resource,
                 _ => return id,
@@ -648,7 +685,9 @@ impl Module {
                 IR::BindPipeline { pass, .. }
                 | IR::SetState { pass, .. }
                 | IR::BindVertexBuffers { pass, .. }
+                | IR::BindIndexBuffer { pass, .. }
                 | IR::Draw { pass, .. }
+                | IR::DrawIndexed { pass, .. }
                 | IR::EndRendering { pass } => id = *pass,
                 IR::Acquire { resource, .. } | IR::Release { resource, .. } => id = *resource,
                 _ => return None,
@@ -743,6 +782,13 @@ impl Module {
                     state,
                     dynamic,
                     ..
+                }
+                | IR::DrawIndexed {
+                    pass,
+                    pipeline,
+                    state,
+                    dynamic,
+                    ..
                 } => {
                     if let Some(in_force) = regions.get(pass).cloned() {
                         if in_force.pipeline.is_none() {
@@ -754,7 +800,7 @@ impl Module {
                     }
                 },
 
-                IR::BindVertexBuffers { pass, .. } | IR::EndRendering { pass } => {
+                IR::BindVertexBuffers { pass, .. } | IR::BindIndexBuffer { pass, .. } | IR::EndRendering { pass } => {
                     if let Some(in_force) = regions.get(pass).cloned() {
                         regions.insert(*value_id, in_force);
                     }
@@ -806,6 +852,20 @@ impl RenderPass<'_> {
             first_binding,
             buffers: buffers.to_vec(),
             offsets: offsets.to_vec(),
+        });
+        self
+    }
+
+    pub fn bind_index_buffer(self, buffer: ValueId, index_type: vk::IndexType) -> Self {
+        self.bind_index_buffer_at(buffer, 0, index_type)
+    }
+
+    pub fn bind_index_buffer_at(mut self, buffer: ValueId, offset: u64, index_type: vk::IndexType) -> Self {
+        self.id = self.module.emit(IR::BindIndexBuffer {
+            pass: self.id,
+            buffer,
+            offset,
+            index_type,
         });
         self
     }
@@ -875,6 +935,32 @@ impl RenderPass<'_> {
             vertex_count,
             instance_count,
             first_vertex,
+            first_instance,
+            pipeline: None,
+            state: Default::default(),
+            dynamic: Default::default(),
+        });
+        self
+    }
+
+    pub fn draw_indexed(self, index_count: u32, instance_count: u32) -> Self {
+        self.draw_indexed_range(index_count, instance_count, 0, 0, 0)
+    }
+
+    pub fn draw_indexed_range(
+        mut self, index_count: u32, instance_count: u32, first_index: u32, vertex_offset: i32, first_instance: u32,
+    ) -> Self {
+        let index_count = self.module.lower_u32(index_count);
+        let instance_count = self.module.lower_u32(instance_count);
+        let first_index = self.module.lower_u32(first_index);
+        let vertex_offset = self.module.lower_i32(vertex_offset);
+        let first_instance = self.module.lower_u32(first_instance);
+        self.id = self.module.emit(IR::DrawIndexed {
+            pass: self.id,
+            index_count,
+            instance_count,
+            first_index,
+            vertex_offset,
             first_instance,
             pipeline: None,
             state: Default::default(),
@@ -993,10 +1079,26 @@ mod tests {
         instructions
             .iter()
             .filter_map(|(_, ir)| match ir {
-                IR::Draw { pipeline, state, .. } => Some((*pipeline, state.clone())),
+                IR::Draw { pipeline, state, .. } | IR::DrawIndexed { pipeline, state, .. } => {
+                    Some((*pipeline, state.clone()))
+                },
                 _ => None,
             })
             .collect()
+    }
+
+    fn u32_constant(module: &Module, id: &ValueId) -> u32 {
+        match module.instructions.get(id.0 as usize) {
+            Some(IR::Constant(ir::Constant::U32(v))) => *v,
+            _ => panic!("{id} is not a u32 constant"),
+        }
+    }
+
+    fn i32_constant(module: &Module, id: &ValueId) -> i32 {
+        match module.instructions.get(id.0 as usize) {
+            Some(IR::Constant(ir::Constant::I32(v))) => *v,
+            _ => panic!("{id} is not an i32 constant"),
+        }
     }
 
     #[test]
@@ -1130,10 +1232,10 @@ mod tests {
             .end_rendering();
 
         let instructions = module.compile(end);
-        assert_eq!(memory_barriers(&module, &instructions), vec![(
-            Access::HostWrite,
-            Access::AttributeRead
-        )]);
+        assert_eq!(
+            memory_barriers(&module, &instructions),
+            vec![(Access::HostWrite, Access::AttributeRead)]
+        );
 
         let binds = instructions
             .iter()
@@ -1174,6 +1276,133 @@ mod tests {
 
         let instructions = module.compile(end);
         assert_eq!(memory_barriers(&module, &instructions).len(), 1);
+    }
+
+    #[test]
+    fn binding_an_index_buffer_makes_the_host_write_visible_to_index_input() {
+        let (mut module, attachment) = module_with_attachment();
+        let indices = module.import_buffer(&Buffer::default());
+
+        let end = module
+            .begin_rendering(&[attachment])
+            .bind_graphics_pipeline(PipelineId(0))
+            .bind_index_buffer(indices, vk::IndexType::UINT32)
+            .draw_indexed(3, 1)
+            .end_rendering();
+
+        let instructions = module.compile(end);
+        assert_eq!(
+            memory_barriers(&module, &instructions),
+            vec![(Access::HostWrite, Access::IndexRead)]
+        );
+
+        let position = |predicate: fn(&IR) -> bool| {
+            instructions
+                .iter()
+                .position(|(_, ir)| predicate(ir))
+                .expect("instruction should be present")
+        };
+        assert!(
+            position(|ir| matches!(ir, IR::MemoryBarrier { .. }))
+                < position(|ir| matches!(ir, IR::BeginRendering { .. }))
+        );
+    }
+
+    #[test]
+    fn vertex_and_index_buffers_each_get_the_barrier_their_stage_needs() {
+        let (mut module, attachment) = module_with_attachment();
+        let vertices = module.import_buffer(&Buffer::default());
+        let indices = module.import_buffer(&Buffer::default());
+
+        let end = module
+            .begin_rendering(&[attachment])
+            .bind_graphics_pipeline(PipelineId(0))
+            .bind_vertex_buffer(0, vertices)
+            .bind_index_buffer(indices, vk::IndexType::UINT32)
+            .draw_indexed(3, 1)
+            .end_rendering();
+
+        let barriers = memory_barriers(&module, &module.compile(end));
+        assert_eq!(barriers.len(), 2);
+        assert!(barriers.contains(&(Access::HostWrite, Access::AttributeRead)));
+        assert!(barriers.contains(&(Access::HostWrite, Access::IndexRead)));
+    }
+
+    #[test]
+    fn rebinding_the_same_index_buffer_does_not_repeat_the_barrier() {
+        let (mut module, attachment) = module_with_attachment();
+        let indices = module.import_buffer(&Buffer::default());
+
+        let end = module
+            .begin_rendering(&[attachment])
+            .bind_graphics_pipeline(PipelineId(0))
+            .bind_index_buffer(indices, vk::IndexType::UINT32)
+            .draw_indexed(3, 1)
+            .bind_index_buffer(indices, vk::IndexType::UINT32)
+            .draw_indexed(3, 1)
+            .end_rendering();
+
+        assert_eq!(memory_barriers(&module, &module.compile(end)).len(), 1);
+    }
+
+    /// An indexed draw goes through the same state inference as a plain one; a variant missing
+    /// from that pass would silently come out with no pipeline and default state.
+    #[test]
+    fn an_indexed_draw_inherits_the_pipeline_and_state_in_force() {
+        let (mut module, attachment) = module_with_attachment();
+        let pipeline = PipelineId(0);
+        let indices = module.import_buffer(&Buffer::default());
+
+        let end = module
+            .begin_rendering(&[attachment])
+            .bind_graphics_pipeline(pipeline)
+            .set_primitive_topology(vk::PrimitiveTopology::LINE_STRIP)
+            .broadcast_color_blend(BlendPreset::PremultipliedAlphaBlend)
+            .bind_index_buffer(indices, vk::IndexType::UINT32)
+            .draw_indexed(6, 1)
+            .end_rendering();
+
+        let draws = draws(&module.compile(end));
+        assert_eq!(draws.len(), 1);
+        assert_eq!(draws[0].0, Some(pipeline));
+        assert_eq!(draws[0].1.rendering.color_formats, vec![FORMAT]);
+        assert_eq!(draws[0].1.topology, vk::PrimitiveTopology::LINE_STRIP);
+        assert!(draws[0].1.blend.iter().all(|blend| blend.blend_enable));
+    }
+
+    #[test]
+    fn an_indexed_draw_lowers_its_range_with_a_signed_vertex_offset() {
+        let (mut module, attachment) = module_with_attachment();
+
+        let end = module
+            .begin_rendering(&[attachment])
+            .bind_graphics_pipeline(PipelineId(0))
+            .draw_indexed_range(9, 2, 3, -4, 5)
+            .end_rendering();
+
+        let instructions = module.compile(end);
+        let (_, ir) = instructions
+            .iter()
+            .find(|(_, ir)| matches!(ir, IR::DrawIndexed { .. }))
+            .expect("the indexed draw should survive compilation");
+
+        let IR::DrawIndexed {
+            index_count,
+            instance_count,
+            first_index,
+            vertex_offset,
+            first_instance,
+            ..
+        } = ir
+        else {
+            unreachable!()
+        };
+
+        assert_eq!(u32_constant(&module, index_count), 9);
+        assert_eq!(u32_constant(&module, instance_count), 2);
+        assert_eq!(u32_constant(&module, first_index), 3);
+        assert_eq!(i32_constant(&module, vertex_offset), -4);
+        assert_eq!(u32_constant(&module, first_instance), 5);
     }
 
     #[test]

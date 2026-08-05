@@ -125,11 +125,34 @@ impl CommandBuffer {
         }
     }
 
+    pub fn bind_index_buffer(&self, buffer: vk::Buffer, offset: vk::DeviceSize, index_type: vk::IndexType) {
+        unsafe {
+            self.device
+                .as_ref()
+                .cmd_bind_index_buffer(self.handle, buffer, offset, index_type)
+        }
+    }
+
     pub fn draw(&self, vertex_count: u32, instance_count: u32, first_vertex: u32, first_instance: u32) {
         unsafe {
             self.device
                 .as_ref()
                 .cmd_draw(self.handle, vertex_count, instance_count, first_vertex, first_instance)
+        }
+    }
+
+    pub fn draw_indexed(
+        &self, index_count: u32, instance_count: u32, first_index: u32, vertex_offset: i32, first_instance: u32,
+    ) {
+        unsafe {
+            self.device.as_ref().cmd_draw_indexed(
+                self.handle,
+                index_count,
+                instance_count,
+                first_index,
+                vertex_offset,
+                first_instance,
+            )
         }
     }
 

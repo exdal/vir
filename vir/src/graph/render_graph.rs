@@ -13,6 +13,7 @@ use crate::{
     CommandBuffer,
     Context,
     DomainFlag,
+    DynamicValues,
     GraphicsPipelineInfo,
     IR,
     ImageAttachment,
@@ -230,7 +231,7 @@ impl RenderGraph {
         let mut pending: Vec<(PipelineId, PipelineState)> = Vec::new();
 
         for (value_id, ir) in instructions {
-            let IR::Draw { pipeline, state, .. } = ir else {
+            let (IR::Draw { pipeline, state, .. } | IR::DrawIndexed { pipeline, state, .. }) = ir else {
                 continue;
             };
 
@@ -513,6 +514,41 @@ impl RenderGraph {
         Ok(())
     }
 
+    /// Binds the pipeline permutation a draw resolved to and brings the dynamic state that
+    /// moved since the last draw up to date.
+    fn prepare_draw(
+        &mut self, pipeline: Option<PipelineId>, state: &PipelineState, dynamic: &DynamicValues,
+    ) -> Result<(), vk::Result> {
+        let pipeline = pipeline.ok_or(vk::Result::ERROR_UNKNOWN)?;
+        let handle = self
+            .pipelines
+            .get(pipeline.0 as usize)
+            .and_then(|declared| declared.variants.get(state))
+            .copied()
+            .ok_or(vk::Result::ERROR_UNKNOWN)?;
+
+        if self.bound_pipeline != Some(handle) {
+            self.batch()?.bind_pipeline(vk::PipelineBindPoint::GRAPHICS, handle);
+            self.bound_pipeline = Some(handle);
+        }
+
+        // dynamic state is only re-recorded when it moved since the last draw
+        let viewports = dynamic.viewports(self.render_area);
+        if !viewports.is_empty() && viewports != self.recorded_viewports {
+            let handles = viewports.iter().copied().map(vk::Viewport::from).collect::<Vec<_>>();
+            self.batch()?.set_viewport(0, &handles);
+            self.recorded_viewports = viewports;
+        }
+
+        let scissors = dynamic.scissors(self.render_area);
+        if !scissors.is_empty() && scissors != self.recorded_scissors {
+            self.batch()?.set_scissor(0, &scissors);
+            self.recorded_scissors = scissors;
+        }
+
+        self.record_push_constants(pipeline, &dynamic.push_constants)
+    }
+
     pub fn dump(instructions: &[ir::Instr]) {
         instructions.iter().for_each(|(id, node)| {
             println!("%{} = {}", id.0, node);
@@ -525,7 +561,7 @@ impl RenderGraph {
         match ir {
             IR::Type(_) => {},
             IR::Constant(c) => match c {
-                ir::Constant::I32(_) => todo!(),
+                ir::Constant::I32(v) => self.set_value(value_id, Value::I32(*v)),
                 ir::Constant::U32(v) => self.set_value(value_id, Value::U32(*v)),
                 ir::Constant::Extent2D(v) => self.set_value(value_id, Value::Extent2D(*v)),
                 ir::Constant::Extent3D(v) => self.set_value(value_id, Value::Extent3D(*v)),
@@ -737,6 +773,18 @@ impl RenderGraph {
                     .collect::<Vec<_>>();
                 self.batch()?.bind_vertex_buffers(*first_binding, &handles, offsets);
             },
+            IR::BindIndexBuffer {
+                pass,
+                buffer,
+                offset,
+                index_type,
+            } => {
+                self.set_value(value_id, Value::Reference(*pass));
+                self.ensure_batch(ctx, allocator)?;
+
+                let handle = self.get::<Buffer>(buffer).handle();
+                self.batch()?.bind_index_buffer(handle, *offset, *index_type);
+            },
             IR::Draw {
                 pass,
                 vertex_count,
@@ -748,35 +796,7 @@ impl RenderGraph {
                 dynamic,
             } => {
                 self.set_value(value_id, Value::Reference(*pass));
-
-                let pipeline = pipeline.ok_or(vk::Result::ERROR_UNKNOWN)?;
-                let handle = self
-                    .pipelines
-                    .get(pipeline.0 as usize)
-                    .and_then(|declared| declared.variants.get(state))
-                    .copied()
-                    .ok_or(vk::Result::ERROR_UNKNOWN)?;
-
-                if self.bound_pipeline != Some(handle) {
-                    self.batch()?.bind_pipeline(vk::PipelineBindPoint::GRAPHICS, handle);
-                    self.bound_pipeline = Some(handle);
-                }
-
-                // dynamic state is only re-recorded when it moved since the last draw
-                let viewports = dynamic.viewports(self.render_area);
-                if !viewports.is_empty() && viewports != self.recorded_viewports {
-                    let handles = viewports.iter().copied().map(vk::Viewport::from).collect::<Vec<_>>();
-                    self.batch()?.set_viewport(0, &handles);
-                    self.recorded_viewports = viewports;
-                }
-
-                let scissors = dynamic.scissors(self.render_area);
-                if !scissors.is_empty() && scissors != self.recorded_scissors {
-                    self.batch()?.set_scissor(0, &scissors);
-                    self.recorded_scissors = scissors;
-                }
-
-                self.record_push_constants(pipeline, &dynamic.push_constants)?;
+                self.prepare_draw(*pipeline, state, dynamic)?;
 
                 let vertex_count = self.get::<u32>(vertex_count);
                 let instance_count = self.get::<u32>(instance_count);
@@ -784,6 +804,28 @@ impl RenderGraph {
                 let first_instance = self.get::<u32>(first_instance);
                 self.batch()?
                     .draw(vertex_count, instance_count, first_vertex, first_instance);
+            },
+            IR::DrawIndexed {
+                pass,
+                index_count,
+                instance_count,
+                first_index,
+                vertex_offset,
+                first_instance,
+                pipeline,
+                state,
+                dynamic,
+            } => {
+                self.set_value(value_id, Value::Reference(*pass));
+                self.prepare_draw(*pipeline, state, dynamic)?;
+
+                let index_count = self.get::<u32>(index_count);
+                let instance_count = self.get::<u32>(instance_count);
+                let first_index = self.get::<u32>(first_index);
+                let vertex_offset = self.get::<i32>(vertex_offset);
+                let first_instance = self.get::<u32>(first_instance);
+                self.batch()?
+                    .draw_indexed(index_count, instance_count, first_index, vertex_offset, first_instance);
             },
             IR::EndRendering { pass } => {
                 self.set_value(value_id, Value::Reference(*pass));
