@@ -1,4 +1,4 @@
-use std::ptr::NonNull;
+use std::{cell::Cell, ptr::NonNull};
 
 use ash::vk;
 use bitflags::bitflags;
@@ -25,6 +25,7 @@ pub struct CommandQueue {
     family_index: u32,
     domain_flags: DomainFlag,
     timeline: vk::Semaphore,
+    timeline_value: Cell<u64>,
 }
 
 impl CommandQueue {
@@ -38,6 +39,7 @@ impl CommandQueue {
             family_index,
             domain_flags,
             timeline,
+            timeline_value: Cell::new(0),
         }
     }
 
@@ -48,6 +50,12 @@ impl CommandQueue {
     pub fn domain_flags(&self) -> DomainFlag { self.domain_flags }
 
     pub fn semaphore(&self) -> &vk::Semaphore { &self.timeline }
+
+    pub fn next_timeline_value(&self) -> u64 {
+        let value = self.timeline_value.get() + 1;
+        self.timeline_value.set(value);
+        value
+    }
 
     pub fn submit(&self, submits: &[vk::SubmitInfo2]) -> Result<(), vk::Result> {
         unsafe {

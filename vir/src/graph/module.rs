@@ -10,13 +10,6 @@ struct ResourceState {
     last_access: ValueId,
 }
 
-fn layout_for_domain(domain: DomainFlag) -> vk::ImageLayout {
-    if domain.contains(DomainFlag::Present) {
-        return vk::ImageLayout::PRESENT_SRC_KHR;
-    }
-    vk::ImageLayout::GENERAL
-}
-
 #[derive(Default)]
 pub struct Module {
     types: HashMap<ir::Type, ValueId>,
@@ -77,10 +70,15 @@ impl Module {
             format: attachment.format(),
             samples: attachment.samples(),
         });
+        let view_type = if attachment.layer_count() > 1 {
+            vk::ImageViewType::TYPE_2D_ARRAY
+        } else {
+            vk::ImageViewType::TYPE_2D
+        };
         let construct_instr = self.emit(IR::ConstructImage {
             image: attachment.image().clone(),
             image_view: attachment.image_view(),
-            view_type: vk::ImageViewType::from_raw(-1),
+            view_type,
             extent,
             format: attachment.format(),
             samples: attachment.samples(),
@@ -105,10 +103,15 @@ impl Module {
         assert!(ty_instr.iter().all(|&i| i == ty));
         let attachments = self.lower_array(ty, attach_instr);
 
-        self.emit(IR::AcquireNextImage {
+        let image_index = self.emit(IR::AcquireNextImage {
             swapchain: swapchain.handle,
             attachments,
             present_semaphores: swapchain.semaphores.clone(),
+        });
+
+        self.emit(IR::Index {
+            array: attachments,
+            index: image_index,
         })
     }
 
@@ -122,7 +125,7 @@ impl Module {
     }
 
     pub fn present(&mut self, attachment: ValueId) -> ValueId {
-        self.release(attachment, Access::None, DomainFlag::Present)
+        self.release(attachment, Access::Present, DomainFlag::Present)
     }
 
     pub fn clear(&mut self, attachment: ValueId, color: ClearValue) -> ValueId {
@@ -176,6 +179,10 @@ impl Module {
                     },
                     IR::AcquireNextImage { attachments, .. } => {
                         stack.push(*attachments);
+                    },
+                    IR::Index { array, index } => {
+                        stack.push(*index);
+                        stack.push(*array);
                     },
                     IR::Acquire { access, resource, .. } => {
                         stack.push(*access);
@@ -260,7 +267,7 @@ impl Module {
 
         for (value_id, ir) in nodes {
             match &ir {
-                IR::AcquireNextImage { .. } | IR::ConstructImage { .. } => {
+                IR::Index { .. } | IR::ConstructImage { .. } => {
                     states.insert(value_id, undefined);
                 },
 
@@ -294,13 +301,9 @@ impl Module {
                     states.insert(value_id, new_state);
                 },
 
-                IR::Release {
-                    resource,
-                    access,
-                    dst_domain,
-                } => {
+                IR::Release { resource, access, .. } => {
                     let state = states.get(resource).copied().unwrap_or(undefined);
-                    let new_layout = layout_for_domain(*dst_domain);
+                    let new_layout = self.resolve_access(*access).into();
                     emit_barrier!(state.last_access, *access, state.layout, new_layout, *resource);
                     states.insert(
                         *resource,
@@ -320,5 +323,5 @@ impl Module {
         result
     }
 
-    fn infer(&self, mut nodes: Vec<ir::Instr>) -> Vec<ir::Instr> { nodes }
+    fn infer(&self, nodes: Vec<ir::Instr>) -> Vec<ir::Instr> { nodes }
 }

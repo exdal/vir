@@ -19,6 +19,19 @@ impl Image {
     pub fn is_null(&self) -> bool { self.handle.is_null() }
 }
 
+pub fn aspect_mask(format: vk::Format) -> vk::ImageAspectFlags {
+    match format {
+        vk::Format::D16_UNORM | vk::Format::X8_D24_UNORM_PACK32 | vk::Format::D32_SFLOAT => {
+            vk::ImageAspectFlags::DEPTH
+        },
+        vk::Format::S8_UINT => vk::ImageAspectFlags::STENCIL,
+        vk::Format::D16_UNORM_S8_UINT | vk::Format::D24_UNORM_S8_UINT | vk::Format::D32_SFLOAT_S8_UINT => {
+            vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL
+        },
+        _ => vk::ImageAspectFlags::COLOR,
+    }
+}
+
 impl From<&Image> for vk::Image {
     fn from(image: &Image) -> Self { image.handle }
 }

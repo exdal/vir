@@ -22,6 +22,15 @@ pub struct ClearValue(pub vk::ClearValue);
 
 impl ClearValue {
     #[inline]
+    pub const fn rgba_f32(r: f32, g: f32, b: f32, a: f32) -> Self {
+        Self(vk::ClearValue {
+            color: vk::ClearColorValue {
+                float32: [r, g, b, a],
+            },
+        })
+    }
+
+    #[inline]
     fn bytes(&self) -> &[u8; size_of::<vk::ClearValue>()] {
         unsafe { &*(self as *const Self as *const [u8; size_of::<vk::ClearValue>()]) }
     }

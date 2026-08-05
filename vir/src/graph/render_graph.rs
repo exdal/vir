@@ -15,6 +15,7 @@ use crate::{
     ValueId,
     core::ScopedStack,
     graph::{ir, value::FromValue},
+    resource,
 };
 
 struct SemaphoreSubmitInfo {
@@ -114,10 +115,12 @@ pub struct RenderGraph<'a> {
 
 impl<'a> RenderGraph<'a> {
     pub fn new(ctx: &'a Context, instructions: &'a [ir::Instr]) -> Self {
+        let value_count = instructions.iter().map(|(id, _)| id.0 as usize + 1).max().unwrap_or(0);
+
         Self {
             ctx,
             instructions,
-            values: Vec::new(),
+            values: vec![Value::None; value_count],
             current_batch: None,
             current_submit: Submit::default(),
             submits: Vec::new(),
@@ -128,7 +131,9 @@ impl<'a> RenderGraph<'a> {
 
     fn set_value(&mut self, value_id: &ValueId, value: Value) {
         let index = value_id.0 as usize;
-        self.values.resize(index + 1, Value::None);
+        if index >= self.values.len() {
+            self.values.resize(index + 1, Value::None);
+        }
         self.values[index] = value;
     }
 
@@ -186,11 +191,27 @@ impl<'a> RenderGraph<'a> {
             self.execute(value_id, node, allocator)?;
         }
 
+        if self.current_batch.is_some() || !self.current_submit.cmd_buffers.is_empty() {
+            self.flush_submit(None)?;
+        }
+
         for submit in self.submits.drain(..) {
+            let queue = self
+                .ctx
+                .command_queue_by_domain(submit.domain)
+                .ok_or(vk::Result::ERROR_UNKNOWN)?;
+
+            let timeline_value = queue.next_timeline_value();
+            let timeline_signal = SemaphoreSubmitInfo {
+                semaphore: *queue.semaphore(),
+                value: timeline_value,
+                access: Access::MemoryRW,
+            };
+
             let stack = ScopedStack::new();
             let wait_semas = stack.alloc_slice::<vk::SemaphoreSubmitInfo>(submit.wait_semas.len());
             let cmd_buf_infos = stack.alloc_slice::<vk::CommandBufferSubmitInfo>(submit.cmd_buffers.len());
-            let signal_semas = stack.alloc_slice::<vk::SemaphoreSubmitInfo>(submit.signal_semas.len());
+            let signal_semas = stack.alloc_slice::<vk::SemaphoreSubmitInfo>(submit.signal_semas.len() + 1);
 
             for (dst, src) in wait_semas.iter_mut().zip(&submit.wait_semas) {
                 *dst = src.into();
@@ -198,20 +219,20 @@ impl<'a> RenderGraph<'a> {
             for (dst, src) in cmd_buf_infos.iter_mut().zip(&submit.cmd_buffers) {
                 *dst = vk::CommandBufferSubmitInfo::default().command_buffer(src.into());
             }
-            for (dst, src) in signal_semas.iter_mut().zip(&submit.signal_semas) {
+            for (dst, src) in signal_semas
+                .iter_mut()
+                .zip(submit.signal_semas.iter().chain(std::iter::once(&timeline_signal)))
+            {
                 *dst = src.into();
             }
 
-            let queue = self
-                .ctx
-                .command_queue_by_domain(submit.domain)
-                .ok_or(vk::Result::ERROR_UNKNOWN)?;
-
-            let submit_info = vk::SubmitInfo2KHR::default()
+            let submit_info = vk::SubmitInfo2::default()
                 .wait_semaphore_infos(wait_semas)
                 .command_buffer_infos(cmd_buf_infos)
                 .signal_semaphore_infos(signal_semas);
             queue.submit(&[submit_info])?;
+
+            allocator.add_timeline_wait(*queue.semaphore(), timeline_value);
         }
 
         for present in self.presents.drain(..) {
@@ -237,10 +258,8 @@ impl<'a> RenderGraph<'a> {
     }
 
     fn execute(&mut self, value_id: &ValueId, ir: &IR, allocator: &mut AllocatorKind) -> Result<(), vk::Result> {
-        self.ensure_batch(allocator)?;
-
         match ir {
-            IR::Type(_) => todo!(),
+            IR::Type(_) => {},
             IR::Constant(c) => match c {
                 ir::Constant::I32(_) => todo!(),
                 ir::Constant::U32(v) => self.set_value(value_id, Value::U32(*v)),
@@ -250,6 +269,12 @@ impl<'a> RenderGraph<'a> {
                 ir::Constant::ClearValue(v) => self.set_value(value_id, Value::ClearValue(*v)),
             },
             IR::Array { ty: _, elements } => self.set_value(value_id, Value::Slice(elements.clone())),
+            IR::Index { array, index } => {
+                let elements = self.get::<Vec<ValueId>>(array);
+                let index = self.get::<u32>(index) as usize;
+                let element = *elements.get(index).ok_or(vk::Result::ERROR_UNKNOWN)?;
+                self.set_value(value_id, Value::Reference(element));
+            },
             IR::ConstructBuffer { .. } => todo!(),
             IR::ConstructImage {
                 image,
@@ -262,15 +287,15 @@ impl<'a> RenderGraph<'a> {
                 level_count,
                 base_layer,
                 layer_count,
-                usage,
+                usage: _,
             } => {
                 let extent = self.get::<vk::Extent3D>(extent);
                 let subresource_range = vk::ImageSubresourceRange {
+                    aspect_mask: resource::aspect_mask(*format),
                     base_mip_level: self.get::<u32>(base_level),
                     level_count: self.get::<u32>(level_count),
                     base_array_layer: self.get::<u32>(base_layer),
                     layer_count: self.get::<u32>(layer_count),
-                    ..Default::default()
                 };
                 let image_view = if image_view.is_null() {
                     allocator.allocate_image_view(image.handle, *format, *view_type, subresource_range)?
@@ -291,11 +316,22 @@ impl<'a> RenderGraph<'a> {
             } => {
                 let acquire_semaphore = allocator.allocate_binary_semaphore()?;
                 let image_index = self.ctx.acquire_next_image(*swapchain, acquire_semaphore)?;
-                allocator.deallocate_semaphore(acquire_semaphore);
 
-                let attachments = self.get::<Vec<ValueId>>(attachments);
-                let attachment_value_id = attachments[image_index as usize];
-                self.set_value(value_id, Value::Reference(attachment_value_id));
+                self.current_submit.wait_semas.push(SemaphoreSubmitInfo {
+                    semaphore: acquire_semaphore,
+                    value: 0,
+                    access: Access::MemoryRW,
+                });
+
+                let elements = self.get::<Vec<ValueId>>(attachments);
+                let element = *elements.get(image_index as usize).ok_or(vk::Result::ERROR_UNKNOWN)?;
+                let present_semaphore = *present_semaphores
+                    .get(image_index as usize)
+                    .ok_or(vk::Result::ERROR_UNKNOWN)?;
+                self.resource_to_swapchain
+                    .insert(element, PresentInfo::new(image_index, *swapchain, present_semaphore));
+
+                self.set_value(value_id, Value::U32(image_index));
             },
             IR::Acquire { .. } => todo!(),
             IR::Release {
@@ -324,6 +360,7 @@ impl<'a> RenderGraph<'a> {
             },
             IR::CallOpaque { .. } => todo!(),
             IR::Clear { attachment, color } => {
+                self.ensure_batch(allocator)?;
                 self.set_value(value_id, Value::Reference(*attachment));
                 let attachment = self.get::<ImageAttachment>(attachment);
                 let color = self.get::<ClearValue>(color);
@@ -336,6 +373,7 @@ impl<'a> RenderGraph<'a> {
                 );
             },
             IR::MemoryBarrier { src_access, dst_access } => {
+                self.ensure_batch(allocator)?;
                 let src_access_flags = self.get::<Access>(src_access);
                 let dst_access_flags = self.get::<Access>(dst_access);
                 self.batch()?.memory_barrier(src_access_flags, dst_access_flags);
@@ -347,6 +385,7 @@ impl<'a> RenderGraph<'a> {
                 new_layout,
                 value,
             } => {
+                self.ensure_batch(allocator)?;
                 let src_access_flags = self.get::<Access>(src_access);
                 let dst_access_flags = self.get::<Access>(dst_access);
                 let attachment = self.get::<ImageAttachment>(value);

@@ -71,4 +71,11 @@ impl<'a> AllocatorKind<'a> {
             AllocatorKind::Frame(a) => a.deallocate_image_view(image_view),
         }
     }
+
+    pub fn add_timeline_wait(&mut self, semaphore: vk::Semaphore, value: u64) {
+        match self {
+            AllocatorKind::Persistent(_) => {},
+            AllocatorKind::Frame(a) => a.add_timeline_wait(semaphore, value),
+        }
+    }
 }

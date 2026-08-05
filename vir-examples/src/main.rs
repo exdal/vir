@@ -1,10 +1,12 @@
 mod device_builder;
 
-use std::{error::Error, ffi::CStr, result::Result};
+use std::{error::Error, ffi::CStr, result::Result, time::Instant};
 
 use ash::{Entry, khr, vk};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
-use vir::{AllocatorKind, Context, Image, ImageAttachment, PersistentAllocator, SuperFrameAllocator, SwapChain};
+use vir::{
+    AllocatorKind, ClearValue, Context, Image, ImageAttachment, PersistentAllocator, SuperFrameAllocator, SwapChain,
+};
 pub use winit;
 use winit::{
     application::ApplicationHandler,
@@ -92,6 +94,25 @@ struct App {
     ctx: Context,
     super_frame_allocator: Option<SuperFrameAllocator>,
     persistent_allocator: PersistentAllocator,
+    dumped_ir: bool,
+    start_time: Instant,
+}
+
+/// Fully saturated rainbow color for `hue` in [0, 1).
+fn rainbow(hue: f32) -> ClearValue {
+    let h = hue.rem_euclid(1.0) * 6.0;
+    let sector = h as u32;
+    let f = h - sector as f32;
+    let (r, g, b) = match sector {
+        0 => (1.0, f, 0.0),
+        1 => (1.0 - f, 1.0, 0.0),
+        2 => (0.0, 1.0, f),
+        3 => (0.0, 1.0 - f, 1.0),
+        4 => (f, 0.0, 1.0),
+        _ => (1.0, 0.0, 1.0 - f),
+    };
+
+    ClearValue::rgba_f32(r, g, b, 1.0)
 }
 
 #[derive(Default)]
@@ -112,6 +133,8 @@ impl App {
             ctx,
             super_frame_allocator: None,
             persistent_allocator,
+            dumped_ir: false,
+            start_time: Instant::now(),
         }
     }
 
@@ -200,7 +223,8 @@ impl App {
                 let image = Image::new(image_handle, None);
                 let extent = vk::Extent3D::default()
                     .width(swapchain_extent.width)
-                    .height(swapchain_extent.height);
+                    .height(swapchain_extent.height)
+                    .depth(1);
                 let subresource_range = vk::ImageSubresourceRange::default()
                     .aspect_mask(vk::ImageAspectFlags::COLOR)
                     .layer_count(1)
@@ -252,14 +276,16 @@ impl App {
 
         let mut module = vir::Module::default();
         let attachment = module.acquire_next_image(swapchain);
-        let attachment = module.clear(attachment, vir::clear::f32::WHITE);
+        let hue = self.start_time.elapsed().as_secs_f32() * 0.2;
+        let attachment = module.clear(attachment, rainbow(hue));
         let attachment = module.present(attachment);
         let executable = module.compile(attachment);
 
         let mut graph = vir::RenderGraph::new(&self.ctx, executable.as_slice());
-        graph.dump();
-
-        panic!();
+        if !self.dumped_ir {
+            graph.dump();
+            self.dumped_ir = true;
+        }
 
         graph.submit(&mut frame_allocator)
     }
@@ -288,8 +314,6 @@ impl ApplicationHandler for AppWrapper {
         let app = self.app.as_mut().unwrap();
         match event {
             WindowEvent::Resized(_) => {
-                // Recreate with current inner_size — physical_size from the event
-                // can be stale on some platforms.
                 app.recreate_swapchain()
                     .expect("Failed to recreate swapchain on resize");
             },

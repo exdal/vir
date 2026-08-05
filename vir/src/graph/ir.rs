@@ -33,6 +33,10 @@ pub enum IR {
         ty: ValueId,
         elements: Vec<ValueId>,
     },
+    Index {
+        array: ValueId,
+        index: ValueId,
+    },
 
     ConstructBuffer {
         buffer: vk::Buffer,
@@ -133,6 +137,7 @@ impl fmt::Display for IR {
                 }
                 write!(f, "]")
             },
+            IR::Index { array, index } => write!(f, "index {array}[{index}]"),
             IR::ConstructBuffer { buffer, size } => write!(f, "declare buffer={{mem: {buffer:?}}} size={size}"),
             IR::ConstructImage {
                 image,

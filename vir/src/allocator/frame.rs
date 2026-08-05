@@ -13,6 +13,8 @@ pub struct FrameAllocator {
     cmd_pool: vk::CommandPool,
     semaphores: Vec<vk::Semaphore>,
     image_views: Vec<vk::ImageView>,
+    cmd_buffers: Vec<vk::CommandBuffer>,
+    timeline_waits: Vec<(vk::Semaphore, u64)>,
 }
 
 impl FrameAllocator {
@@ -24,7 +26,24 @@ impl FrameAllocator {
             cmd_pool: vk::CommandPool::null(),
             semaphores: Vec::default(),
             image_views: Vec::default(),
+            cmd_buffers: Vec::default(),
+            timeline_waits: Vec::default(),
         }
+    }
+
+    pub fn add_timeline_wait(&mut self, semaphore: vk::Semaphore, value: u64) {
+        self.timeline_waits.push((semaphore, value));
+    }
+
+    fn wait_idle(&self) -> Result<(), vk::Result> {
+        if self.timeline_waits.is_empty() {
+            return Ok(());
+        }
+
+        let (semaphores, values): (Vec<_>, Vec<_>) = self.timeline_waits.iter().copied().unzip();
+        let wait_info = vk::SemaphoreWaitInfo::default().semaphores(&semaphores).values(&values);
+
+        unsafe { self.device.as_ref().wait_semaphores(&wait_info, u64::MAX) }
     }
 
     fn ensure_cmd_pool(&mut self, queue_family: u32) -> Result<(), vk::Result> {
@@ -38,7 +57,18 @@ impl FrameAllocator {
     }
 
     fn deallocate(&mut self, issued_frame: usize) -> Result<(), vk::Result> {
+        self.wait_idle()?;
+        self.timeline_waits.clear();
+
         if !self.cmd_pool.is_null() {
+            if !self.cmd_buffers.is_empty() {
+                unsafe {
+                    self.device
+                        .as_ref()
+                        .free_command_buffers(self.cmd_pool, &self.cmd_buffers)
+                };
+                self.cmd_buffers.clear();
+            }
             self.upstream.reset_command_pool(self.cmd_pool, false)?;
         }
 
@@ -82,6 +112,7 @@ impl Allocator for FrameAllocator {
             .level(vk::CommandBufferLevel::PRIMARY);
 
         let cmd_buffer = unsafe { self.device.as_ref().allocate_command_buffers(&alloc_info) }?[0];
+        self.cmd_buffers.push(cmd_buffer);
 
         Ok(CommandBuffer::new(self.device, cmd_buffer))
     }
@@ -117,14 +148,14 @@ impl SuperFrameAllocator {
         }
     }
 
-    fn get_last_frame(&mut self) -> &mut FrameAllocator {
+    fn current_frame(&mut self) -> &mut FrameAllocator {
         self.frames.get_mut(self.frame_counter % self.frames_in_flight).unwrap()
     }
 
     pub fn get_next_frame(&mut self) -> Result<&mut FrameAllocator, vk::Result> {
-        let issued_frame = self.frame_counter.add(1);
-        let frame = self.get_last_frame();
-        // wait for frame here
+        self.frame_counter = self.frame_counter.add(1);
+        let issued_frame = self.frame_counter;
+        let frame = self.current_frame();
         frame.deallocate(issued_frame)?;
 
         Ok(frame)
