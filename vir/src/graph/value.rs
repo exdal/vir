@@ -18,6 +18,7 @@ impl fmt::Debug for ValueId {
 pub enum Value {
     None,
     U32(u32),
+    Extent2D(vk::Extent2D),
     Extent3D(vk::Extent3D),
     ImageAttachment(ImageAttachment),
     Slice(Vec<ValueId>),
@@ -35,6 +36,15 @@ impl FromValue for u32 {
         match value {
             Value::U32(v) => *v,
             _ => panic!("expected U32, got {:?}", value),
+        }
+    }
+}
+
+impl FromValue for vk::Extent2D {
+    fn from_value(value: &Value) -> Self {
+        match value {
+            Value::Extent2D(v) => *v,
+            _ => panic!("expected Extent2D, got {:?}", value),
         }
     }
 }

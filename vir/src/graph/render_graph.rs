@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, ptr::NonNull};
 
 use ash::vk::{self, Handle};
 
@@ -9,13 +9,21 @@ use crate::{
     CommandBuffer,
     Context,
     DomainFlag,
+    GraphicsPipelineInfo,
     IR,
     ImageAttachment,
+    PipelineId,
+    PipelineLayout,
+    PipelineState,
     Value,
     ValueId,
     core::ScopedStack,
     graph::{ir, value::FromValue},
-    resource,
+    resource::{
+        self,
+        pipeline::{PipelineRequest, create_pipelines},
+        shader::{self, Reflection},
+    },
 };
 
 struct SemaphoreSubmitInfo {
@@ -102,10 +110,21 @@ impl PresentInfo {
     }
 }
 
-pub struct RenderGraph<'a> {
-    ctx: &'a Context,
-    instructions: &'a [ir::Instr],
+struct DeclaredPipeline {
+    info: GraphicsPipelineInfo,
+    reflections: Vec<Reflection>,
+    layout: Option<PipelineLayout>,
+    variants: HashMap<PipelineState, vk::Pipeline>,
+}
+
+pub const DEFAULT_VARIABLE_DESCRIPTOR_COUNT: u32 = 1024;
+
+pub struct RenderGraph {
+    device: NonNull<ash::Device>,
+    pipelines: Vec<DeclaredPipeline>,
+    variable_descriptor_count: u32,
     values: Vec<Value>,
+    bound_pipeline: Option<vk::Pipeline>,
     current_batch: Option<Batch>,
     current_submit: Submit,
     submits: Vec<Submit>,
@@ -113,20 +132,135 @@ pub struct RenderGraph<'a> {
     resource_to_swapchain: HashMap<ValueId, PresentInfo>,
 }
 
-impl<'a> RenderGraph<'a> {
-    pub fn new(ctx: &'a Context, instructions: &'a [ir::Instr]) -> Self {
-        let value_count = instructions.iter().map(|(id, _)| id.0 as usize + 1).max().unwrap_or(0);
-
+impl RenderGraph {
+    pub fn new(ctx: &Context) -> Self {
         Self {
-            ctx,
-            instructions,
-            values: vec![Value::None; value_count],
+            device: NonNull::from(ctx.device()),
+            pipelines: Vec::new(),
+            variable_descriptor_count: DEFAULT_VARIABLE_DESCRIPTOR_COUNT,
+            values: Vec::new(),
+            bound_pipeline: None,
             current_batch: None,
             current_submit: Submit::default(),
             submits: Vec::new(),
             presents: Vec::new(),
             resource_to_swapchain: HashMap::new(),
         }
+    }
+
+    pub fn with_variable_descriptor_count(mut self, count: u32) -> Self {
+        self.variable_descriptor_count = count;
+        self
+    }
+
+    pub fn declare_pipeline(&mut self, info: GraphicsPipelineInfo) -> Result<PipelineId, vk::Result> {
+        if info.shaders.is_empty() {
+            tracing::error!("pipeline declared without any shaders");
+            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+        }
+
+        let reflections = info
+            .shaders
+            .iter()
+            .map(|spirv| shader::reflect(spirv))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let id = PipelineId(self.pipelines.len() as u32);
+        self.pipelines.push(DeclaredPipeline {
+            info,
+            reflections,
+            layout: None,
+            variants: HashMap::new(),
+        });
+
+        Ok(id)
+    }
+
+    fn construct_pipelines(&mut self, instructions: &[ir::Instr]) -> Result<(), vk::Result> {
+        let mut pending: Vec<(PipelineId, PipelineState)> = Vec::new();
+
+        for (value_id, ir) in instructions {
+            let IR::Draw { pipeline, state, .. } = ir else {
+                continue;
+            };
+
+            let Some(pipeline) = pipeline else {
+                tracing::error!(%value_id, "draw with no pipeline bound");
+                return Err(vk::Result::ERROR_UNKNOWN);
+            };
+
+            let Some(declared) = self.pipelines.get(pipeline.0 as usize) else {
+                tracing::error!(%pipeline, "draw with a pipeline that was never declared");
+                return Err(vk::Result::ERROR_UNKNOWN);
+            };
+
+            if declared.variants.contains_key(state) {
+                continue;
+            }
+            if pending.iter().any(|(id, pending)| id == pipeline && pending == state) {
+                continue;
+            }
+
+            pending.push((*pipeline, state.clone()));
+        }
+
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        let device_ptr = self.device;
+        let device = unsafe { device_ptr.as_ref() };
+
+        for (id, _) in &pending {
+            let index = id.0 as usize;
+            if self.pipelines[index].layout.is_none() {
+                let layout = PipelineLayout::create(
+                    device,
+                    &self.pipelines[index].reflections,
+                    self.variable_descriptor_count,
+                )?;
+                self.pipelines[index].layout = Some(layout);
+            }
+        }
+
+        let requests = pending
+            .iter()
+            .map(|(id, state)| {
+                let declared = &self.pipelines[id.0 as usize];
+                PipelineRequest {
+                    info: &declared.info,
+                    reflections: &declared.reflections,
+                    state,
+                    layout: declared
+                        .layout
+                        .as_ref()
+                        .map_or(vk::PipelineLayout::null(), |l| l.handle),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        tracing::debug!(count = requests.len(), "compiling pipeline permutations");
+        let handles = create_pipelines(device, &requests)?;
+        drop(requests);
+
+        for ((id, state), handle) in pending.into_iter().zip(handles) {
+            self.pipelines[id.0 as usize].variants.insert(state, handle);
+        }
+
+        Ok(())
+    }
+
+    fn reset(&mut self, instructions: &[ir::Instr]) {
+        let value_count = instructions.iter().map(|(id, _)| id.0 as usize + 1).max().unwrap_or(0);
+
+        self.values.clear();
+        self.values.resize(value_count, Value::None);
+        self.bound_pipeline = None;
+        self.current_batch = None;
+        self.current_submit = Submit::default();
+        self.submits.clear();
+        self.presents.clear();
+        self.resource_to_swapchain.clear();
     }
 
     fn set_value(&mut self, value_id: &ValueId, value: Value) {
@@ -153,17 +287,19 @@ impl<'a> RenderGraph<'a> {
         }
     }
 
-    fn ensure_batch(&mut self, allocator: &mut AllocatorKind) -> Result<(), vk::Result> {
+    fn device(&self) -> &ash::Device { unsafe { self.device.as_ref() } }
+
+    fn ensure_batch(&mut self, ctx: &Context, allocator: &mut AllocatorKind) -> Result<(), vk::Result> {
         if self.current_batch.is_some() {
             return Ok(());
         }
 
-        let queue = self
-            .ctx
+        let queue = ctx
             .command_queue_by_domain(self.current_submit.domain)
             .ok_or(vk::Result::ERROR_UNKNOWN)?;
         let cmd_buf = allocator.allocate_command_buffer(queue.family_index())?;
         self.current_batch = Some(Batch::new(cmd_buf)?);
+        self.bound_pipeline = None;
         Ok(())
     }
 
@@ -186,9 +322,14 @@ impl<'a> RenderGraph<'a> {
         Ok(())
     }
 
-    pub fn submit(&mut self, allocator: &mut AllocatorKind) -> Result<(), vk::Result> {
-        for (value_id, node) in self.instructions {
-            self.execute(value_id, node, allocator)?;
+    pub fn execute(
+        &mut self, ctx: &Context, instructions: &[ir::Instr], allocator: &mut AllocatorKind,
+    ) -> Result<(), vk::Result> {
+        self.construct_pipelines(instructions)?;
+        self.reset(instructions);
+
+        for (value_id, node) in instructions {
+            self.execute_one(ctx, value_id, node, allocator)?;
         }
 
         if self.current_batch.is_some() || !self.current_submit.cmd_buffers.is_empty() {
@@ -196,8 +337,7 @@ impl<'a> RenderGraph<'a> {
         }
 
         for submit in self.submits.drain(..) {
-            let queue = self
-                .ctx
+            let queue = ctx
                 .command_queue_by_domain(submit.domain)
                 .ok_or(vk::Result::ERROR_UNKNOWN)?;
 
@@ -236,8 +376,7 @@ impl<'a> RenderGraph<'a> {
         }
 
         for present in self.presents.drain(..) {
-            let queue = self
-                .ctx
+            let queue = ctx
                 .command_queue_by_domain(DomainFlag::Graphics)
                 .ok_or(vk::Result::ERROR_UNKNOWN)?;
 
@@ -245,25 +384,27 @@ impl<'a> RenderGraph<'a> {
                 .wait_semaphores(std::slice::from_ref(&present.semaphore))
                 .swapchains(std::slice::from_ref(&present.swapchain))
                 .image_indices(std::slice::from_ref(&present.image_index));
-            self.ctx.present(queue, &present_info)?;
+            ctx.present(queue, &present_info)?;
         }
 
         Ok(())
     }
 
-    pub fn dump(&self) {
-        self.instructions.iter().for_each(|(id, node)| {
+    pub fn dump(instructions: &[ir::Instr]) {
+        instructions.iter().for_each(|(id, node)| {
             println!("%{} = {}", id.0, node);
         });
     }
 
-    fn execute(&mut self, value_id: &ValueId, ir: &IR, allocator: &mut AllocatorKind) -> Result<(), vk::Result> {
+    fn execute_one(
+        &mut self, ctx: &Context, value_id: &ValueId, ir: &IR, allocator: &mut AllocatorKind,
+    ) -> Result<(), vk::Result> {
         match ir {
             IR::Type(_) => {},
             IR::Constant(c) => match c {
                 ir::Constant::I32(_) => todo!(),
                 ir::Constant::U32(v) => self.set_value(value_id, Value::U32(*v)),
-                ir::Constant::Extent2D(_) => todo!(),
+                ir::Constant::Extent2D(v) => self.set_value(value_id, Value::Extent2D(*v)),
                 ir::Constant::Extent3D(v) => self.set_value(value_id, Value::Extent3D(*v)),
                 ir::Constant::Access(v) => self.set_value(value_id, Value::Access(*v)),
                 ir::Constant::ClearValue(v) => self.set_value(value_id, Value::ClearValue(*v)),
@@ -315,7 +456,7 @@ impl<'a> RenderGraph<'a> {
                 present_semaphores,
             } => {
                 let acquire_semaphore = allocator.allocate_binary_semaphore()?;
-                let image_index = self.ctx.acquire_next_image(*swapchain, acquire_semaphore)?;
+                let image_index = ctx.acquire_next_image(*swapchain, acquire_semaphore)?;
 
                 self.current_submit.wait_semas.push(SemaphoreSubmitInfo {
                     semaphore: acquire_semaphore,
@@ -360,7 +501,7 @@ impl<'a> RenderGraph<'a> {
             },
             IR::CallOpaque { .. } => todo!(),
             IR::Clear { attachment, color } => {
-                self.ensure_batch(allocator)?;
+                self.ensure_batch(ctx, allocator)?;
                 self.set_value(value_id, Value::Reference(*attachment));
                 let attachment = self.get::<ImageAttachment>(attachment);
                 let color = self.get::<ClearValue>(color);
@@ -372,8 +513,87 @@ impl<'a> RenderGraph<'a> {
                     &[subresource_range],
                 );
             },
+            IR::BeginRendering {
+                color_attachments,
+                render_area,
+            } => {
+                self.ensure_batch(ctx, allocator)?;
+
+                let attachments = color_attachments
+                    .iter()
+                    .map(|id| self.get::<ImageAttachment>(id))
+                    .collect::<Vec<_>>();
+
+                let extent = match render_area {
+                    Some(id) => self.get::<vk::Extent2D>(id),
+                    None => attachments
+                        .first()
+                        .map(|attachment| vk::Extent2D {
+                            width: attachment.extent().width,
+                            height: attachment.extent().height,
+                        })
+                        .ok_or(vk::Result::ERROR_UNKNOWN)?,
+                };
+
+                let render_area = vk::Rect2D::default().extent(extent);
+                let attachment_infos = attachments
+                    .iter()
+                    .map(|attachment| {
+                        vk::RenderingAttachmentInfo::default()
+                            .image_view(attachment.image_view())
+                            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                            .load_op(vk::AttachmentLoadOp::LOAD)
+                            .store_op(vk::AttachmentStoreOp::STORE)
+                    })
+                    .collect::<Vec<_>>();
+
+                self.batch()?.begin_rendering(render_area, &attachment_infos);
+
+                match color_attachments.first() {
+                    Some(first) => self.set_value(value_id, Value::Reference(*first)),
+                    None => self.set_value(value_id, Value::None),
+                }
+            },
+            IR::BindPipeline { pass, .. } | IR::SetRasterState { pass, .. } => {
+                self.set_value(value_id, Value::Reference(*pass));
+            },
+            IR::Draw {
+                pass,
+                vertex_count,
+                instance_count,
+                first_vertex,
+                first_instance,
+                pipeline,
+                state,
+            } => {
+                self.set_value(value_id, Value::Reference(*pass));
+
+                let pipeline = pipeline.ok_or(vk::Result::ERROR_UNKNOWN)?;
+                let handle = self
+                    .pipelines
+                    .get(pipeline.0 as usize)
+                    .and_then(|declared| declared.variants.get(state))
+                    .copied()
+                    .ok_or(vk::Result::ERROR_UNKNOWN)?;
+
+                if self.bound_pipeline != Some(handle) {
+                    self.batch()?.bind_pipeline(vk::PipelineBindPoint::GRAPHICS, handle);
+                    self.bound_pipeline = Some(handle);
+                }
+
+                let vertex_count = self.get::<u32>(vertex_count);
+                let instance_count = self.get::<u32>(instance_count);
+                let first_vertex = self.get::<u32>(first_vertex);
+                let first_instance = self.get::<u32>(first_instance);
+                self.batch()?
+                    .draw(vertex_count, instance_count, first_vertex, first_instance);
+            },
+            IR::EndRendering { pass } => {
+                self.set_value(value_id, Value::Reference(*pass));
+                self.batch()?.end_rendering();
+            },
             IR::MemoryBarrier { src_access, dst_access } => {
-                self.ensure_batch(allocator)?;
+                self.ensure_batch(ctx, allocator)?;
                 let src_access_flags = self.get::<Access>(src_access);
                 let dst_access_flags = self.get::<Access>(dst_access);
                 self.batch()?.memory_barrier(src_access_flags, dst_access_flags);
@@ -385,7 +605,7 @@ impl<'a> RenderGraph<'a> {
                 new_layout,
                 value,
             } => {
-                self.ensure_batch(allocator)?;
+                self.ensure_batch(ctx, allocator)?;
                 let src_access_flags = self.get::<Access>(src_access);
                 let dst_access_flags = self.get::<Access>(dst_access);
                 let attachment = self.get::<ImageAttachment>(value);
@@ -402,5 +622,25 @@ impl<'a> RenderGraph<'a> {
         }
 
         Ok(())
+    }
+}
+
+impl Drop for RenderGraph {
+    fn drop(&mut self) {
+        let device = self.device();
+
+        if let Err(err) = unsafe { device.device_wait_idle() } {
+            tracing::error!(?err, "failed to wait for the device before tearing down pipelines");
+        }
+
+        for declared in &self.pipelines {
+            for handle in declared.variants.values() {
+                unsafe { device.destroy_pipeline(*handle, None) };
+            }
+
+            if let Some(layout) = &declared.layout {
+                layout.destroy(device);
+            }
+        }
     }
 }

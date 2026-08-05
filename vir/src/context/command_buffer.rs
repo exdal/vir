@@ -72,6 +72,46 @@ impl CommandBuffer {
         }
     }
 
+    pub fn begin_rendering(&self, render_area: vk::Rect2D, color_attachments: &[vk::RenderingAttachmentInfo]) {
+        let rendering_info = vk::RenderingInfo::default()
+            .render_area(render_area)
+            .layer_count(1)
+            .color_attachments(color_attachments);
+
+        let viewport = vk::Viewport::default()
+            .x(render_area.offset.x as f32)
+            .y(render_area.offset.y as f32)
+            .width(render_area.extent.width as f32)
+            .height(render_area.extent.height as f32)
+            .min_depth(0.0)
+            .max_depth(1.0);
+
+        unsafe {
+            let device = self.device.as_ref();
+            device.cmd_begin_rendering(self.handle, &rendering_info);
+            device.cmd_set_viewport(self.handle, 0, &[viewport]);
+            device.cmd_set_scissor(self.handle, 0, &[render_area]);
+        }
+    }
+
+    pub fn end_rendering(&self) { unsafe { self.device.as_ref().cmd_end_rendering(self.handle) } }
+
+    pub fn bind_pipeline(&self, bind_point: vk::PipelineBindPoint, pipeline: vk::Pipeline) {
+        unsafe {
+            self.device
+                .as_ref()
+                .cmd_bind_pipeline(self.handle, bind_point, pipeline)
+        }
+    }
+
+    pub fn draw(&self, vertex_count: u32, instance_count: u32, first_vertex: u32, first_instance: u32) {
+        unsafe {
+            self.device
+                .as_ref()
+                .cmd_draw(self.handle, vertex_count, instance_count, first_vertex, first_instance)
+        }
+    }
+
     pub fn clear_color(
         &self, image: vk::Image, image_layout: vk::ImageLayout, clear_color_value: &ClearValue,
         ranges: &[vk::ImageSubresourceRange],

@@ -2,7 +2,7 @@ use core::fmt;
 
 use ash::vk;
 
-use crate::{Access, ClearValue, DomainFlag, Image, ValueId};
+use crate::{Access, ClearValue, DomainFlag, Image, PipelineId, PipelineState, RasterStateChange, ValueId};
 
 pub type Instr = (ValueId, IR);
 
@@ -81,6 +81,31 @@ pub enum IR {
         color: ValueId,
     },
 
+    BeginRendering {
+        color_attachments: Vec<ValueId>,
+        render_area: Option<ValueId>,
+    },
+    BindPipeline {
+        pass: ValueId,
+        pipeline: PipelineId,
+        bind_point: vk::PipelineBindPoint,
+    },
+    SetRasterState {
+        pass: ValueId,
+        change: RasterStateChange,
+    },
+    Draw {
+        pass: ValueId,
+        vertex_count: ValueId,
+        instance_count: ValueId,
+        first_vertex: ValueId,
+        first_instance: ValueId,
+        pipeline: Option<PipelineId>,
+        state: PipelineState,
+    },
+    EndRendering {
+        pass: ValueId,
+    },
     MemoryBarrier {
         src_access: ValueId,
         dst_access: ValueId,
@@ -178,6 +203,66 @@ impl fmt::Display for IR {
                 args, returns, domain, ..
             } => write!(f, "call.opaque domain={domain:?} args={args} returns={returns}"),
             IR::Clear { attachment, color } => write!(f, "clear attachment={attachment} color={color}"),
+            IR::BeginRendering {
+                color_attachments,
+                render_area,
+            } => {
+                write!(f, "begin_rendering color=[")?;
+                for (i, id) in color_attachments.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{id}")?;
+                }
+                match render_area {
+                    Some(area) => write!(f, "] area={area}"),
+                    None => write!(f, "] area=attachments"),
+                }
+            },
+            IR::BindPipeline {
+                pass,
+                pipeline,
+                bind_point,
+            } => write!(f, "bind_pipeline {pass} pipeline={pipeline} bind_point={bind_point:?}"),
+            IR::SetRasterState { pass, change } => {
+                let (name, value) = match change {
+                    RasterStateChange::Topology(v) => ("topology", format!("{v:?}")),
+                    RasterStateChange::PolygonMode(v) => ("polygon_mode", format!("{v:?}")),
+                    RasterStateChange::CullMode(v) => ("cull_mode", format!("{v:?}")),
+                    RasterStateChange::FrontFace(v) => ("front_face", format!("{v:?}")),
+                };
+                write!(f, "set_raster_state {pass} {name}={value}")
+            },
+            IR::Draw {
+                pass,
+                vertex_count,
+                instance_count,
+                first_vertex,
+                first_instance,
+                pipeline,
+                state,
+            } => {
+                write!(
+                    f,
+                    "draw {pass} verts={vertex_count} insts={instance_count} first_vert={first_vertex} \
+                     first_inst={first_instance} pipeline="
+                )?;
+                match pipeline {
+                    Some(pipeline) => write!(f, "{pipeline}")?,
+                    None => write!(f, "none")?,
+                }
+                write!(
+                    f,
+                    " formats={:?} samples={:?} topology={:?} polygon={:?} cull={:?} front={:?}",
+                    state.rendering.color_formats,
+                    state.rendering.samples,
+                    state.raster.topology,
+                    state.raster.polygon_mode,
+                    state.raster.cull_mode,
+                    state.raster.front_face
+                )
+            },
+            IR::EndRendering { pass } => write!(f, "end_rendering {pass}"),
             IR::MemoryBarrier { src_access, dst_access } => {
                 write!(f, "barrier.memory src={src_access} dst={dst_access}")
             },

@@ -14,7 +14,19 @@ pub use allocator::{AllocatorKind, FrameAllocator, PersistentAllocator, SuperFra
 use ash::vk;
 pub use context::{Access, CommandBuffer, Context, DomainFlag};
 pub use graph::{IR, ImageAttachment, Module, PassCallback, RenderGraph, Value, ValueId};
-pub use resource::{Image, SwapChain};
+pub use resource::{
+    DescriptorBinding,
+    GraphicsPipelineInfo,
+    Image,
+    PipelineId,
+    PipelineLayout,
+    PipelineState,
+    RasterState,
+    RasterStateChange,
+    Reflection,
+    RenderingState,
+    SwapChain,
+};
 
 #[derive(Clone, Copy)]
 #[repr(transparent)]
@@ -24,9 +36,7 @@ impl ClearValue {
     #[inline]
     pub const fn rgba_f32(r: f32, g: f32, b: f32, a: f32) -> Self {
         Self(vk::ClearValue {
-            color: vk::ClearColorValue {
-                float32: [r, g, b, a],
-            },
+            color: vk::ClearColorValue { float32: [r, g, b, a] },
         })
     }
 

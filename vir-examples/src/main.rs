@@ -1,11 +1,21 @@
 mod device_builder;
 
-use std::{error::Error, ffi::CStr, result::Result, time::Instant};
+use std::{error::Error, ffi::CStr, io::Cursor, result::Result, time::Instant};
 
 use ash::{Entry, khr, vk};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
 use vir::{
-    AllocatorKind, ClearValue, Context, Image, ImageAttachment, PersistentAllocator, SuperFrameAllocator, SwapChain,
+    AllocatorKind,
+    ClearValue,
+    Context,
+    GraphicsPipelineInfo,
+    Image,
+    ImageAttachment,
+    PersistentAllocator,
+    PipelineId,
+    RenderGraph,
+    SuperFrameAllocator,
+    SwapChain,
 };
 pub use winit;
 use winit::{
@@ -86,14 +96,19 @@ fn create_surface(
     }
 }
 
+const TRIANGLE_VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/triangle.vert.spv"));
+const TRIANGLE_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/triangle.frag.spv"));
+
 struct App {
     ash_entry: ash::Entry,
     window: Window,
     surface: vk::SurfaceKHR,
     swapchain: Option<SwapChain>,
     ctx: Context,
+    graph: RenderGraph,
     super_frame_allocator: Option<SuperFrameAllocator>,
     persistent_allocator: PersistentAllocator,
+    triangle_pipeline: PipelineId,
     dumped_ir: bool,
     start_time: Instant,
 }
@@ -115,6 +130,10 @@ fn rainbow(hue: f32) -> ClearValue {
     ClearValue::rgba_f32(r, g, b, 1.0)
 }
 
+fn read_spirv(bytes: &[u8]) -> Vec<u32> {
+    ash::util::read_spv(&mut Cursor::new(bytes)).expect("shader is not valid SPIR-V")
+}
+
 #[derive(Default)]
 struct AppWrapper {
     app: Option<App>,
@@ -124,18 +143,28 @@ impl App {
     fn new(
         window: Window, surface: vk::SurfaceKHR, ash_entry: ash::Entry, ctx: Context,
         persistent_allocator: PersistentAllocator,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, vk::Result> {
+        let mut graph = RenderGraph::new(&ctx);
+
+        let triangle_pipeline = graph.declare_pipeline(
+            GraphicsPipelineInfo::new()
+                .with_shader(&read_spirv(TRIANGLE_VERT_SPV))
+                .with_shader(&read_spirv(TRIANGLE_FRAG_SPV)),
+        )?;
+
+        Ok(Self {
             window,
             ash_entry,
             surface,
             swapchain: None,
             ctx,
+            graph,
             super_frame_allocator: None,
             persistent_allocator,
+            triangle_pipeline,
             dumped_ir: false,
             start_time: Instant::now(),
-        }
+        })
     }
 
     fn init(window: Window) -> Result<Self, Box<dyn Error>> {
@@ -166,6 +195,7 @@ impl App {
 
         let mut vk13_features = vk::PhysicalDeviceVulkan13Features::default()
             .synchronization2(true)
+            .dynamic_rendering(true)
             .shader_demote_to_helper_invocation(true);
         let mut vk12_features = vk::PhysicalDeviceVulkan12Features::default()
             .descriptor_indexing(true)
@@ -180,8 +210,11 @@ impl App {
             .scalar_block_layout(true);
         let mut vk11_features = vk::PhysicalDeviceVulkan11Features::default()
             .variable_pointers(true)
-            .variable_pointers_storage_buffer(true);
-        let vk10_features = vk::PhysicalDeviceFeatures::default();
+            .variable_pointers_storage_buffer(true)
+            .shader_draw_parameters(true);
+        // Needed for the wireframe permutation in `run`; VK_POLYGON_MODE_FILL is the only
+        // polygon mode guaranteed without it.
+        let vk10_features = vk::PhysicalDeviceFeatures::default().fill_mode_non_solid(true);
         let features = vk::PhysicalDeviceFeatures2::default()
             .features(vk10_features)
             .push_next(&mut vk11_features)
@@ -202,7 +235,7 @@ impl App {
 
         let surface = create_surface(&ash_entry, ctx.instance(), raw_window_handle, raw_display_handle)?;
 
-        Ok(Self::new(window, surface, ash_entry, ctx, persistent_allocator))
+        Ok(Self::new(window, surface, ash_entry, ctx, persistent_allocator)?)
     }
 
     fn create_swapchain(&mut self, extent: vk::Extent2D) -> Result<SwapChain, vk::Result> {
@@ -249,6 +282,7 @@ impl App {
             attachments,
         )?;
         self.super_frame_allocator = Some(self.ctx.create_super_frame_allocator(image_count));
+
         Ok(swapchain)
     }
 
@@ -278,16 +312,25 @@ impl App {
         let attachment = module.acquire_next_image(swapchain);
         let hue = self.start_time.elapsed().as_secs_f32() * 0.2;
         let attachment = module.clear(attachment, rainbow(hue));
+
+        let pass = module.begin_rendering(&[attachment]);
+        let pass = module.bind_pipeline(pass, self.triangle_pipeline);
+        let pass = module.draw(pass, 3, 1);
+
+        let pass = module.set_polygon_mode(pass, vk::PolygonMode::LINE);
+        let pass = module.draw(pass, 3, 1);
+        let attachment = module.end_rendering(pass);
+
         let attachment = module.present(attachment);
         let executable = module.compile(attachment);
 
-        let mut graph = vir::RenderGraph::new(&self.ctx, executable.as_slice());
         if !self.dumped_ir {
-            graph.dump();
+            RenderGraph::dump(executable.as_slice());
             self.dumped_ir = true;
         }
 
-        graph.submit(&mut frame_allocator)
+        self.graph
+            .execute(&self.ctx, executable.as_slice(), &mut frame_allocator)
     }
 }
 

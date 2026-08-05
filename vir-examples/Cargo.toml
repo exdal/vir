@@ -10,3 +10,7 @@ winit = { workspace = true }
 raw-window-handle = "0.6.0"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+# Slang is an example-side concern: `vir` itself only ever consumes SPIR-V.
+[build-dependencies]
+shader-slang = { workspace = true }
