@@ -15,6 +15,7 @@ use crate::{
     PipelineId,
     PipelineLayout,
     PipelineState,
+    ResolvedViewport,
     Value,
     ValueId,
     core::ScopedStack,
@@ -125,6 +126,9 @@ pub struct RenderGraph {
     variable_descriptor_count: u32,
     values: Vec<Value>,
     bound_pipeline: Option<vk::Pipeline>,
+    render_area: vk::Rect2D,
+    recorded_viewports: Vec<ResolvedViewport>,
+    recorded_scissors: Vec<vk::Rect2D>,
     current_batch: Option<Batch>,
     current_submit: Submit,
     submits: Vec<Submit>,
@@ -140,6 +144,9 @@ impl RenderGraph {
             variable_descriptor_count: DEFAULT_VARIABLE_DESCRIPTOR_COUNT,
             values: Vec::new(),
             bound_pipeline: None,
+            render_area: vk::Rect2D::default(),
+            recorded_viewports: Vec::new(),
+            recorded_scissors: Vec::new(),
             current_batch: None,
             current_submit: Submit::default(),
             submits: Vec::new(),
@@ -256,6 +263,9 @@ impl RenderGraph {
         self.values.clear();
         self.values.resize(value_count, Value::None);
         self.bound_pipeline = None;
+        self.render_area = vk::Rect2D::default();
+        self.recorded_viewports.clear();
+        self.recorded_scissors.clear();
         self.current_batch = None;
         self.current_submit = Submit::default();
         self.submits.clear();
@@ -300,6 +310,8 @@ impl RenderGraph {
         let cmd_buf = allocator.allocate_command_buffer(queue.family_index())?;
         self.current_batch = Some(Batch::new(cmd_buf)?);
         self.bound_pipeline = None;
+        self.recorded_viewports.clear();
+        self.recorded_scissors.clear();
         Ok(())
     }
 
@@ -536,6 +548,8 @@ impl RenderGraph {
                 };
 
                 let render_area = vk::Rect2D::default().extent(extent);
+                self.render_area = render_area;
+
                 let attachment_infos = attachments
                     .iter()
                     .map(|attachment| {
@@ -554,7 +568,7 @@ impl RenderGraph {
                     None => self.set_value(value_id, Value::None),
                 }
             },
-            IR::BindPipeline { pass, .. } | IR::SetRasterState { pass, .. } => {
+            IR::BindPipeline { pass, .. } | IR::SetState { pass, .. } => {
                 self.set_value(value_id, Value::Reference(*pass));
             },
             IR::Draw {
@@ -565,6 +579,7 @@ impl RenderGraph {
                 first_instance,
                 pipeline,
                 state,
+                dynamic,
             } => {
                 self.set_value(value_id, Value::Reference(*pass));
 
@@ -579,6 +594,20 @@ impl RenderGraph {
                 if self.bound_pipeline != Some(handle) {
                     self.batch()?.bind_pipeline(vk::PipelineBindPoint::GRAPHICS, handle);
                     self.bound_pipeline = Some(handle);
+                }
+
+                // dynamic state is only re-recorded when it moved since the last draw
+                let viewports = dynamic.viewports(self.render_area);
+                if !viewports.is_empty() && viewports != self.recorded_viewports {
+                    let handles = viewports.iter().copied().map(vk::Viewport::from).collect::<Vec<_>>();
+                    self.batch()?.set_viewport(0, &handles);
+                    self.recorded_viewports = viewports;
+                }
+
+                let scissors = dynamic.scissors(self.render_area);
+                if !scissors.is_empty() && scissors != self.recorded_scissors {
+                    self.batch()?.set_scissor(0, &scissors);
+                    self.recorded_scissors = scissors;
                 }
 
                 let vertex_count = self.get::<u32>(vertex_count);

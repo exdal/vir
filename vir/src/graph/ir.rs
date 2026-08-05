@@ -2,7 +2,7 @@ use core::fmt;
 
 use ash::vk;
 
-use crate::{Access, ClearValue, DomainFlag, Image, PipelineId, PipelineState, RasterStateChange, ValueId};
+use crate::{Access, ClearValue, DomainFlag, DynamicValues, Image, PipelineId, PipelineState, StateChange, ValueId};
 
 pub type Instr = (ValueId, IR);
 
@@ -90,9 +90,9 @@ pub enum IR {
         pipeline: PipelineId,
         bind_point: vk::PipelineBindPoint,
     },
-    SetRasterState {
+    SetState {
         pass: ValueId,
-        change: RasterStateChange,
+        change: StateChange,
     },
     Draw {
         pass: ValueId,
@@ -102,6 +102,7 @@ pub enum IR {
         first_instance: ValueId,
         pipeline: Option<PipelineId>,
         state: PipelineState,
+        dynamic: DynamicValues,
     },
     EndRendering {
         pass: ValueId,
@@ -224,14 +225,23 @@ impl fmt::Display for IR {
                 pipeline,
                 bind_point,
             } => write!(f, "bind_pipeline {pass} pipeline={pipeline} bind_point={bind_point:?}"),
-            IR::SetRasterState { pass, change } => {
-                let (name, value) = match change {
-                    RasterStateChange::Topology(v) => ("topology", format!("{v:?}")),
-                    RasterStateChange::PolygonMode(v) => ("polygon_mode", format!("{v:?}")),
-                    RasterStateChange::CullMode(v) => ("cull_mode", format!("{v:?}")),
-                    RasterStateChange::FrontFace(v) => ("front_face", format!("{v:?}")),
-                };
-                write!(f, "set_raster_state {pass} {name}={value}")
+            IR::SetState { pass, change } => {
+                write!(f, "set_state {pass} ")?;
+                match change {
+                    StateChange::PrimitiveTopology(v) => write!(f, "topology={v:?}"),
+                    StateChange::Rasterization(v) => write!(
+                        f,
+                        "rasterization={{polygon={:?} cull={:?} front={:?} line_width={}}}",
+                        v.polygon_mode, v.cull_mode, v.front_face, v.line_width
+                    ),
+                    StateChange::DynamicState(v) => write!(f, "dynamic_state={v:?}"),
+                    StateChange::Viewport { index, viewport } => write!(f, "viewport[{index}]={viewport:?}"),
+                    StateChange::Scissor { index, rect } => write!(f, "scissor[{index}]={rect:?}"),
+                    StateChange::ColorBlend { index, blend } => match index {
+                        Some(index) => write!(f, "color_blend[{index}]={blend:?}"),
+                        None => write!(f, "color_blend[*]={blend:?}"),
+                    },
+                }
             },
             IR::Draw {
                 pass,
@@ -241,6 +251,7 @@ impl fmt::Display for IR {
                 first_instance,
                 pipeline,
                 state,
+                dynamic,
             } => {
                 write!(
                     f,
@@ -253,14 +264,24 @@ impl fmt::Display for IR {
                 }
                 write!(
                     f,
-                    " formats={:?} samples={:?} topology={:?} polygon={:?} cull={:?} front={:?}",
+                    " formats={:?} samples={:?} topology={:?} polygon={:?} cull={:?} front={:?} blend={:?}",
                     state.rendering.color_formats,
                     state.rendering.samples,
-                    state.raster.topology,
-                    state.raster.polygon_mode,
-                    state.raster.cull_mode,
-                    state.raster.front_face
-                )
+                    state.topology,
+                    state.rasterization.polygon_mode,
+                    state.rasterization.cull_mode,
+                    state.rasterization.front_face,
+                    state.blend.iter().map(|blend| blend.blend_enable).collect::<Vec<_>>()
+                )?;
+
+                match state.viewports.is_empty() {
+                    true => write!(f, " viewports=dynamic{:?}", dynamic.viewports)?,
+                    false => write!(f, " viewports={:?}", state.viewports)?,
+                }
+                match state.scissors.is_empty() {
+                    true => write!(f, " scissors=dynamic{:?}", dynamic.scissors),
+                    false => write!(f, " scissors={:?}", state.scissors),
+                }
             },
             IR::EndRendering { pass } => write!(f, "end_rendering {pass}"),
             IR::MemoryBarrier { src_access, dst_access } => {

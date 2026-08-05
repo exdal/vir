@@ -78,19 +78,22 @@ impl CommandBuffer {
             .layer_count(1)
             .color_attachments(color_attachments);
 
-        let viewport = vk::Viewport::default()
-            .x(render_area.offset.x as f32)
-            .y(render_area.offset.y as f32)
-            .width(render_area.extent.width as f32)
-            .height(render_area.extent.height as f32)
-            .min_depth(0.0)
-            .max_depth(1.0);
+        unsafe { self.device.as_ref().cmd_begin_rendering(self.handle, &rendering_info) }
+    }
 
+    pub fn set_viewport(&self, first_viewport: u32, viewports: &[vk::Viewport]) {
         unsafe {
-            let device = self.device.as_ref();
-            device.cmd_begin_rendering(self.handle, &rendering_info);
-            device.cmd_set_viewport(self.handle, 0, &[viewport]);
-            device.cmd_set_scissor(self.handle, 0, &[render_area]);
+            self.device
+                .as_ref()
+                .cmd_set_viewport(self.handle, first_viewport, viewports)
+        }
+    }
+
+    pub fn set_scissor(&self, first_scissor: u32, scissors: &[vk::Rect2D]) {
+        unsafe {
+            self.device
+                .as_ref()
+                .cmd_set_scissor(self.handle, first_scissor, scissors)
         }
     }
 

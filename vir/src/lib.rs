@@ -13,19 +13,27 @@ use std::{
 pub use allocator::{AllocatorKind, FrameAllocator, PersistentAllocator, SuperFrameAllocator};
 use ash::vk;
 pub use context::{Access, CommandBuffer, Context, DomainFlag};
-pub use graph::{IR, ImageAttachment, Module, PassCallback, RenderGraph, Value, ValueId};
+pub use graph::{IR, ImageAttachment, Module, PassCallback, RenderGraph, RenderPass, Value, ValueId};
 pub use resource::{
+    BlendPreset,
+    ColorBlendAttachmentState,
     DescriptorBinding,
+    DynamicStateFlags,
+    DynamicValues,
     GraphicsPipelineInfo,
     Image,
+    PassState,
     PipelineId,
     PipelineLayout,
     PipelineState,
-    RasterState,
-    RasterStateChange,
+    RasterizationState,
+    Rect2D,
     Reflection,
     RenderingState,
+    ResolvedViewport,
+    StateChange,
     SwapChain,
+    Viewport,
 };
 
 #[derive(Clone, Copy)]

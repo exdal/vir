@@ -5,16 +5,20 @@ use ash::vk;
 use crate::{
     Access,
     ClearValue,
+    ColorBlendAttachmentState,
     DomainFlag,
+    DynamicStateFlags,
     IR,
     ImageAttachment,
+    PassState,
     PipelineId,
-    PipelineState,
-    RasterState,
-    RasterStateChange,
+    RasterizationState,
+    Rect2D,
     RenderingState,
+    StateChange,
     SwapChain,
     ValueId,
+    Viewport,
     graph::ir,
 };
 
@@ -22,6 +26,13 @@ use crate::{
 struct ResourceState {
     layout: vk::ImageLayout,
     last_access: ValueId,
+}
+
+#[derive(Clone, Copy)]
+struct ImageInfo {
+    format: vk::Format,
+    samples: vk::SampleCountFlags,
+    extent: vk::Extent2D,
 }
 
 #[derive(Default)]
@@ -66,8 +77,6 @@ impl Module {
     }
 
     fn lower_u32(&mut self, v: u32) -> ValueId { self.lower_constant(ir::Constant::U32(v)) }
-
-    fn lower_i32(&mut self, v: i32) -> ValueId { self.lower_constant(ir::Constant::I32(v)) }
 
     fn lower_access(&mut self, access: Access) -> ValueId { self.lower_constant(ir::Constant::Access(access)) }
 
@@ -147,72 +156,22 @@ impl Module {
         self.emit(IR::Clear { attachment, color })
     }
 
-    pub fn begin_rendering(&mut self, color_attachments: &[ValueId]) -> ValueId {
-        self.emit(IR::BeginRendering {
+    pub fn begin_rendering(&mut self, color_attachments: &[ValueId]) -> RenderPass<'_> {
+        let id = self.emit(IR::BeginRendering {
             color_attachments: color_attachments.to_vec(),
             render_area: None,
-        })
+        });
+        RenderPass { module: self, id }
     }
 
-    pub fn begin_rendering_area(&mut self, color_attachments: &[ValueId], render_area: vk::Extent2D) -> ValueId {
+    pub fn begin_rendering_area(&mut self, color_attachments: &[ValueId], render_area: vk::Extent2D) -> RenderPass<'_> {
         let render_area = self.lower_constant(ir::Constant::Extent2D(render_area));
-        self.emit(IR::BeginRendering {
+        let id = self.emit(IR::BeginRendering {
             color_attachments: color_attachments.to_vec(),
             render_area: Some(render_area),
-        })
+        });
+        RenderPass { module: self, id }
     }
-
-    pub fn bind_pipeline(&mut self, pass: ValueId, pipeline: PipelineId) -> ValueId {
-        self.emit(IR::BindPipeline {
-            pass,
-            pipeline,
-            bind_point: vk::PipelineBindPoint::GRAPHICS,
-        })
-    }
-
-    fn set_raster_state(&mut self, pass: ValueId, change: RasterStateChange) -> ValueId {
-        self.emit(IR::SetRasterState { pass, change })
-    }
-
-    pub fn set_topology(&mut self, pass: ValueId, topology: vk::PrimitiveTopology) -> ValueId {
-        self.set_raster_state(pass, RasterStateChange::Topology(topology))
-    }
-
-    pub fn set_polygon_mode(&mut self, pass: ValueId, polygon_mode: vk::PolygonMode) -> ValueId {
-        self.set_raster_state(pass, RasterStateChange::PolygonMode(polygon_mode))
-    }
-
-    pub fn set_cull_mode(&mut self, pass: ValueId, cull_mode: vk::CullModeFlags) -> ValueId {
-        self.set_raster_state(pass, RasterStateChange::CullMode(cull_mode))
-    }
-
-    pub fn set_front_face(&mut self, pass: ValueId, front_face: vk::FrontFace) -> ValueId {
-        self.set_raster_state(pass, RasterStateChange::FrontFace(front_face))
-    }
-
-    pub fn draw(&mut self, pass: ValueId, vertex_count: u32, instance_count: u32) -> ValueId {
-        self.draw_range(pass, vertex_count, instance_count, 0, 0)
-    }
-
-    pub fn draw_range(
-        &mut self, pass: ValueId, vertex_count: u32, instance_count: u32, first_vertex: u32, first_instance: u32,
-    ) -> ValueId {
-        let vertex_count = self.lower_u32(vertex_count);
-        let instance_count = self.lower_u32(instance_count);
-        let first_vertex = self.lower_u32(first_vertex);
-        let first_instance = self.lower_u32(first_instance);
-        self.emit(IR::Draw {
-            pass,
-            vertex_count,
-            instance_count,
-            first_vertex,
-            first_instance,
-            pipeline: None,
-            state: PipelineState::default(),
-        })
-    }
-
-    pub fn end_rendering(&mut self, pass: ValueId) -> ValueId { self.emit(IR::EndRendering { pass }) }
 
     pub fn compile(&self, id: ValueId) -> Vec<ir::Instr> {
         let linearized = self.topo_sort(id);
@@ -288,7 +247,7 @@ impl Module {
                         render_area.iter().for_each(|v| stack.push(*v));
                         color_attachments.iter().rev().for_each(|v| stack.push(*v));
                     },
-                    IR::BindPipeline { pass, .. } | IR::SetRasterState { pass, .. } => {
+                    IR::BindPipeline { pass, .. } | IR::SetState { pass, .. } => {
                         stack.push(*pass);
                     },
                     IR::Draw {
@@ -432,7 +391,7 @@ impl Module {
                 },
 
                 IR::BindPipeline { pass, .. }
-                | IR::SetRasterState { pass, .. }
+                | IR::SetState { pass, .. }
                 | IR::Draw { pass, .. }
                 | IR::EndRendering { pass } => {
                     let state = states.get(pass).copied().unwrap_or(undefined);
@@ -461,19 +420,39 @@ impl Module {
         result
     }
 
-    fn resolve_image_type(&self, id: ValueId) -> Option<(vk::Format, vk::SampleCountFlags)> {
+    /// Walk back from a value to the image it names.
+    fn resolve_image(&self, id: ValueId) -> Option<ImageInfo> {
         let mut id = id;
 
-        for _ in 0..64 {
+        for _ in 0..256 {
             match self.instructions.get(id.0 as usize)? {
-                IR::ConstructImage { format, samples, .. } => return Some((*format, *samples)),
-                IR::Type(ir::Type::Image { format, samples }) => return Some((*format, *samples)),
-                IR::Array { ty, .. } => id = *ty,
+                IR::ConstructImage {
+                    format,
+                    samples,
+                    extent,
+                    ..
+                } => {
+                    let extent = match self.instructions.get(extent.0 as usize)? {
+                        IR::Constant(ir::Constant::Extent3D(extent)) => *extent,
+                        _ => return None,
+                    };
+
+                    return Some(ImageInfo {
+                        format: *format,
+                        samples: *samples,
+                        extent: vk::Extent2D {
+                            width: extent.width,
+                            height: extent.height,
+                        },
+                    });
+                },
+                // every element of an attachment array describes the same image
+                IR::Array { elements, .. } => id = *elements.first()?,
                 IR::Index { array, .. } => id = *array,
                 IR::Clear { attachment, .. } => id = *attachment,
                 IR::BeginRendering { color_attachments, .. } => id = *color_attachments.first()?,
                 IR::BindPipeline { pass, .. }
-                | IR::SetRasterState { pass, .. }
+                | IR::SetState { pass, .. }
                 | IR::Draw { pass, .. }
                 | IR::EndRendering { pass } => id = *pass,
                 IR::Acquire { resource, .. } | IR::Release { resource, .. } => id = *resource,
@@ -484,10 +463,19 @@ impl Module {
         None
     }
 
+    fn resolve_extent_2d(&self, id: ValueId) -> Option<vk::Extent2D> {
+        match self.instructions.get(id.0 as usize)? {
+            IR::Constant(ir::Constant::Extent2D(extent)) => Some(*extent),
+            _ => None,
+        }
+    }
+
+    /// Give every draw the pipeline and state that were in force where it was recorded.
     fn infer(&self, mut nodes: Vec<ir::Instr>) -> Vec<ir::Instr> {
-        #[derive(Clone, Default)]
+        #[derive(Clone)]
         struct InForce {
-            state: PipelineState,
+            state: PassState,
+            area: vk::Rect2D,
             pipeline: Option<PipelineId>,
         }
 
@@ -495,34 +483,47 @@ impl Module {
 
         for (value_id, ir) in nodes.iter_mut() {
             match ir {
-                IR::BeginRendering { color_attachments, .. } => {
+                IR::BeginRendering {
+                    color_attachments,
+                    render_area,
+                } => {
                     let mut rendering = RenderingState::default();
+                    let mut attachment_extent = None;
 
                     for (index, attachment) in color_attachments.iter().enumerate() {
-                        let Some((format, samples)) = self.resolve_image_type(*attachment) else {
+                        let Some(image) = self.resolve_image(*attachment) else {
                             tracing::warn!(%attachment, "cannot infer attachment type; pipelines may not match");
                             continue;
                         };
 
                         if index == 0 {
-                            rendering.samples = samples;
-                        } else if samples != rendering.samples {
+                            rendering.samples = image.samples;
+                            attachment_extent = Some(image.extent);
+                        } else if image.samples != rendering.samples {
                             tracing::warn!(
                                 %attachment,
                                 "attachment sample count differs from the region's first attachment"
                             );
                         }
 
-                        rendering.color_formats.push(format);
+                        rendering.color_formats.push(image.format);
+                    }
+
+                    // framebuffer-relative state resolves against this, so it has to match the
+                    // area the region is opened with
+                    let extent = match render_area {
+                        Some(id) => self.resolve_extent_2d(*id),
+                        None => attachment_extent,
+                    };
+                    if extent.is_none() {
+                        tracing::warn!(%value_id, "cannot infer the render area; static viewports may be wrong");
                     }
 
                     regions.insert(
                         *value_id,
                         InForce {
-                            state: PipelineState {
-                                rendering,
-                                raster: RasterState::default(),
-                            },
+                            state: PassState::for_rendering(rendering),
+                            area: vk::Rect2D::default().extent(extent.unwrap_or_default()),
                             pipeline: None,
                         },
                     );
@@ -535,22 +536,26 @@ impl Module {
                     }
                 },
 
-                IR::SetRasterState { pass, change } => {
+                IR::SetState { pass, change } => {
                     if let Some(mut in_force) = regions.get(pass).cloned() {
-                        in_force.state.raster.apply(*change);
+                        in_force.state.apply(*change);
                         regions.insert(*value_id, in_force);
                     }
                 },
 
                 IR::Draw {
-                    pass, pipeline, state, ..
+                    pass,
+                    pipeline,
+                    state,
+                    dynamic,
+                    ..
                 } => {
                     if let Some(in_force) = regions.get(pass).cloned() {
                         if in_force.pipeline.is_none() {
                             tracing::warn!(%value_id, "draw with no pipeline bound");
                         }
                         *pipeline = in_force.pipeline;
-                        *state = in_force.state.clone();
+                        (*state, *dynamic) = in_force.state.resolve(in_force.area);
                         regions.insert(*value_id, in_force);
                     }
                 },
@@ -569,19 +574,110 @@ impl Module {
     }
 }
 
+/// A rendering region that is open for recording. State set here only reaches the draws that
+/// follow it.
+pub struct RenderPass<'a> {
+    module: &'a mut Module,
+    id: ValueId,
+}
+
+impl RenderPass<'_> {
+    pub fn id(&self) -> ValueId { self.id }
+
+    pub fn bind_graphics_pipeline(mut self, pipeline: PipelineId) -> Self {
+        self.id = self.module.emit(IR::BindPipeline {
+            pass: self.id,
+            pipeline,
+            bind_point: vk::PipelineBindPoint::GRAPHICS,
+        });
+        self
+    }
+
+    fn set_state(mut self, change: StateChange) -> Self {
+        self.id = self.module.emit(IR::SetState { pass: self.id, change });
+        self
+    }
+
+    pub fn set_primitive_topology(self, topology: vk::PrimitiveTopology) -> Self {
+        self.set_state(StateChange::PrimitiveTopology(topology))
+    }
+
+    pub fn set_rasterization(self, rasterization: RasterizationState) -> Self {
+        self.set_state(StateChange::Rasterization(rasterization))
+    }
+
+    /// Pick what the pass records instead of baking into pipelines. Viewport and scissor are
+    /// dynamic by default.
+    pub fn set_dynamic_state(self, dynamic: DynamicStateFlags) -> Self {
+        self.set_state(StateChange::DynamicState(dynamic))
+    }
+
+    pub fn set_viewport(self, index: u32, viewport: impl Into<Viewport>) -> Self {
+        self.set_state(StateChange::Viewport {
+            index,
+            viewport: viewport.into(),
+        })
+    }
+
+    pub fn set_scissor(self, index: u32, rect: Rect2D) -> Self { self.set_state(StateChange::Scissor { index, rect }) }
+
+    pub fn set_color_blend(self, index: u32, blend: impl Into<ColorBlendAttachmentState>) -> Self {
+        self.set_state(StateChange::ColorBlend {
+            index: Some(index),
+            blend: blend.into(),
+        })
+    }
+
+    pub fn broadcast_color_blend(self, blend: impl Into<ColorBlendAttachmentState>) -> Self {
+        self.set_state(StateChange::ColorBlend {
+            index: None,
+            blend: blend.into(),
+        })
+    }
+
+    pub fn draw(self, vertex_count: u32, instance_count: u32) -> Self {
+        self.draw_range(vertex_count, instance_count, 0, 0)
+    }
+
+    pub fn draw_range(
+        mut self, vertex_count: u32, instance_count: u32, first_vertex: u32, first_instance: u32,
+    ) -> Self {
+        let vertex_count = self.module.lower_u32(vertex_count);
+        let instance_count = self.module.lower_u32(instance_count);
+        let first_vertex = self.module.lower_u32(first_vertex);
+        let first_instance = self.module.lower_u32(first_instance);
+        self.id = self.module.emit(IR::Draw {
+            pass: self.id,
+            vertex_count,
+            instance_count,
+            first_vertex,
+            first_instance,
+            pipeline: None,
+            state: Default::default(),
+            dynamic: Default::default(),
+        });
+        self
+    }
+
+    /// Close the region and hand back the attachment it rendered into.
+    pub fn end_rendering(self) -> ValueId { self.module.emit(IR::EndRendering { pass: self.id }) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Image;
+    use crate::{BlendPreset, Image, PipelineState, ResolvedViewport};
 
     const FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
+    const WIDTH: u32 = 64;
+    const HEIGHT: u32 = 32;
 
     fn module_with_attachment() -> (Module, ValueId) {
         let mut module = Module::default();
         let attachment = ImageAttachment::new(
             Image::new(vk::Image::null(), None),
             FORMAT,
-            vk::Extent3D::default().width(4).height(4).depth(1),
+            vk::Extent3D::default().width(WIDTH).height(HEIGHT).depth(1),
             vk::SampleCountFlags::TYPE_1,
             vk::ImageLayout::UNDEFINED,
         );
@@ -600,38 +696,43 @@ mod tests {
     }
 
     #[test]
-    fn a_draw_inherits_the_regions_formats_and_the_default_raster_state() {
+    fn a_draw_inherits_the_regions_formats_and_the_default_state() {
         let (mut module, attachment) = module_with_attachment();
         let pipeline = PipelineId(0);
 
-        let pass = module.begin_rendering(&[attachment]);
-        let pass = module.bind_pipeline(pass, pipeline);
-        let pass = module.draw(pass, 3, 1);
-        let end = module.end_rendering(pass);
+        let end = module
+            .begin_rendering(&[attachment])
+            .bind_graphics_pipeline(pipeline)
+            .draw(3, 1)
+            .end_rendering();
 
         let draws = draws(&module.compile(end));
         assert_eq!(draws.len(), 1);
         assert_eq!(draws[0].0, Some(pipeline));
         assert_eq!(draws[0].1.rendering.color_formats, vec![FORMAT]);
-        assert_eq!(draws[0].1.raster, RasterState::default());
+        assert_eq!(draws[0].1.rasterization, RasterizationState::default());
+        assert_eq!(draws[0].1.topology, vk::PrimitiveTopology::TRIANGLE_LIST);
     }
 
     #[test]
     fn state_set_after_bind_reaches_the_draw() {
         let (mut module, attachment) = module_with_attachment();
-        let pipeline = PipelineId(0);
 
-        let pass = module.begin_rendering(&[attachment]);
-        let pass = module.bind_pipeline(pass, pipeline);
-        let pass = module.set_cull_mode(pass, vk::CullModeFlags::BACK);
-        let pass = module.set_polygon_mode(pass, vk::PolygonMode::LINE);
-        let pass = module.draw(pass, 3, 1);
-        let end = module.end_rendering(pass);
+        let end = module
+            .begin_rendering(&[attachment])
+            .bind_graphics_pipeline(PipelineId(0))
+            .set_rasterization(RasterizationState {
+                cull_mode: vk::CullModeFlags::BACK,
+                polygon_mode: vk::PolygonMode::LINE,
+                ..Default::default()
+            })
+            .draw(3, 1)
+            .end_rendering();
 
         let draws = draws(&module.compile(end));
         assert_eq!(draws.len(), 1);
-        assert_eq!(draws[0].1.raster.cull_mode, vk::CullModeFlags::BACK);
-        assert_eq!(draws[0].1.raster.polygon_mode, vk::PolygonMode::LINE);
+        assert_eq!(draws[0].1.rasterization.cull_mode, vk::CullModeFlags::BACK);
+        assert_eq!(draws[0].1.rasterization.polygon_mode, vk::PolygonMode::LINE);
     }
 
     #[test]
@@ -639,17 +740,21 @@ mod tests {
         let (mut module, attachment) = module_with_attachment();
         let pipeline = PipelineId(0);
 
-        let pass = module.begin_rendering(&[attachment]);
-        let pass = module.bind_pipeline(pass, pipeline);
-        let pass = module.draw(pass, 3, 1);
-        let pass = module.set_cull_mode(pass, vk::CullModeFlags::FRONT);
-        let pass = module.draw(pass, 3, 1);
-        let end = module.end_rendering(pass);
+        let end = module
+            .begin_rendering(&[attachment])
+            .bind_graphics_pipeline(pipeline)
+            .draw(3, 1)
+            .set_rasterization(RasterizationState {
+                cull_mode: vk::CullModeFlags::FRONT,
+                ..Default::default()
+            })
+            .draw(3, 1)
+            .end_rendering();
 
         let draws = draws(&module.compile(end));
         assert_eq!(draws.len(), 2);
-        assert_eq!(draws[0].1.raster.cull_mode, vk::CullModeFlags::NONE);
-        assert_eq!(draws[1].1.raster.cull_mode, vk::CullModeFlags::FRONT);
+        assert_eq!(draws[0].1.rasterization.cull_mode, vk::CullModeFlags::NONE);
+        assert_eq!(draws[1].1.rasterization.cull_mode, vk::CullModeFlags::FRONT);
         assert_eq!(draws[0].0, draws[1].0);
         assert_ne!(draws[0].1, draws[1].1);
     }
@@ -657,44 +762,178 @@ mod tests {
     #[test]
     fn draws_that_agree_on_state_share_one_permutation() {
         let (mut module, attachment) = module_with_attachment();
-        let pipeline = PipelineId(0);
 
-        let pass = module.begin_rendering(&[attachment]);
-        let pass = module.bind_pipeline(pass, pipeline);
-        let pass = module.set_cull_mode(pass, vk::CullModeFlags::BACK);
-        let pass = module.draw(pass, 3, 1);
-        let pass = module.draw(pass, 6, 1);
-        let end = module.end_rendering(pass);
+        let end = module
+            .begin_rendering(&[attachment])
+            .bind_graphics_pipeline(PipelineId(0))
+            .set_primitive_topology(vk::PrimitiveTopology::LINE_STRIP)
+            .draw(3, 1)
+            .draw(6, 1)
+            .end_rendering();
 
         let draws = draws(&module.compile(end));
         assert_eq!(draws.len(), 2);
         assert_eq!(draws[0], draws[1]);
+        assert_eq!(draws[0].1.topology, vk::PrimitiveTopology::LINE_STRIP);
     }
 
     #[test]
     fn rebinding_a_declaration_keeps_the_state_accumulated_so_far() {
         let (mut module, attachment) = module_with_attachment();
 
-        let pass = module.begin_rendering(&[attachment]);
-        let pass = module.set_cull_mode(pass, vk::CullModeFlags::BACK);
-        let pass = module.bind_pipeline(pass, PipelineId(1));
-        let pass = module.draw(pass, 3, 1);
-        let end = module.end_rendering(pass);
+        let end = module
+            .begin_rendering(&[attachment])
+            .set_rasterization(RasterizationState {
+                cull_mode: vk::CullModeFlags::BACK,
+                ..Default::default()
+            })
+            .bind_graphics_pipeline(PipelineId(1))
+            .draw(3, 1)
+            .end_rendering();
 
         let draws = draws(&module.compile(end));
         assert_eq!(draws[0].0, Some(PipelineId(1)));
-        assert_eq!(draws[0].1.raster.cull_mode, vk::CullModeFlags::BACK);
+        assert_eq!(draws[0].1.rasterization.cull_mode, vk::CullModeFlags::BACK);
     }
 
     #[test]
     fn a_draw_with_no_bound_pipeline_infers_none() {
         let (mut module, attachment) = module_with_attachment();
 
-        let pass = module.begin_rendering(&[attachment]);
-        let pass = module.draw(pass, 3, 1);
-        let end = module.end_rendering(pass);
+        let end = module.begin_rendering(&[attachment]).draw(3, 1).end_rendering();
 
         let draws = draws(&module.compile(end));
         assert_eq!(draws[0].0, None);
+    }
+
+    #[test]
+    fn a_second_region_over_the_same_attachment_keeps_its_own_state() {
+        let (mut module, attachment) = module_with_attachment();
+        let pipeline = PipelineId(0);
+
+        let attachment = module
+            .begin_rendering(&[attachment])
+            .bind_graphics_pipeline(pipeline)
+            .set_rasterization(RasterizationState {
+                polygon_mode: vk::PolygonMode::LINE,
+                ..Default::default()
+            })
+            .draw(3, 1)
+            .end_rendering();
+        let end = module
+            .begin_rendering(&[attachment])
+            .bind_graphics_pipeline(pipeline)
+            .draw(3, 1)
+            .end_rendering();
+
+        let draws = draws(&module.compile(end));
+        assert_eq!(draws.len(), 2);
+        assert_eq!(draws[0].1.rasterization.polygon_mode, vk::PolygonMode::LINE);
+        assert_eq!(draws[1].1.rasterization.polygon_mode, vk::PolygonMode::FILL);
+        assert_eq!(draws[1].1.rendering.color_formats, vec![FORMAT]);
+    }
+
+    #[test]
+    fn a_dynamic_viewport_travels_with_the_draw_instead_of_the_pipeline() {
+        let (mut module, attachment) = module_with_attachment();
+
+        let end = module
+            .begin_rendering(&[attachment])
+            .bind_graphics_pipeline(PipelineId(0))
+            .set_viewport(0, Rect2D::relative(0.0, 0.0, 0.5, 0.5))
+            .draw(3, 1)
+            .set_viewport(0, Rect2D::framebuffer())
+            .draw(3, 1)
+            .end_rendering();
+
+        let compiled = module.compile(end);
+        let dynamic = compiled
+            .iter()
+            .filter_map(|(_, ir)| match ir {
+                IR::Draw { dynamic, .. } => Some(dynamic.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        // both draws share a permutation, only the recorded viewport differs
+        let draws = draws(&compiled);
+        assert_eq!(draws[0].1, draws[1].1);
+        assert!(draws[0].1.viewports.is_empty());
+        assert_eq!(dynamic[0].viewports, vec![Rect2D::relative(0.0, 0.0, 0.5, 0.5).into()]);
+        assert_eq!(dynamic[1].viewports, vec![Viewport::framebuffer()]);
+    }
+
+    #[test]
+    fn a_static_viewport_is_resolved_against_the_render_area_and_keys_the_pipeline() {
+        let (mut module, attachment) = module_with_attachment();
+
+        let end = module
+            .begin_rendering(&[attachment])
+            .bind_graphics_pipeline(PipelineId(0))
+            .set_dynamic_state(DynamicStateFlags::None)
+            .set_viewport(0, Rect2D::relative(0.0, 0.0, 0.5, 1.0))
+            .set_scissor(0, Rect2D::framebuffer())
+            .draw(3, 1)
+            .end_rendering();
+
+        let draws = draws(&module.compile(end));
+        assert_eq!(
+            draws[0].1.viewports,
+            vec![ResolvedViewport {
+                x: 0.0,
+                y: 0.0,
+                width: (WIDTH / 2) as f32,
+                height: HEIGHT as f32,
+                min_depth: 0.0,
+                max_depth: 1.0,
+            }]
+        );
+        assert_eq!(
+            draws[0].1.scissors,
+            vec![vk::Rect2D::default().extent(vk::Extent2D {
+                width: WIDTH,
+                height: HEIGHT
+            })]
+        );
+    }
+
+    #[test]
+    fn a_static_viewport_follows_the_render_area_a_region_was_opened_with() {
+        let (mut module, attachment) = module_with_attachment();
+
+        let end = module
+            .begin_rendering_area(
+                &[attachment],
+                vk::Extent2D {
+                    width: WIDTH / 2,
+                    height: HEIGHT / 2,
+                },
+            )
+            .bind_graphics_pipeline(PipelineId(0))
+            .set_dynamic_state(DynamicStateFlags::None)
+            .draw(3, 1)
+            .end_rendering();
+
+        let draws = draws(&module.compile(end));
+        assert_eq!(draws[0].1.viewports[0].width, (WIDTH / 2) as f32);
+        assert_eq!(draws[0].1.viewports[0].height, (HEIGHT / 2) as f32);
+    }
+
+    #[test]
+    fn blend_state_is_per_attachment_and_keys_the_pipeline() {
+        let (mut module, attachment) = module_with_attachment();
+
+        let end = module
+            .begin_rendering(&[attachment])
+            .bind_graphics_pipeline(PipelineId(0))
+            .draw(3, 1)
+            .broadcast_color_blend(BlendPreset::AlphaBlend)
+            .draw(3, 1)
+            .end_rendering();
+
+        let draws = draws(&module.compile(end));
+        assert_eq!(draws[0].1.blend, vec![ColorBlendAttachmentState::default()]);
+        assert_eq!(draws[1].1.blend, vec![BlendPreset::AlphaBlend.into()]);
+        assert_ne!(draws[0].1, draws[1].1);
     }
 }

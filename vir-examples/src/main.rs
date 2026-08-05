@@ -6,13 +6,17 @@ use ash::{Entry, khr, vk};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
 use vir::{
     AllocatorKind,
+    BlendPreset,
     ClearValue,
     Context,
+    DynamicStateFlags,
     GraphicsPipelineInfo,
     Image,
     ImageAttachment,
     PersistentAllocator,
     PipelineId,
+    RasterizationState,
+    Rect2D,
     RenderGraph,
     SuperFrameAllocator,
     SwapChain,
@@ -313,13 +317,28 @@ impl App {
         let hue = self.start_time.elapsed().as_secs_f32() * 0.2;
         let attachment = module.clear(attachment, rainbow(hue));
 
-        let pass = module.begin_rendering(&[attachment]);
-        let pass = module.bind_pipeline(pass, self.triangle_pipeline);
-        let pass = module.draw(pass, 3, 1);
+        let attachment = module
+            .begin_rendering(&[attachment])
+            .bind_graphics_pipeline(self.triangle_pipeline)
+            .set_viewport(0, Rect2D::framebuffer())
+            .set_scissor(0, Rect2D::framebuffer())
+            .broadcast_color_blend(BlendPreset::Off)
+            .set_rasterization(RasterizationState {
+                cull_mode: vk::CullModeFlags::NONE,
+                ..Default::default()
+            })
+            .draw(3, 1)
+            .end_rendering();
 
-        let pass = module.set_polygon_mode(pass, vk::PolygonMode::LINE);
-        let pass = module.draw(pass, 3, 1);
-        let attachment = module.end_rendering(pass);
+        let attachment = module
+            .begin_rendering(&[attachment])
+            .bind_graphics_pipeline(self.triangle_pipeline)
+            .set_dynamic_state(DynamicStateFlags::Viewport | DynamicStateFlags::Scissor)
+            .set_viewport(0, Rect2D::relative(0.5, 0.5, 0.5, 0.5))
+            .set_scissor(0, Rect2D::relative(0.5, 0.5, 0.5, 0.5))
+            .broadcast_color_blend(BlendPreset::AlphaBlend)
+            .draw(3, 1)
+            .end_rendering();
 
         let attachment = module.present(attachment);
         let executable = module.compile(attachment);

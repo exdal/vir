@@ -190,10 +190,9 @@ fn parse(spirv: &[u32]) -> Option<Parsed> {
                 );
             },
             op::TYPE_POINTER if operands.len() >= 3 => {
-                parsed.types.insert(
-                    operands[0],
-                    TypeInfo::Pointer { pointee: operands[2] },
-                );
+                parsed
+                    .types
+                    .insert(operands[0], TypeInfo::Pointer { pointee: operands[2] });
             },
             op::TYPE_ACCELERATION_STRUCTURE if !operands.is_empty() => {
                 parsed.types.insert(operands[0], TypeInfo::AccelerationStructure);

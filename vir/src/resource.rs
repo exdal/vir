@@ -5,13 +5,21 @@ pub mod swapchain;
 
 pub use image::{Image, aspect_mask};
 pub use pipeline::{
+    BlendPreset,
+    ColorBlendAttachmentState,
+    DynamicStateFlags,
+    DynamicValues,
     GraphicsPipelineInfo,
+    PassState,
     PipelineId,
     PipelineLayout,
     PipelineState,
-    RasterState,
-    RasterStateChange,
+    RasterizationState,
+    Rect2D,
     RenderingState,
+    ResolvedViewport,
+    StateChange,
+    Viewport,
 };
 pub use shader::{DescriptorBinding, Reflection};
 pub use swapchain::SwapChain;

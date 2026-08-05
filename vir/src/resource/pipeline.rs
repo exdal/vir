@@ -1,6 +1,22 @@
+pub mod state;
+
 use std::collections::BTreeMap;
 
 use ash::vk::{self, Handle};
+pub use state::{
+    BlendPreset,
+    ColorBlendAttachmentState,
+    DynamicStateFlags,
+    DynamicValues,
+    PassState,
+    PipelineState,
+    RasterizationState,
+    Rect2D,
+    RenderingState,
+    ResolvedViewport,
+    StateChange,
+    Viewport,
+};
 
 use crate::resource::shader::Reflection;
 
@@ -9,65 +25,6 @@ pub struct PipelineId(pub(crate) u32);
 
 impl std::fmt::Display for PipelineId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "#{}", self.0) }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct RenderingState {
-    pub color_formats: Vec<vk::Format>,
-    pub samples: vk::SampleCountFlags,
-}
-
-impl Default for RenderingState {
-    fn default() -> Self {
-        Self {
-            color_formats: Vec::new(),
-            samples: vk::SampleCountFlags::TYPE_1,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct RasterState {
-    pub topology: vk::PrimitiveTopology,
-    pub polygon_mode: vk::PolygonMode,
-    pub cull_mode: vk::CullModeFlags,
-    pub front_face: vk::FrontFace,
-}
-
-impl Default for RasterState {
-    fn default() -> Self {
-        Self {
-            topology: vk::PrimitiveTopology::TRIANGLE_LIST,
-            polygon_mode: vk::PolygonMode::FILL,
-            cull_mode: vk::CullModeFlags::NONE,
-            front_face: vk::FrontFace::COUNTER_CLOCKWISE,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum RasterStateChange {
-    Topology(vk::PrimitiveTopology),
-    PolygonMode(vk::PolygonMode),
-    CullMode(vk::CullModeFlags),
-    FrontFace(vk::FrontFace),
-}
-
-impl RasterState {
-    pub fn apply(&mut self, change: RasterStateChange) {
-        match change {
-            RasterStateChange::Topology(topology) => self.topology = topology,
-            RasterStateChange::PolygonMode(polygon_mode) => self.polygon_mode = polygon_mode,
-            RasterStateChange::CullMode(cull_mode) => self.cull_mode = cull_mode,
-            RasterStateChange::FrontFace(front_face) => self.front_face = front_face,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
-pub struct PipelineState {
-    pub rendering: RenderingState,
-    pub raster: RasterState,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -287,40 +244,68 @@ pub(crate) fn create_pipelines(
         .map(|request| {
             request
                 .state
-                .rendering
-                .color_formats
+                .blend
                 .iter()
-                .map(|_| {
-                    vk::PipelineColorBlendAttachmentState::default()
-                        .blend_enable(false)
-                        .color_write_mask(vk::ColorComponentFlags::RGBA)
-                })
+                .copied()
+                .map(vk::PipelineColorBlendAttachmentState::from)
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
 
+    let viewports = requests
+        .iter()
+        .map(|request| {
+            request
+                .state
+                .viewports
+                .iter()
+                .copied()
+                .map(vk::Viewport::from)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let scissors = requests
+        .iter()
+        .map(|request| request.state.scissors.clone())
+        .collect::<Vec<_>>();
+    let dynamic_states = requests
+        .iter()
+        .map(|request| request.state.dynamic_states())
+        .collect::<Vec<_>>();
+
     let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
-    let viewport = vk::PipelineViewportStateCreateInfo::default()
-        .viewport_count(1)
-        .scissor_count(1);
     let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default();
-    let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
-    let dynamic_state = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+
+    let viewport = requests
+        .iter()
+        .enumerate()
+        .map(|(index, request)| {
+            let mut info = vk::PipelineViewportStateCreateInfo::default()
+                .viewport_count(request.state.viewport_count)
+                .scissor_count(request.state.viewport_count);
+            if !viewports[index].is_empty() {
+                info = info.viewports(&viewports[index]);
+            }
+            if !scissors[index].is_empty() {
+                info = info.scissors(&scissors[index]);
+            }
+            info
+        })
+        .collect::<Vec<_>>();
+
+    let dynamic_state = dynamic_states
+        .iter()
+        .map(|states| vk::PipelineDynamicStateCreateInfo::default().dynamic_states(states))
+        .collect::<Vec<_>>();
 
     let input_assembly = requests
         .iter()
-        .map(|request| vk::PipelineInputAssemblyStateCreateInfo::default().topology(request.state.raster.topology))
+        .map(|request| vk::PipelineInputAssemblyStateCreateInfo::default().topology(request.state.topology))
         .collect::<Vec<_>>();
 
     let rasterization = requests
         .iter()
-        .map(|request| {
-            vk::PipelineRasterizationStateCreateInfo::default()
-                .polygon_mode(request.state.raster.polygon_mode)
-                .cull_mode(request.state.raster.cull_mode)
-                .front_face(request.state.raster.front_face)
-                .line_width(1.0)
-        })
+        .map(|request| vk::PipelineRasterizationStateCreateInfo::from(request.state.rasterization))
         .collect::<Vec<_>>();
 
     let multisample = requests
@@ -350,12 +335,12 @@ pub(crate) fn create_pipelines(
                 .stages(&stages[index])
                 .vertex_input_state(&vertex_input)
                 .input_assembly_state(&input_assembly[index])
-                .viewport_state(&viewport)
+                .viewport_state(&viewport[index])
                 .rasterization_state(&rasterization[index])
                 .multisample_state(&multisample[index])
                 .depth_stencil_state(&depth_stencil)
                 .color_blend_state(&color_blend[index])
-                .dynamic_state(&dynamic_state)
+                .dynamic_state(&dynamic_state[index])
                 .layout(requests[index].layout)
                 .push_next(rendering)
         })
