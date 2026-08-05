@@ -344,7 +344,43 @@ impl From<BlendPreset> for ColorBlendAttachmentState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct PushConstants {
+    pub offset: u32,
+    pub data: Vec<u8>,
+}
+
+impl PushConstants {
+    pub fn is_empty(&self) -> bool { self.data.is_empty() }
+
+    pub fn size(&self) -> u32 { self.data.len() as u32 }
+
+    pub fn end(&self) -> u32 { self.offset + self.size() }
+
+    pub fn write(&mut self, offset: u32, bytes: &[u8]) {
+        if self.is_empty() {
+            self.offset = offset;
+            self.data = bytes.to_vec();
+            return;
+        }
+
+        let start = self.offset.min(offset);
+        let end = self.end().max(offset + bytes.len() as u32);
+
+        if (start, end) != (self.offset, self.end()) {
+            let mut widened = vec![0; (end - start) as usize];
+            let head = (self.offset - start) as usize;
+            widened[head..head + self.data.len()].copy_from_slice(&self.data);
+            self.offset = start;
+            self.data = widened;
+        }
+
+        let head = (offset - self.offset) as usize;
+        self.data[head..head + bytes.len()].copy_from_slice(bytes);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum StateChange {
     PrimitiveTopology(vk::PrimitiveTopology),
     Rasterization(RasterizationState),
@@ -357,14 +393,16 @@ pub enum StateChange {
         index: u32,
         rect: Rect2D,
     },
-    /// `index` of `None` applies to every color attachment.
     ColorBlend {
         index: Option<u32>,
         blend: ColorBlendAttachmentState,
     },
+    PushConstants {
+        offset: u32,
+        data: Vec<u8>,
+    },
 }
 
-/// The state in force at a point inside a pass.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PassState {
     pub rendering: RenderingState,
@@ -374,6 +412,7 @@ pub struct PassState {
     pub viewports: Vec<Viewport>,
     pub scissors: Vec<Rect2D>,
     pub dynamic: DynamicStateFlags,
+    pub push_constants: PushConstants,
 }
 
 impl Default for PassState {
@@ -386,6 +425,7 @@ impl Default for PassState {
             viewports: vec![Viewport::default()],
             scissors: vec![Rect2D::default()],
             dynamic: DynamicStateFlags::default(),
+            push_constants: PushConstants::default(),
         }
     }
 }
@@ -426,13 +466,11 @@ impl PassState {
                     self.blend.iter_mut().for_each(|attachment| *attachment = blend);
                 }
             },
+            StateChange::PushConstants { offset, data } => self.push_constants.write(offset, &data),
         }
     }
 
-    /// Split the state in force into the permutation key and the values the pass records itself.
     pub fn resolve(&self, area: vk::Rect2D) -> (PipelineState, DynamicValues) {
-        // a pipeline needs as many scissors as viewports, and untouched slots cover the whole
-        // render area rather than nothing
         let count = self.viewports.len().max(self.scissors.len()).max(1);
         let viewport_at = |index: usize| self.viewports.get(index).copied().unwrap_or_default();
         let scissor_at = |index: usize| self.scissors.get(index).copied().unwrap_or_default();
@@ -451,7 +489,10 @@ impl PassState {
             scissors: Vec::new(),
             dynamic: self.dynamic,
         };
-        let mut values = DynamicValues::default();
+        let mut values = DynamicValues {
+            push_constants: self.push_constants.clone(),
+            ..Default::default()
+        };
 
         if self.dynamic.contains(DynamicStateFlags::Viewport) {
             values.viewports = (0..count).map(viewport_at).collect();
@@ -469,7 +510,6 @@ impl PassState {
     }
 }
 
-/// The key a pipeline permutation is compiled and looked up under.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PipelineState {
     pub rendering: RenderingState,
@@ -477,7 +517,6 @@ pub struct PipelineState {
     pub rasterization: RasterizationState,
     pub blend: Vec<ColorBlendAttachmentState>,
     pub viewport_count: u32,
-    /// Both are empty when the matching state is dynamic.
     pub viewports: Vec<ResolvedViewport>,
     pub scissors: Vec<vk::Rect2D>,
     pub dynamic: DynamicStateFlags,
@@ -500,11 +539,11 @@ impl PipelineState {
     }
 }
 
-/// Dynamic state a draw records, still relative to the render area it lands in.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct DynamicValues {
     pub viewports: Vec<Viewport>,
     pub scissors: Vec<Rect2D>,
+    pub push_constants: PushConstants,
 }
 
 impl DynamicValues {
@@ -514,5 +553,56 @@ impl DynamicValues {
 
     pub fn scissors(&self, area: vk::Rect2D) -> Vec<vk::Rect2D> {
         self.scissors.iter().map(|rect| rect.resolve(area)).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_first_write_starts_the_run_where_it_lands() {
+        let mut constants = PushConstants::default();
+        constants.write(16, &[1, 2, 3, 4]);
+        assert_eq!(constants.offset, 16);
+        assert_eq!(constants.data, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn a_later_write_overwrites_the_bytes_it_lands_on() {
+        let mut constants = PushConstants::default();
+        constants.write(0, &[1, 2, 3, 4]);
+        constants.write(2, &[9, 9]);
+        assert_eq!(constants.offset, 0);
+        assert_eq!(constants.data, vec![1, 2, 9, 9]);
+    }
+
+    #[test]
+    fn writes_on_both_sides_widen_the_run_and_zero_the_gap() {
+        let mut constants = PushConstants::default();
+        constants.write(4, &[1, 2]);
+        constants.write(10, &[3]);
+        constants.write(0, &[7, 7]);
+
+        assert_eq!(constants.offset, 0);
+        assert_eq!(constants.data, vec![7, 7, 0, 0, 1, 2, 0, 0, 0, 0, 3]);
+        assert_eq!(constants.end(), 11);
+    }
+
+    #[test]
+    fn pushed_bytes_stay_out_of_the_permutation_key() {
+        let mut with_constants = PassState::default();
+        with_constants.apply(StateChange::PushConstants {
+            offset: 0,
+            data: vec![1, 2, 3, 4],
+        });
+
+        let area = vk::Rect2D::default();
+        let (plain_state, plain_values) = PassState::default().resolve(area);
+        let (state, values) = with_constants.resolve(area);
+
+        assert_eq!(state, plain_state);
+        assert!(plain_values.push_constants.is_empty());
+        assert_eq!(values.push_constants.data, vec![1, 2, 3, 4]);
     }
 }

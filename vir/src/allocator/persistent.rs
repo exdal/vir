@@ -1,20 +1,25 @@
-use std::ptr::NonNull;
+use std::{collections::HashMap, ptr::NonNull};
 
 use ash::vk::{self, Handle};
+use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme};
 
-use super::Allocator;
-use crate::CommandBuffer;
+use super::{Allocator, MemoryAllocator, map_allocation_error};
+use crate::{Buffer, BufferInfo, CommandBuffer};
 
 pub struct PersistentAllocator {
     device: NonNull<ash::Device>,
+    memory: MemoryAllocator,
     cmd_pool: vk::CommandPool,
+    allocations: HashMap<vk::Buffer, Allocation>,
 }
 
 impl PersistentAllocator {
-    pub fn new(device: NonNull<ash::Device>) -> Self {
+    pub fn new(device: NonNull<ash::Device>, memory: MemoryAllocator) -> Self {
         PersistentAllocator {
             device,
+            memory,
             cmd_pool: vk::CommandPool::null(),
+            allocations: HashMap::new(),
         }
     }
 
@@ -96,6 +101,84 @@ impl Allocator for PersistentAllocator {
     fn deallocate_image_view(&mut self, image_view: vk::ImageView) {
         unsafe {
             self.device.as_ref().destroy_image_view(image_view, None);
+        }
+    }
+
+    fn allocate_buffer(&mut self, info: &BufferInfo) -> Result<Buffer, vk::Result> {
+        let device = unsafe { self.device.as_ref() };
+
+        let create_info = vk::BufferCreateInfo::default()
+            .size(info.size)
+            .usage(info.usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let handle = unsafe { device.create_buffer(&create_info, None) }?;
+
+        let requirements = unsafe { device.get_buffer_memory_requirements(handle) };
+        let allocation = self.memory.borrow_mut().allocate(&AllocationCreateDesc {
+            name: &info.name,
+            requirements,
+            location: info.location,
+            linear: true,
+            allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+        });
+
+        let allocation = match allocation {
+            Ok(allocation) => allocation,
+            Err(err) => {
+                unsafe { device.destroy_buffer(handle, None) };
+                return Err(map_allocation_error(err));
+            },
+        };
+
+        if let Err(err) =
+            unsafe { device.bind_buffer_memory(handle, allocation.memory(), allocation.offset()) }
+        {
+            let _ = self.memory.borrow_mut().free(allocation);
+            unsafe { device.destroy_buffer(handle, None) };
+            return Err(err);
+        }
+
+        let device_address = if info.usage.contains(vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS) {
+            let address_info = vk::BufferDeviceAddressInfo::default().buffer(handle);
+            unsafe { device.get_buffer_device_address(&address_info) }
+        } else {
+            0
+        };
+
+        let mapped = allocation.mapped_ptr().map(NonNull::cast::<u8>);
+        self.allocations.insert(handle, allocation);
+
+        Ok(Buffer::new(handle, info.size, device_address, mapped))
+    }
+
+    fn deallocate_buffer(&mut self, buffer: Buffer) {
+        let Some(allocation) = self.allocations.remove(&buffer.handle()) else {
+            tracing::error!(handle = ?buffer.handle(), "buffer was not allocated by this allocator");
+            return;
+        };
+
+        if let Err(err) = self.memory.borrow_mut().free(allocation) {
+            tracing::error!(%err, "failed to free a buffer allocation");
+        }
+
+        unsafe { self.device.as_ref().destroy_buffer(buffer.handle(), None) };
+    }
+}
+
+impl Drop for PersistentAllocator {
+    fn drop(&mut self) {
+        let device = unsafe { self.device.as_ref() };
+
+        for (handle, allocation) in self.allocations.drain() {
+            if let Err(err) = self.memory.borrow_mut().free(allocation) {
+                tracing::error!(%err, "failed to free a buffer allocation during teardown");
+            }
+
+            unsafe { device.destroy_buffer(handle, None) };
+        }
+
+        if !self.cmd_pool.is_null() {
+            unsafe { device.destroy_command_pool(self.cmd_pool, None) };
         }
     }
 }

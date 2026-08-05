@@ -2,8 +2,8 @@ use std::{ops::Add, ptr::NonNull};
 
 use ash::vk::{self, Handle};
 
-use super::{Allocator, persistent::PersistentAllocator};
-use crate::CommandBuffer;
+use super::{Allocator, MemoryAllocator, persistent::PersistentAllocator};
+use crate::{Buffer, BufferInfo, CommandBuffer};
 
 #[derive(Debug)]
 pub struct FrameAllocator {
@@ -13,6 +13,7 @@ pub struct FrameAllocator {
     cmd_pool: vk::CommandPool,
     semaphores: Vec<vk::Semaphore>,
     image_views: Vec<vk::ImageView>,
+    buffers: Vec<Buffer>,
     cmd_buffers: Vec<vk::CommandBuffer>,
     timeline_waits: Vec<(vk::Semaphore, u64)>,
 }
@@ -26,6 +27,7 @@ impl FrameAllocator {
             cmd_pool: vk::CommandPool::null(),
             semaphores: Vec::default(),
             image_views: Vec::default(),
+            buffers: Vec::default(),
             cmd_buffers: Vec::default(),
             timeline_waits: Vec::default(),
         }
@@ -82,9 +84,43 @@ impl FrameAllocator {
             .for_each(|view| self.upstream.deallocate_image_view(*view));
         self.image_views.clear();
 
+        // safe because `wait_idle` above already blocked until this frame's submits retired
+        for buffer in std::mem::take(&mut self.buffers) {
+            self.upstream.deallocate_buffer(buffer);
+        }
+
         self.issued_frame = issued_frame;
 
         Ok(())
+    }
+}
+
+impl Drop for FrameAllocator {
+    fn drop(&mut self) {
+        // the frame's buffers and views go back to `upstream`, which drops right after this
+        if let Err(err) = self.wait_idle() {
+            tracing::error!(?err, "failed to wait for a frame before tearing it down");
+        }
+
+        if !self.cmd_pool.is_null() {
+            let device = unsafe { self.device.as_ref() };
+            if !self.cmd_buffers.is_empty() {
+                unsafe { device.free_command_buffers(self.cmd_pool, &self.cmd_buffers) };
+            }
+            unsafe { device.destroy_command_pool(self.cmd_pool, None) };
+        }
+
+        self.semaphores
+            .iter()
+            .for_each(|sema| self.upstream.deallocate_semaphore(*sema));
+
+        self.image_views
+            .iter()
+            .for_each(|view| self.upstream.deallocate_image_view(*view));
+
+        for buffer in std::mem::take(&mut self.buffers) {
+            self.upstream.deallocate_buffer(buffer);
+        }
     }
 }
 
@@ -127,6 +163,12 @@ impl Allocator for FrameAllocator {
     }
 
     fn deallocate_image_view(&mut self, _: vk::ImageView) {}
+
+    fn allocate_buffer(&mut self, info: &BufferInfo) -> Result<Buffer, vk::Result> {
+        self.upstream.allocate_buffer(info).inspect(|x| self.buffers.push(*x))
+    }
+
+    fn deallocate_buffer(&mut self, _: Buffer) {}
 }
 
 pub struct SuperFrameAllocator {
@@ -136,9 +178,9 @@ pub struct SuperFrameAllocator {
 }
 
 impl SuperFrameAllocator {
-    pub fn new(device: NonNull<ash::Device>, frames_in_flight: usize) -> Self {
+    pub fn new(device: NonNull<ash::Device>, memory: MemoryAllocator, frames_in_flight: usize) -> Self {
         let frames = (0..frames_in_flight)
-            .map(|_| FrameAllocator::new(device, PersistentAllocator::new(device)))
+            .map(|_| FrameAllocator::new(device, PersistentAllocator::new(device, memory.clone())))
             .collect::<Vec<FrameAllocator>>();
 
         Self {

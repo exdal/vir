@@ -2,7 +2,7 @@ use std::fmt;
 
 use ash::vk;
 
-use crate::{Access, ClearValue, ImageAttachment};
+use crate::{Access, Buffer, ClearValue, ImageAttachment};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ValueId(pub u32);
@@ -21,6 +21,7 @@ pub enum Value {
     Extent2D(vk::Extent2D),
     Extent3D(vk::Extent3D),
     ImageAttachment(ImageAttachment),
+    Buffer(Buffer),
     Slice(Vec<ValueId>),
     Reference(ValueId),
     Access(Access),
@@ -63,6 +64,15 @@ impl FromValue for ImageAttachment {
         match value {
             Value::ImageAttachment(v) => v.clone(),
             _ => panic!("expected ImageAttachment, got {:?}", value),
+        }
+    }
+}
+
+impl FromValue for Buffer {
+    fn from_value(value: &Value) -> Self {
+        match value {
+            Value::Buffer(v) => *v,
+            _ => panic!("expected Buffer, got {:?}", value),
         }
     }
 }

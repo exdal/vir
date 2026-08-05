@@ -107,6 +107,24 @@ impl CommandBuffer {
         }
     }
 
+    pub fn push_constants(
+        &self, layout: vk::PipelineLayout, stage_flags: vk::ShaderStageFlags, offset: u32, data: &[u8],
+    ) {
+        unsafe {
+            self.device
+                .as_ref()
+                .cmd_push_constants(self.handle, layout, stage_flags, offset, data)
+        }
+    }
+
+    pub fn bind_vertex_buffers(&self, first_binding: u32, buffers: &[vk::Buffer], offsets: &[vk::DeviceSize]) {
+        unsafe {
+            self.device
+                .as_ref()
+                .cmd_bind_vertex_buffers(self.handle, first_binding, buffers, offsets)
+        }
+    }
+
     pub fn draw(&self, vertex_count: u32, instance_count: u32, first_vertex: u32, first_instance: u32) {
         unsafe {
             self.device

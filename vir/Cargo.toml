@@ -7,3 +7,4 @@ edition = "2024"
 ash = { workspace = true }
 tracing = { workspace = true }
 bitflags = { workspace = true }
+gpu-allocator = { workspace = true }

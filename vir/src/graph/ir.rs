@@ -2,7 +2,18 @@ use core::fmt;
 
 use ash::vk;
 
-use crate::{Access, ClearValue, DomainFlag, DynamicValues, Image, PipelineId, PipelineState, StateChange, ValueId};
+use crate::{
+    Access,
+    Buffer,
+    ClearValue,
+    DomainFlag,
+    DynamicValues,
+    Image,
+    PipelineId,
+    PipelineState,
+    StateChange,
+    ValueId,
+};
 
 pub type Instr = (ValueId, IR);
 
@@ -39,7 +50,7 @@ pub enum IR {
     },
 
     ConstructBuffer {
-        buffer: vk::Buffer,
+        buffer: Buffer,
         size: ValueId,
     },
     ConstructImage {
@@ -93,6 +104,12 @@ pub enum IR {
     SetState {
         pass: ValueId,
         change: StateChange,
+    },
+    BindVertexBuffers {
+        pass: ValueId,
+        first_binding: u32,
+        buffers: Vec<ValueId>,
+        offsets: Vec<u64>,
     },
     Draw {
         pass: ValueId,
@@ -164,7 +181,9 @@ impl fmt::Display for IR {
                 write!(f, "]")
             },
             IR::Index { array, index } => write!(f, "index {array}[{index}]"),
-            IR::ConstructBuffer { buffer, size } => write!(f, "declare buffer={{mem: {buffer:?}}} size={size}"),
+            IR::ConstructBuffer { buffer, size } => {
+                write!(f, "declare buffer={{mem: {:?}}} size={size}", buffer.handle())
+            },
             IR::ConstructImage {
                 image,
                 image_view,
@@ -225,6 +244,21 @@ impl fmt::Display for IR {
                 pipeline,
                 bind_point,
             } => write!(f, "bind_pipeline {pass} pipeline={pipeline} bind_point={bind_point:?}"),
+            IR::BindVertexBuffers {
+                pass,
+                first_binding,
+                buffers,
+                offsets,
+            } => {
+                write!(f, "bind_vertex_buffers {pass} first={first_binding} buffers=[")?;
+                for (i, id) in buffers.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{id}")?;
+                }
+                write!(f, "] offsets={offsets:?}")
+            },
             IR::SetState { pass, change } => {
                 write!(f, "set_state {pass} ")?;
                 match change {
@@ -240,6 +274,9 @@ impl fmt::Display for IR {
                     StateChange::ColorBlend { index, blend } => match index {
                         Some(index) => write!(f, "color_blend[{index}]={blend:?}"),
                         None => write!(f, "color_blend[*]={blend:?}"),
+                    },
+                    StateChange::PushConstants { offset, data } => {
+                        write!(f, "push_constants[{}..{}]", offset, offset + data.len() as u32)
                     },
                 }
             },
@@ -279,8 +316,14 @@ impl fmt::Display for IR {
                     false => write!(f, " viewports={:?}", state.viewports)?,
                 }
                 match state.scissors.is_empty() {
-                    true => write!(f, " scissors=dynamic{:?}", dynamic.scissors),
-                    false => write!(f, " scissors={:?}", state.scissors),
+                    true => write!(f, " scissors=dynamic{:?}", dynamic.scissors)?,
+                    false => write!(f, " scissors={:?}", state.scissors)?,
+                }
+
+                let push = &dynamic.push_constants;
+                match push.is_empty() {
+                    true => Ok(()),
+                    false => write!(f, " push_constants=[{}..{}]", push.offset, push.end()),
                 }
             },
             IR::EndRendering { pass } => write!(f, "end_rendering {pass}"),

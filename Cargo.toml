@@ -10,6 +10,6 @@ ash = "0.38.0"
 winit = "0.30.12"
 tracing = "0.1.41"
 tracing-subscriber = "0.3.19"
-gpu-allocator = "0.28.0"
+gpu-allocator = { version = "0.28.0", default-features = false, features = ["std", "vulkan"] }
 bitflags = "2.10.0"
 shader-slang = "0.1.0"

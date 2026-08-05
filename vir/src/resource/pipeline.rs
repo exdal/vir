@@ -10,6 +10,7 @@ pub use state::{
     DynamicValues,
     PassState,
     PipelineState,
+    PushConstants,
     RasterizationState,
     Rect2D,
     RenderingState,
@@ -27,6 +28,52 @@ impl std::fmt::Display for PipelineId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "#{}", self.0) }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VertexAttribute {
+    pub location: u32,
+    pub format: vk::Format,
+    pub offset: u32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct VertexLayout {
+    pub stride: u32,
+    pub attributes: Vec<VertexAttribute>,
+}
+
+impl VertexLayout {
+    pub fn interleaved(reflections: &[Reflection]) -> Self {
+        let Some(vertex) = reflections
+            .iter()
+            .find(|reflection| reflection.stage == vk::ShaderStageFlags::VERTEX)
+        else {
+            return Self::default();
+        };
+
+        let mut offset = 0;
+        let attributes = vertex
+            .vertex_inputs
+            .iter()
+            .map(|input| {
+                let attribute = VertexAttribute {
+                    location: input.location,
+                    format: input.format,
+                    offset,
+                };
+                offset += input.size;
+                attribute
+            })
+            .collect();
+
+        Self {
+            stride: offset,
+            attributes,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool { self.attributes.is_empty() }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct GraphicsPipelineInfo {
     pub shaders: Vec<Vec<u32>>,
@@ -41,13 +88,47 @@ impl GraphicsPipelineInfo {
     }
 }
 
+pub fn push_constant_ranges(reflections: &[Reflection]) -> Vec<vk::PushConstantRange> {
+    let mut merged: BTreeMap<(u32, u32), vk::ShaderStageFlags> = BTreeMap::new();
+
+    for reflection in reflections {
+        if reflection.push_constant_size == 0 {
+            continue;
+        }
+
+        *merged
+            .entry((reflection.push_constant_offset, reflection.push_constant_size))
+            .or_insert(vk::ShaderStageFlags::empty()) |= reflection.stage;
+    }
+
+    merged
+        .into_iter()
+        .map(|((offset, size), stages)| {
+            vk::PushConstantRange::default()
+                .stage_flags(stages)
+                .offset(offset)
+                .size(size)
+        })
+        .collect()
+}
+
 #[derive(Debug, Default)]
 pub struct PipelineLayout {
     pub handle: vk::PipelineLayout,
     pub set_layouts: Vec<vk::DescriptorSetLayout>,
+    pub push_constant_ranges: Vec<vk::PushConstantRange>,
 }
 
 impl PipelineLayout {
+    pub fn cover(&self, offset: u32, size: u32) -> impl Iterator<Item = (vk::ShaderStageFlags, u32, u32)> + '_ {
+        let end = offset.saturating_add(size);
+        self.push_constant_ranges.iter().filter_map(move |range| {
+            let start = range.offset.max(offset);
+            let stop = (range.offset + range.size).min(end);
+            (stop > start).then(|| (range.stage_flags, start, stop - start))
+        })
+    }
+
     pub(crate) fn create(
         device: &ash::Device, reflections: &[Reflection], max_variable_descriptor_count: u32,
     ) -> Result<Self, vk::Result> {
@@ -59,15 +140,8 @@ impl PipelineLayout {
         }
 
         let mut merged: BTreeMap<(u32, u32), Merged> = BTreeMap::new();
-        let mut push_constant_size = 0;
-        let mut push_constant_stages = vk::ShaderStageFlags::empty();
 
         for reflection in reflections {
-            if reflection.push_constant_size > 0 {
-                push_constant_size = push_constant_size.max(reflection.push_constant_size);
-                push_constant_stages |= reflection.stage;
-            }
-
             for binding in &reflection.bindings {
                 match merged.entry((binding.set, binding.binding)) {
                     std::collections::btree_map::Entry::Occupied(mut entry) => {
@@ -150,12 +224,7 @@ impl PipelineLayout {
             }
         }
 
-        let push_constant_ranges = Vec::from_iter((push_constant_size > 0).then(|| {
-            vk::PushConstantRange::default()
-                .stage_flags(push_constant_stages)
-                .offset(0)
-                .size(push_constant_size)
-        }));
+        let push_constant_ranges = push_constant_ranges(reflections);
 
         let create_info = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(&set_layouts)
@@ -171,7 +240,11 @@ impl PipelineLayout {
             },
         };
 
-        Ok(Self { handle, set_layouts })
+        Ok(Self {
+            handle,
+            set_layouts,
+            push_constant_ranges,
+        })
     }
 
     pub(crate) fn destroy(&self, device: &ash::Device) {
@@ -187,6 +260,7 @@ impl PipelineLayout {
 pub(crate) struct PipelineRequest<'a> {
     pub info: &'a GraphicsPipelineInfo,
     pub reflections: &'a [Reflection],
+    pub vertex: &'a VertexLayout,
     pub state: &'a PipelineState,
     pub layout: vk::PipelineLayout,
 }
@@ -273,7 +347,46 @@ pub(crate) fn create_pipelines(
         .map(|request| request.state.dynamic_states())
         .collect::<Vec<_>>();
 
-    let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
+    let vertex_bindings = requests
+        .iter()
+        .map(|request| {
+            Vec::from_iter((!request.vertex.is_empty()).then(|| {
+                vk::VertexInputBindingDescription::default()
+                    .binding(0)
+                    .stride(request.vertex.stride)
+                    .input_rate(vk::VertexInputRate::VERTEX)
+            }))
+        })
+        .collect::<Vec<_>>();
+
+    let vertex_attributes = requests
+        .iter()
+        .map(|request| {
+            request
+                .vertex
+                .attributes
+                .iter()
+                .map(|attribute| {
+                    vk::VertexInputAttributeDescription::default()
+                        .binding(0)
+                        .location(attribute.location)
+                        .format(attribute.format)
+                        .offset(attribute.offset)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    let vertex_input = vertex_bindings
+        .iter()
+        .zip(&vertex_attributes)
+        .map(|(bindings, attributes)| {
+            vk::PipelineVertexInputStateCreateInfo::default()
+                .vertex_binding_descriptions(bindings)
+                .vertex_attribute_descriptions(attributes)
+        })
+        .collect::<Vec<_>>();
+
     let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default();
 
     let viewport = requests
@@ -333,7 +446,7 @@ pub(crate) fn create_pipelines(
         .map(|(index, rendering)| {
             vk::GraphicsPipelineCreateInfo::default()
                 .stages(&stages[index])
-                .vertex_input_state(&vertex_input)
+                .vertex_input_state(&vertex_input[index])
                 .input_assembly_state(&input_assembly[index])
                 .viewport_state(&viewport[index])
                 .rasterization_state(&rasterization[index])
@@ -355,4 +468,146 @@ pub(crate) fn create_pipelines(
         }
         err
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::CString;
+
+    use super::*;
+    use crate::resource::shader::VertexInput;
+
+    fn reflection(stage: vk::ShaderStageFlags, vertex_inputs: Vec<VertexInput>) -> Reflection {
+        Reflection {
+            stage,
+            entry_point: CString::new("main").unwrap(),
+            bindings: Vec::new(),
+            push_constant_offset: 0,
+            push_constant_size: 0,
+            vertex_inputs,
+        }
+    }
+
+    fn with_push_constants(stage: vk::ShaderStageFlags, offset: u32, size: u32) -> Reflection {
+        Reflection {
+            push_constant_offset: offset,
+            push_constant_size: size,
+            ..reflection(stage, Vec::new())
+        }
+    }
+
+    fn layout(ranges: Vec<vk::PushConstantRange>) -> PipelineLayout {
+        PipelineLayout {
+            push_constant_ranges: ranges,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn packs_vertex_inputs_into_one_tightly_interleaved_binding() {
+        let reflections = [
+            reflection(vk::ShaderStageFlags::VERTEX, vec![
+                VertexInput {
+                    location: 0,
+                    format: vk::Format::R32G32_SFLOAT,
+                    size: 8,
+                },
+                VertexInput {
+                    location: 1,
+                    format: vk::Format::R32G32B32_SFLOAT,
+                    size: 12,
+                },
+            ]),
+            reflection(vk::ShaderStageFlags::FRAGMENT, Vec::new()),
+        ];
+
+        let layout = VertexLayout::interleaved(&reflections);
+        assert_eq!(layout.stride, 20);
+        assert_eq!(layout.attributes, vec![
+            VertexAttribute {
+                location: 0,
+                format: vk::Format::R32G32_SFLOAT,
+                offset: 0,
+            },
+            VertexAttribute {
+                location: 1,
+                format: vk::Format::R32G32B32_SFLOAT,
+                offset: 8,
+            },
+        ]);
+    }
+
+    #[test]
+    fn a_shader_with_no_vertex_inputs_yields_an_empty_layout() {
+        let reflections = [reflection(vk::ShaderStageFlags::VERTEX, Vec::new())];
+        assert_eq!(VertexLayout::interleaved(&reflections), VertexLayout::default());
+    }
+
+    #[test]
+    fn stages_that_read_the_same_block_share_one_range() {
+        let ranges = push_constant_ranges(&[
+            with_push_constants(vk::ShaderStageFlags::VERTEX, 0, 16),
+            with_push_constants(vk::ShaderStageFlags::FRAGMENT, 0, 16),
+        ]);
+
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].offset, 0);
+        assert_eq!(ranges[0].size, 16);
+        assert_eq!(
+            ranges[0].stage_flags,
+            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT
+        );
+    }
+
+    #[test]
+    fn stages_that_disagree_get_a_range_each() {
+        let ranges = push_constant_ranges(&[
+            with_push_constants(vk::ShaderStageFlags::VERTEX, 0, 16),
+            with_push_constants(vk::ShaderStageFlags::FRAGMENT, 16, 8),
+        ]);
+
+        assert_eq!(
+            ranges
+                .iter()
+                .map(|range| (range.stage_flags, range.offset, range.size))
+                .collect::<Vec<_>>(),
+            vec![
+                (vk::ShaderStageFlags::VERTEX, 0, 16),
+                (vk::ShaderStageFlags::FRAGMENT, 16, 8),
+            ]
+        );
+    }
+
+    #[test]
+    fn stages_without_push_constants_contribute_no_range() {
+        let ranges = push_constant_ranges(&[
+            reflection(vk::ShaderStageFlags::VERTEX, Vec::new()),
+            reflection(vk::ShaderStageFlags::FRAGMENT, Vec::new()),
+        ]);
+        assert!(ranges.is_empty());
+    }
+
+    #[test]
+    fn a_push_is_clipped_to_the_ranges_that_cover_it() {
+        let layout = layout(push_constant_ranges(&[
+            with_push_constants(vk::ShaderStageFlags::VERTEX, 0, 16),
+            with_push_constants(vk::ShaderStageFlags::FRAGMENT, 16, 16),
+        ]));
+
+        // a push spanning both ranges is split at the boundary
+        assert_eq!(layout.cover(0, 32).collect::<Vec<_>>(), vec![
+            (vk::ShaderStageFlags::VERTEX, 0, 16),
+            (vk::ShaderStageFlags::FRAGMENT, 16, 16),
+        ]);
+
+        // one that lands inside a single range keeps its own bounds
+        assert_eq!(layout.cover(20, 4).collect::<Vec<_>>(), vec![(
+            vk::ShaderStageFlags::FRAGMENT,
+            20,
+            4
+        )]);
+
+        // and one that lands past every range covers nothing
+        assert_eq!(layout.cover(64, 4).count(), 0);
+    }
 }

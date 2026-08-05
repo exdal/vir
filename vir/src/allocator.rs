@@ -1,3 +1,5 @@
+use std::{cell::RefCell, rc::Rc};
+
 use ash::vk;
 
 pub mod frame;
@@ -7,7 +9,20 @@ pub use self::{
     frame::{FrameAllocator, SuperFrameAllocator},
     persistent::PersistentAllocator,
 };
-use crate::CommandBuffer;
+use crate::{Buffer, BufferInfo, CommandBuffer};
+
+pub type MemoryAllocator = Rc<RefCell<gpu_allocator::vulkan::Allocator>>;
+
+pub(crate) fn map_allocation_error(err: gpu_allocator::AllocationError) -> vk::Result {
+    use gpu_allocator::AllocationError;
+
+    tracing::error!(%err, "gpu memory allocation failed");
+    match err {
+        AllocationError::OutOfMemory => vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+        AllocationError::FailedToMap(_) => vk::Result::ERROR_MEMORY_MAP_FAILED,
+        _ => vk::Result::ERROR_INITIALIZATION_FAILED,
+    }
+}
 
 pub trait Allocator: std::fmt::Debug {
     fn allocate_binary_semaphore(&mut self) -> Result<vk::Semaphore, vk::Result>;
@@ -19,6 +34,8 @@ pub trait Allocator: std::fmt::Debug {
         subresource_range: vk::ImageSubresourceRange,
     ) -> Result<vk::ImageView, vk::Result>;
     fn deallocate_image_view(&mut self, image_view: vk::ImageView);
+    fn allocate_buffer(&mut self, info: &BufferInfo) -> Result<Buffer, vk::Result>;
+    fn deallocate_buffer(&mut self, buffer: Buffer);
 }
 
 pub enum AllocatorKind<'a> {
@@ -69,6 +86,20 @@ impl<'a> AllocatorKind<'a> {
         match self {
             AllocatorKind::Persistent(a) => a.deallocate_image_view(image_view),
             AllocatorKind::Frame(a) => a.deallocate_image_view(image_view),
+        }
+    }
+
+    pub fn allocate_buffer(&mut self, info: &BufferInfo) -> Result<Buffer, vk::Result> {
+        match self {
+            AllocatorKind::Persistent(a) => a.allocate_buffer(info),
+            AllocatorKind::Frame(a) => a.allocate_buffer(info),
+        }
+    }
+
+    pub fn deallocate_buffer(&mut self, buffer: Buffer) {
+        match self {
+            AllocatorKind::Persistent(a) => a.deallocate_buffer(buffer),
+            AllocatorKind::Frame(a) => a.deallocate_buffer(buffer),
         }
     }
 

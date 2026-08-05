@@ -16,16 +16,20 @@ pub use context::{Access, CommandBuffer, Context, DomainFlag};
 pub use graph::{IR, ImageAttachment, Module, PassCallback, RenderGraph, RenderPass, Value, ValueId};
 pub use resource::{
     BlendPreset,
+    Buffer,
+    BufferInfo,
     ColorBlendAttachmentState,
     DescriptorBinding,
     DynamicStateFlags,
     DynamicValues,
     GraphicsPipelineInfo,
     Image,
+    MemoryLocation,
     PassState,
     PipelineId,
     PipelineLayout,
     PipelineState,
+    PushConstants,
     RasterizationState,
     Rect2D,
     Reflection,
@@ -33,6 +37,8 @@ pub use resource::{
     ResolvedViewport,
     StateChange,
     SwapChain,
+    VertexAttribute,
+    VertexLayout,
     Viewport,
 };
 

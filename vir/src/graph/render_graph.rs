@@ -1,10 +1,14 @@
-use std::{collections::HashMap, ptr::NonNull};
+use std::{
+    collections::{HashMap, HashSet},
+    ptr::NonNull,
+};
 
 use ash::vk::{self, Handle};
 
 use crate::{
     Access,
     AllocatorKind,
+    Buffer,
     ClearValue,
     CommandBuffer,
     Context,
@@ -15,9 +19,11 @@ use crate::{
     PipelineId,
     PipelineLayout,
     PipelineState,
+    PushConstants,
     ResolvedViewport,
     Value,
     ValueId,
+    VertexLayout,
     core::ScopedStack,
     graph::{ir, value::FromValue},
     resource::{
@@ -114,6 +120,7 @@ impl PresentInfo {
 struct DeclaredPipeline {
     info: GraphicsPipelineInfo,
     reflections: Vec<Reflection>,
+    vertex: VertexLayout,
     layout: Option<PipelineLayout>,
     variants: HashMap<PipelineState, vk::Pipeline>,
 }
@@ -124,11 +131,13 @@ pub struct RenderGraph {
     device: NonNull<ash::Device>,
     pipelines: Vec<DeclaredPipeline>,
     variable_descriptor_count: u32,
+    warned_push_constants: HashSet<PipelineId>,
     values: Vec<Value>,
     bound_pipeline: Option<vk::Pipeline>,
     render_area: vk::Rect2D,
     recorded_viewports: Vec<ResolvedViewport>,
     recorded_scissors: Vec<vk::Rect2D>,
+    recorded_push_constants: Option<(vk::PipelineLayout, PushConstants)>,
     current_batch: Option<Batch>,
     current_submit: Submit,
     submits: Vec<Submit>,
@@ -142,11 +151,13 @@ impl RenderGraph {
             device: NonNull::from(ctx.device()),
             pipelines: Vec::new(),
             variable_descriptor_count: DEFAULT_VARIABLE_DESCRIPTOR_COUNT,
+            warned_push_constants: HashSet::new(),
             values: Vec::new(),
             bound_pipeline: None,
             render_area: vk::Rect2D::default(),
             recorded_viewports: Vec::new(),
             recorded_scissors: Vec::new(),
+            recorded_push_constants: None,
             current_batch: None,
             current_submit: Submit::default(),
             submits: Vec::new(),
@@ -172,10 +183,13 @@ impl RenderGraph {
             .map(|spirv| shader::reflect(spirv))
             .collect::<Result<Vec<_>, _>>()?;
 
+        let vertex = VertexLayout::interleaved(&reflections);
+
         let id = PipelineId(self.pipelines.len() as u32);
         self.pipelines.push(DeclaredPipeline {
             info,
             reflections,
+            vertex,
             layout: None,
             variants: HashMap::new(),
         });
@@ -237,6 +251,7 @@ impl RenderGraph {
                 PipelineRequest {
                     info: &declared.info,
                     reflections: &declared.reflections,
+                    vertex: &declared.vertex,
                     state,
                     layout: declared
                         .layout
@@ -266,6 +281,7 @@ impl RenderGraph {
         self.render_area = vk::Rect2D::default();
         self.recorded_viewports.clear();
         self.recorded_scissors.clear();
+        self.recorded_push_constants = None;
         self.current_batch = None;
         self.current_submit = Submit::default();
         self.submits.clear();
@@ -312,6 +328,7 @@ impl RenderGraph {
         self.bound_pipeline = None;
         self.recorded_viewports.clear();
         self.recorded_scissors.clear();
+        self.recorded_push_constants = None;
         Ok(())
     }
 
@@ -402,6 +419,48 @@ impl RenderGraph {
         Ok(())
     }
 
+    fn record_push_constants(&mut self, pipeline: PipelineId, push: &PushConstants) -> Result<(), vk::Result> {
+        if push.is_empty() {
+            return Ok(());
+        }
+
+        let cmd_buf = self.batch()?.clone();
+        let layout = self
+            .pipelines
+            .get(pipeline.0 as usize)
+            .and_then(|declared| declared.layout.as_ref())
+            .ok_or(vk::Result::ERROR_UNKNOWN)?;
+
+        let unchanged = self
+            .recorded_push_constants
+            .as_ref()
+            .is_some_and(|(handle, recorded)| *handle == layout.handle && recorded == push);
+        if unchanged {
+            return Ok(());
+        }
+
+        let mut covered = 0;
+        for (stages, offset, size) in layout.cover(push.offset, push.size()) {
+            let head = (offset - push.offset) as usize;
+            cmd_buf.push_constants(layout.handle, stages, offset, &push.data[head..head + size as usize]);
+            covered += size;
+        }
+
+        let handle = layout.handle;
+        if covered < push.size() && self.warned_push_constants.insert(pipeline) {
+            tracing::warn!(
+                %pipeline,
+                offset = push.offset,
+                size = push.size(),
+                covered,
+                "pushed bytes the pipeline's shaders do not declare; they are dropped"
+            );
+        }
+
+        self.recorded_push_constants = Some((handle, push.clone()));
+        Ok(())
+    }
+
     pub fn dump(instructions: &[ir::Instr]) {
         instructions.iter().for_each(|(id, node)| {
             println!("%{} = {}", id.0, node);
@@ -428,7 +487,9 @@ impl RenderGraph {
                 let element = *elements.get(index).ok_or(vk::Result::ERROR_UNKNOWN)?;
                 self.set_value(value_id, Value::Reference(element));
             },
-            IR::ConstructBuffer { .. } => todo!(),
+            IR::ConstructBuffer { buffer, size: _ } => {
+                self.set_value(value_id, Value::Buffer(*buffer));
+            },
             IR::ConstructImage {
                 image,
                 image_view,
@@ -571,6 +632,21 @@ impl RenderGraph {
             IR::BindPipeline { pass, .. } | IR::SetState { pass, .. } => {
                 self.set_value(value_id, Value::Reference(*pass));
             },
+            IR::BindVertexBuffers {
+                pass,
+                first_binding,
+                buffers,
+                offsets,
+            } => {
+                self.set_value(value_id, Value::Reference(*pass));
+                self.ensure_batch(ctx, allocator)?;
+
+                let handles = buffers
+                    .iter()
+                    .map(|id| self.get::<Buffer>(id).handle())
+                    .collect::<Vec<_>>();
+                self.batch()?.bind_vertex_buffers(*first_binding, &handles, offsets);
+            },
             IR::Draw {
                 pass,
                 vertex_count,
@@ -609,6 +685,8 @@ impl RenderGraph {
                     self.batch()?.set_scissor(0, &scissors);
                     self.recorded_scissors = scissors;
                 }
+
+                self.record_push_constants(pipeline, &dynamic.push_constants)?;
 
                 let vertex_count = self.get::<u32>(vertex_count);
                 let instance_count = self.get::<u32>(instance_count);

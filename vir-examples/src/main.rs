@@ -7,6 +7,8 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, Raw
 use vir::{
     AllocatorKind,
     BlendPreset,
+    Buffer,
+    BufferInfo,
     ClearValue,
     Context,
     DynamicStateFlags,
@@ -20,6 +22,7 @@ use vir::{
     RenderGraph,
     SuperFrameAllocator,
     SwapChain,
+    allocator::Allocator,
 };
 pub use winit;
 use winit::{
@@ -102,17 +105,72 @@ fn create_surface(
 
 const TRIANGLE_VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/triangle.vert.spv"));
 const TRIANGLE_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/triangle.frag.spv"));
+const TRIANGLE_BUFFER_VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/triangle_buffer.vert.spv"));
+
+/// One vertex as `vs_buffer` reads it: `float2 position` then `float3 color`, which is exactly
+/// what reflection packs into binding 0.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Vertex {
+    position: [f32; 2],
+    color: [f32; 3],
+}
+
+/// The block `triangle.slang` declares, laid out to match it member for member.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct PushConstants {
+    offset: [f32; 2],
+    scale: f32,
+    tint: f32,
+}
+
+/// Where `tint` sits in the block, for the draws that push nothing else.
+const TINT_OFFSET: u32 = 12;
+
+const STATIC_TRIANGLE: [Vertex; 3] = [
+    Vertex {
+        position: [-0.9, -0.1],
+        color: [1.0, 1.0, 0.0],
+    },
+    Vertex {
+        position: [-0.5, -0.9],
+        color: [0.0, 1.0, 1.0],
+    },
+    Vertex {
+        position: [-0.1, -0.1],
+        color: [1.0, 0.0, 1.0],
+    },
+];
+
+/// The same triangle on the other side, spun by `angle`, rebuilt every frame.
+fn spinning_triangle(angle: f32) -> [Vertex; 3] {
+    let (sin, cos) = angle.sin_cos();
+    let colors = [[1.0, 0.3, 0.3], [0.3, 1.0, 0.3], [0.3, 0.3, 1.0]];
+
+    std::array::from_fn(|index| {
+        let corner = std::f32::consts::TAU * index as f32 / 3.0;
+        let (x, y) = (0.3 * corner.cos(), 0.3 * corner.sin());
+        Vertex {
+            position: [0.5 + x * cos - y * sin, 0.5 + x * sin + y * cos],
+            color: colors[index],
+        }
+    })
+}
 
 struct App {
     ash_entry: ash::Entry,
     window: Window,
     surface: vk::SurfaceKHR,
     swapchain: Option<SwapChain>,
-    ctx: Context,
+    // everything below borrows the device and the memory allocator from ctx, so it has to drop first
     graph: RenderGraph,
     super_frame_allocator: Option<SuperFrameAllocator>,
     persistent_allocator: PersistentAllocator,
+    ctx: Context,
     triangle_pipeline: PipelineId,
+    vertex_pipeline: PipelineId,
+    static_vertices: Buffer,
     dumped_ir: bool,
     start_time: Instant,
 }
@@ -146,7 +204,7 @@ struct AppWrapper {
 impl App {
     fn new(
         window: Window, surface: vk::SurfaceKHR, ash_entry: ash::Entry, ctx: Context,
-        persistent_allocator: PersistentAllocator,
+        mut persistent_allocator: PersistentAllocator,
     ) -> Result<Self, vk::Result> {
         let mut graph = RenderGraph::new(&ctx);
 
@@ -156,16 +214,28 @@ impl App {
                 .with_shader(&read_spirv(TRIANGLE_FRAG_SPV)),
         )?;
 
+        let vertex_pipeline = graph.declare_pipeline(
+            GraphicsPipelineInfo::new()
+                .with_shader(&read_spirv(TRIANGLE_BUFFER_VERT_SPV))
+                .with_shader(&read_spirv(TRIANGLE_FRAG_SPV)),
+        )?;
+
+        let mut static_vertices = persistent_allocator
+            .allocate_buffer(&BufferInfo::vertex(size_of_val(&STATIC_TRIANGLE) as u64).with_name("static triangle"))?;
+        static_vertices.write(0, &STATIC_TRIANGLE)?;
+
         Ok(Self {
             window,
             ash_entry,
             surface,
             swapchain: None,
-            ctx,
             graph,
             super_frame_allocator: None,
             persistent_allocator,
+            ctx,
             triangle_pipeline,
+            vertex_pipeline,
+            static_vertices,
             dumped_ir: false,
             start_time: Instant::now(),
         })
@@ -216,8 +286,6 @@ impl App {
             .variable_pointers(true)
             .variable_pointers_storage_buffer(true)
             .shader_draw_parameters(true);
-        // Needed for the wireframe permutation in `run`; VK_POLYGON_MODE_FILL is the only
-        // polygon mode guaranteed without it.
         let vk10_features = vk::PhysicalDeviceFeatures::default().fill_mode_non_solid(true);
         let features = vk::PhysicalDeviceFeatures2::default()
             .features(vk10_features)
@@ -229,7 +297,7 @@ impl App {
             .set_features(features)
             .build(&instance, &physical_device)?;
 
-        let mut ctx = Context::new(device, physical_device.handle, instance, &ash_entry);
+        let mut ctx = Context::new(device, physical_device.handle, instance, &ash_entry)?;
         let graphics_queue_index = physical_device
             .get_queue_index(vk::QueueFlags::GRAPHICS)
             .expect("No graphics queue");
@@ -310,12 +378,27 @@ impl App {
             .as_mut()
             .expect("swapchain must be created before rendering")
             .get_next_frame()?;
+
+        let elapsed = self.start_time.elapsed().as_secs_f32();
+        let spinning = spinning_triangle(elapsed);
+        let mut spinning_vertices = next_frame
+            .allocate_buffer(&BufferInfo::vertex(size_of_val(&spinning) as u64).with_name("spinning triangle"))?;
+        spinning_vertices.write(0, &spinning)?;
+
         let mut frame_allocator = AllocatorKind::Frame(next_frame);
 
         let mut module = vir::Module::default();
         let attachment = module.acquire_next_image(swapchain);
-        let hue = self.start_time.elapsed().as_secs_f32() * 0.2;
-        let attachment = module.clear(attachment, rainbow(hue));
+        let attachment = module.clear(attachment, rainbow(elapsed * 0.2));
+
+        let static_vertices = module.import_buffer(&self.static_vertices);
+        let spinning_vertices = module.import_buffer(&spinning_vertices);
+
+        let sliding = PushConstants {
+            offset: [0.25 * elapsed.sin(), 0.0],
+            scale: 1.0,
+            tint: 0.0,
+        };
 
         let attachment = module
             .begin_rendering(&[attachment])
@@ -327,6 +410,7 @@ impl App {
                 cull_mode: vk::CullModeFlags::NONE,
                 ..Default::default()
             })
+            .push_constants(&sliding)
             .draw(3, 1)
             .end_rendering();
 
@@ -337,6 +421,28 @@ impl App {
             .set_viewport(0, Rect2D::relative(0.5, 0.5, 0.5, 0.5))
             .set_scissor(0, Rect2D::relative(0.5, 0.5, 0.5, 0.5))
             .broadcast_color_blend(BlendPreset::AlphaBlend)
+            .push_constants(&PushConstants {
+                scale: 0.5 + 0.5 * elapsed.cos(),
+                ..sliding
+            })
+            .draw(3, 1)
+            .end_rendering();
+
+        let attachment = module
+            .begin_rendering(&[attachment])
+            .bind_graphics_pipeline(self.vertex_pipeline)
+            .set_viewport(0, Rect2D::framebuffer())
+            .set_scissor(0, Rect2D::framebuffer())
+            .broadcast_color_blend(BlendPreset::Off)
+            .set_rasterization(RasterizationState {
+                cull_mode: vk::CullModeFlags::NONE,
+                ..Default::default()
+            })
+            .push_constants_at(TINT_OFFSET, &0.0f32)
+            .bind_vertex_buffer(0, static_vertices)
+            .draw(3, 1)
+            .push_constants_at(TINT_OFFSET, &(0.5 + 0.5 * elapsed.sin()))
+            .bind_vertex_buffer(0, spinning_vertices)
             .draw(3, 1)
             .end_rendering();
 
@@ -373,7 +479,10 @@ impl ApplicationHandler for AppWrapper {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
-        let app = self.app.as_mut().unwrap();
+        let Some(app) = self.app.as_mut() else {
+            return;
+        };
+
         match event {
             WindowEvent::Resized(_) => {
                 app.recreate_swapchain()
@@ -392,6 +501,11 @@ impl ApplicationHandler for AppWrapper {
             },
             _ => {},
         }
+    }
+
+    fn exiting(&mut self, _: &ActiveEventLoop) {
+        // drops the graph, which waits for the device and tears down its pipelines
+        self.app = None;
     }
 }
 
@@ -425,4 +539,83 @@ fn main() -> Result<(), Box<dyn Error>> {
     let _ = event_loop.run_app(&mut app_wrapper);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use vir::{
+        VertexAttribute,
+        VertexLayout,
+        resource::{pipeline::push_constant_ranges, shader},
+    };
+
+    use super::*;
+
+    /// The whole chain: Slang emits POSITION/COLOR as locations, reflection reads them back, and
+    /// the layout that comes out has to match the `Vertex` struct the example uploads.
+    #[test]
+    fn the_reflected_vertex_layout_matches_the_uploaded_vertex() {
+        let reflections = [
+            shader::reflect(&read_spirv(TRIANGLE_BUFFER_VERT_SPV)).expect("vertex shader should reflect"),
+            shader::reflect(&read_spirv(TRIANGLE_FRAG_SPV)).expect("fragment shader should reflect"),
+        ];
+
+        let layout = VertexLayout::interleaved(&reflections);
+        assert_eq!(layout.stride as usize, size_of::<Vertex>());
+        assert_eq!(
+            layout.attributes,
+            vec![
+                VertexAttribute {
+                    location: 0,
+                    format: vk::Format::R32G32_SFLOAT,
+                    offset: 0,
+                },
+                VertexAttribute {
+                    location: 1,
+                    format: vk::Format::R32G32B32_SFLOAT,
+                    offset: 8,
+                },
+            ]
+        );
+    }
+
+    /// The SV_VertexID triangle must keep compiling to a pipeline with no vertex input at all.
+    #[test]
+    fn the_vertex_id_shader_reflects_no_attributes() {
+        let reflections = [shader::reflect(&read_spirv(TRIANGLE_VERT_SPV)).expect("vertex shader should reflect")];
+        assert_eq!(VertexLayout::interleaved(&reflections), VertexLayout::default());
+    }
+
+    /// What `push_constants` sends has to be the block Slang laid out, or the shader reads
+    /// whatever the neighbouring member happened to be.
+    #[test]
+    fn the_reflected_push_constant_block_matches_the_pushed_struct() {
+        for spirv in [TRIANGLE_VERT_SPV, TRIANGLE_FRAG_SPV] {
+            let reflection = shader::reflect(&read_spirv(spirv)).expect("shader should reflect");
+            assert_eq!(reflection.push_constant_offset, 0);
+            assert_eq!(reflection.push_constant_size as usize, size_of::<PushConstants>());
+        }
+
+        // TINT_OFFSET has to name the last member, since the geometry draws push it alone
+        assert_eq!(TINT_OFFSET as usize, size_of::<PushConstants>() - size_of::<f32>());
+    }
+
+    /// `vs_buffer` ignores the block, so its pipeline gets a fragment-only range over it while
+    /// the SV_VertexID pipeline gets one range both stages share.
+    #[test]
+    fn a_stage_that_ignores_the_block_stays_out_of_its_range() {
+        let reflect = |spirv| shader::reflect(&read_spirv(spirv)).expect("shader should reflect");
+
+        let shared = push_constant_ranges(&[reflect(TRIANGLE_VERT_SPV), reflect(TRIANGLE_FRAG_SPV)]);
+        assert_eq!(shared.len(), 1);
+        assert_eq!(
+            shared[0].stage_flags,
+            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT
+        );
+        assert_eq!(shared[0].size as usize, size_of::<PushConstants>());
+
+        let fragment_only = push_constant_ranges(&[reflect(TRIANGLE_BUFFER_VERT_SPV), reflect(TRIANGLE_FRAG_SPV)]);
+        assert_eq!(fragment_only.len(), 1);
+        assert_eq!(fragment_only[0].stage_flags, vk::ShaderStageFlags::FRAGMENT);
+    }
 }

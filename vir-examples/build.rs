@@ -1,15 +1,13 @@
-//! Compiles the example's Slang shaders to SPIR-V at build time.
-//!
-//! Slang lives here rather than in `vir` on purpose: the library only ever consumes SPIR-V,
-//! so choosing a shading language stays the application's decision.
-
 use std::{env, error::Error, path::PathBuf};
 
 use shader_slang as slang;
 use slang::Downcast;
 
-/// Entry points to pull out of `triangle.slang`, in the order they are emitted.
-const ENTRY_POINTS: [(&str, &str); 2] = [("vs_main", "triangle.vert.spv"), ("fs_main", "triangle.frag.spv")];
+const ENTRY_POINTS: [(&str, &str); 3] = [
+    ("vs_main", "triangle.vert.spv"),
+    ("fs_main", "triangle.frag.spv"),
+    ("vs_buffer", "triangle_buffer.vert.spv"),
+];
 
 fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed=shaders/triangle.slang");

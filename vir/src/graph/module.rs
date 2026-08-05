@@ -4,6 +4,7 @@ use ash::vk;
 
 use crate::{
     Access,
+    Buffer,
     ClearValue,
     ColorBlendAttachmentState,
     DomainFlag,
@@ -113,6 +114,12 @@ impl Module {
         });
 
         (ty_instr, construct_instr)
+    }
+
+    pub fn import_buffer(&mut self, buffer: &Buffer) -> ValueId {
+        self.lower_type(ir::Type::Buffer);
+        let size = self.lower_u32(buffer.size() as u32);
+        self.emit(IR::ConstructBuffer { buffer: *buffer, size })
     }
 
     pub fn acquire_next_image(&mut self, swapchain: &SwapChain) -> ValueId {
@@ -250,6 +257,10 @@ impl Module {
                     IR::BindPipeline { pass, .. } | IR::SetState { pass, .. } => {
                         stack.push(*pass);
                     },
+                    IR::BindVertexBuffers { pass, buffers, .. } => {
+                        buffers.iter().rev().for_each(|v| stack.push(*v));
+                        stack.push(*pass);
+                    },
                     IR::Draw {
                         pass,
                         vertex_count,
@@ -294,7 +305,29 @@ impl Module {
     fn sync(&self, nodes: Vec<ir::Instr>) -> Vec<ir::Instr> {
         let mut result = Vec::with_capacity(nodes.len() * 2);
         let mut states: HashMap<ValueId, ResourceState> = HashMap::new();
+        let mut buffer_states: HashMap<ValueId, ValueId> = HashMap::new();
         let mut next_id = self.instructions.len() as u32;
+
+        let mut region_buffers: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
+        let mut open_region: Option<ValueId> = None;
+        for (value_id, ir) in &nodes {
+            match ir {
+                IR::BeginRendering { .. } => open_region = Some(*value_id),
+                IR::EndRendering { .. } => open_region = None,
+                IR::BindVertexBuffers { buffers, .. } => {
+                    let Some(region) = open_region else {
+                        continue;
+                    };
+                    let bound = region_buffers.entry(region).or_default();
+                    for buffer in buffers {
+                        if !bound.contains(buffer) {
+                            bound.push(*buffer);
+                        }
+                    }
+                },
+                _ => {},
+            }
+        }
 
         macro_rules! alloc {
             () => {{
@@ -308,6 +341,18 @@ impl Module {
                 let id = alloc!();
                 result.push((id, IR::Constant(ir::Constant::Access($access))));
                 id
+            }};
+        }
+        macro_rules! emit_memory_barrier {
+            ($src:expr, $dst:expr) => {{
+                let id = alloc!();
+                result.push((
+                    id,
+                    IR::MemoryBarrier {
+                        src_access: $src,
+                        dst_access: $dst,
+                    },
+                ));
             }};
         }
         macro_rules! emit_barrier {
@@ -327,6 +372,8 @@ impl Module {
         }
 
         let no_access_id = emit_access!(Access::None);
+        let mut host_write_id: Option<ValueId> = None;
+        let mut attribute_read_id: Option<ValueId> = None;
         let undefined = ResourceState {
             layout: vk::ImageLayout::UNDEFINED,
             last_access: no_access_id,
@@ -387,11 +434,42 @@ impl Module {
                         states.insert(*attachment, new_state);
                     }
 
+                    for buffer in region_buffers.get(&value_id).into_iter().flatten() {
+                        // an imported buffer has no producer inside the graph, so the host is the
+                        // only thing that can have written it
+                        let last = buffer_states.get(buffer).copied().unwrap_or_else(|| match host_write_id {
+                            Some(id) => id,
+                            None => {
+                                let id = emit_access!(Access::HostWrite);
+                                host_write_id = Some(id);
+                                id
+                            },
+                        });
+
+                        let read_id = match attribute_read_id {
+                            Some(id) => id,
+                            None => {
+                                let id = emit_access!(Access::AttributeRead);
+                                attribute_read_id = Some(id);
+                                id
+                            },
+                        };
+
+                        // already visible to vertex input from an earlier region
+                        if last == read_id {
+                            continue;
+                        }
+                        emit_memory_barrier!(last, read_id);
+                        buffer_states.insert(*buffer, read_id);
+                    }
+
                     states.insert(value_id, new_state);
                 },
 
+                // the barriers these need were emitted at region entry
                 IR::BindPipeline { pass, .. }
                 | IR::SetState { pass, .. }
+                | IR::BindVertexBuffers { pass, .. }
                 | IR::Draw { pass, .. }
                 | IR::EndRendering { pass } => {
                     let state = states.get(pass).copied().unwrap_or(undefined);
@@ -420,7 +498,6 @@ impl Module {
         result
     }
 
-    /// Walk back from a value to the image it names.
     fn resolve_image(&self, id: ValueId) -> Option<ImageInfo> {
         let mut id = id;
 
@@ -453,6 +530,7 @@ impl Module {
                 IR::BeginRendering { color_attachments, .. } => id = *color_attachments.first()?,
                 IR::BindPipeline { pass, .. }
                 | IR::SetState { pass, .. }
+                | IR::BindVertexBuffers { pass, .. }
                 | IR::Draw { pass, .. }
                 | IR::EndRendering { pass } => id = *pass,
                 IR::Acquire { resource, .. } | IR::Release { resource, .. } => id = *resource,
@@ -470,7 +548,6 @@ impl Module {
         }
     }
 
-    /// Give every draw the pipeline and state that were in force where it was recorded.
     fn infer(&self, mut nodes: Vec<ir::Instr>) -> Vec<ir::Instr> {
         #[derive(Clone)]
         struct InForce {
@@ -538,7 +615,7 @@ impl Module {
 
                 IR::SetState { pass, change } => {
                     if let Some(mut in_force) = regions.get(pass).cloned() {
-                        in_force.state.apply(*change);
+                        in_force.state.apply(change.clone());
                         regions.insert(*value_id, in_force);
                     }
                 },
@@ -560,7 +637,7 @@ impl Module {
                     }
                 },
 
-                IR::EndRendering { pass } => {
+                IR::BindVertexBuffers { pass, .. } | IR::EndRendering { pass } => {
                     if let Some(in_force) = regions.get(pass).cloned() {
                         regions.insert(*value_id, in_force);
                     }
@@ -574,8 +651,6 @@ impl Module {
     }
 }
 
-/// A rendering region that is open for recording. State set here only reaches the draws that
-/// follow it.
 pub struct RenderPass<'a> {
     module: &'a mut Module,
     id: ValueId,
@@ -598,6 +673,40 @@ impl RenderPass<'_> {
         self
     }
 
+    pub fn bind_vertex_buffer(self, binding: u32, buffer: ValueId) -> Self {
+        self.bind_vertex_buffers(binding, &[buffer], &[0])
+    }
+
+    pub fn bind_vertex_buffers(mut self, first_binding: u32, buffers: &[ValueId], offsets: &[u64]) -> Self {
+        assert_eq!(
+            buffers.len(),
+            offsets.len(),
+            "every bound vertex buffer needs an offset"
+        );
+
+        self.id = self.module.emit(IR::BindVertexBuffers {
+            pass: self.id,
+            first_binding,
+            buffers: buffers.to_vec(),
+            offsets: offsets.to_vec(),
+        });
+        self
+    }
+
+    pub fn push_constants<T: Copy>(self, value: &T) -> Self { self.push_constants_at(0, value) }
+
+    pub fn push_constants_at<T: Copy>(self, offset: u32, value: &T) -> Self {
+        let bytes = unsafe { std::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) };
+        self.push_constant_bytes(offset, bytes)
+    }
+
+    pub fn push_constant_bytes(self, offset: u32, data: &[u8]) -> Self {
+        self.set_state(StateChange::PushConstants {
+            offset,
+            data: data.to_vec(),
+        })
+    }
+
     pub fn set_primitive_topology(self, topology: vk::PrimitiveTopology) -> Self {
         self.set_state(StateChange::PrimitiveTopology(topology))
     }
@@ -606,8 +715,6 @@ impl RenderPass<'_> {
         self.set_state(StateChange::Rasterization(rasterization))
     }
 
-    /// Pick what the pass records instead of baking into pipelines. Viewport and scissor are
-    /// dynamic by default.
     pub fn set_dynamic_state(self, dynamic: DynamicStateFlags) -> Self {
         self.set_state(StateChange::DynamicState(dynamic))
     }
@@ -659,7 +766,6 @@ impl RenderPass<'_> {
         self
     }
 
-    /// Close the region and hand back the attachment it rendered into.
     pub fn end_rendering(self) -> ValueId { self.module.emit(IR::EndRendering { pass: self.id }) }
 }
 
@@ -685,6 +791,29 @@ mod tests {
         (module, construct)
     }
 
+    fn memory_barriers(module: &Module, instructions: &[ir::Instr]) -> Vec<(Access, Access)> {
+        let access = |id: &ValueId| {
+            instructions
+                .iter()
+                .find(|(instr_id, _)| instr_id == id)
+                .map(|(_, ir)| ir)
+                .or_else(|| module.instructions.get(id.0 as usize))
+                .and_then(|ir| match ir {
+                    IR::Constant(ir::Constant::Access(a)) => Some(*a),
+                    _ => None,
+                })
+                .expect("barrier operand should be an access constant")
+        };
+
+        instructions
+            .iter()
+            .filter_map(|(_, ir)| match ir {
+                IR::MemoryBarrier { src_access, dst_access } => Some((access(src_access), access(dst_access))),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn draws(instructions: &[ir::Instr]) -> Vec<(Option<PipelineId>, PipelineState)> {
         instructions
             .iter()
@@ -693,6 +822,65 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn binding_a_vertex_buffer_makes_the_host_write_visible_to_vertex_input() {
+        let (mut module, attachment) = module_with_attachment();
+        let buffer = module.import_buffer(&Buffer::default());
+
+        let end = module
+            .begin_rendering(&[attachment])
+            .bind_graphics_pipeline(PipelineId(0))
+            .bind_vertex_buffer(0, buffer)
+            .draw(3, 1)
+            .end_rendering();
+
+        let instructions = module.compile(end);
+        assert_eq!(memory_barriers(&module, &instructions), vec![(
+            Access::HostWrite,
+            Access::AttributeRead
+        )]);
+
+        let binds = instructions
+            .iter()
+            .filter(|(_, ir)| matches!(ir, IR::BindVertexBuffers { .. }))
+            .count();
+        assert_eq!(binds, 1);
+
+        let position = |predicate: fn(&IR) -> bool| {
+            instructions
+                .iter()
+                .position(|(_, ir)| predicate(ir))
+                .expect("instruction should be present")
+        };
+        assert!(
+            position(|ir| matches!(ir, IR::MemoryBarrier { .. }))
+                < position(|ir| matches!(ir, IR::BeginRendering { .. }))
+        );
+
+        let draws = draws(&instructions);
+        assert_eq!(draws.len(), 1);
+        assert_eq!(draws[0].0, Some(PipelineId(0)));
+        assert_eq!(draws[0].1.rendering.color_formats, vec![FORMAT]);
+    }
+
+    #[test]
+    fn rebinding_the_same_vertex_buffer_does_not_repeat_the_barrier() {
+        let (mut module, attachment) = module_with_attachment();
+        let buffer = module.import_buffer(&Buffer::default());
+
+        let end = module
+            .begin_rendering(&[attachment])
+            .bind_graphics_pipeline(PipelineId(0))
+            .bind_vertex_buffer(0, buffer)
+            .draw(3, 1)
+            .bind_vertex_buffer(0, buffer)
+            .draw(3, 1)
+            .end_rendering();
+
+        let instructions = module.compile(end);
+        assert_eq!(memory_barriers(&module, &instructions).len(), 1);
     }
 
     #[test]
@@ -917,6 +1105,87 @@ mod tests {
         let draws = draws(&module.compile(end));
         assert_eq!(draws[0].1.viewports[0].width, (WIDTH / 2) as f32);
         assert_eq!(draws[0].1.viewports[0].height, (HEIGHT / 2) as f32);
+    }
+
+    #[test]
+    fn push_constants_reach_the_draws_that_follow_them() {
+        let (mut module, attachment) = module_with_attachment();
+
+        let end = module
+            .begin_rendering(&[attachment])
+            .bind_graphics_pipeline(PipelineId(0))
+            .push_constants(&[1.0f32, 2.0])
+            .draw(3, 1)
+            .push_constants_at(4, &3.0f32)
+            .draw(3, 1)
+            .end_rendering();
+
+        let compiled = module.compile(end);
+        let pushed = compiled
+            .iter()
+            .filter_map(|(_, ir)| match ir {
+                IR::Draw { dynamic, .. } => Some(dynamic.push_constants.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        // the second push only touches the tail, so the first four bytes carry over
+        assert_eq!(pushed[0].offset, 0);
+        assert_eq!(pushed[0].data, [1.0f32, 2.0].map(f32::to_ne_bytes).concat());
+        assert_eq!(pushed[1].data, [1.0f32, 3.0].map(f32::to_ne_bytes).concat());
+
+        // and none of it splits the pipeline permutation
+        let draws = draws(&compiled);
+        assert_eq!(draws[0], draws[1]);
+    }
+
+    #[test]
+    fn a_draw_recorded_before_a_push_does_not_see_it() {
+        let (mut module, attachment) = module_with_attachment();
+
+        let end = module
+            .begin_rendering(&[attachment])
+            .bind_graphics_pipeline(PipelineId(0))
+            .draw(3, 1)
+            .push_constants(&7u32)
+            .draw(3, 1)
+            .end_rendering();
+
+        let pushed = module
+            .compile(end)
+            .iter()
+            .filter_map(|(_, ir)| match ir {
+                IR::Draw { dynamic, .. } => Some(dynamic.push_constants.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(pushed[0].is_empty());
+        assert_eq!(pushed[1].data, 7u32.to_ne_bytes());
+    }
+
+    #[test]
+    fn a_push_before_the_pipeline_bind_still_reaches_the_draw() {
+        let (mut module, attachment) = module_with_attachment();
+
+        let end = module
+            .begin_rendering(&[attachment])
+            .push_constants(&7u32)
+            .bind_graphics_pipeline(PipelineId(0))
+            .draw(3, 1)
+            .end_rendering();
+
+        let compiled = module.compile(end);
+        let (_, IR::Draw { dynamic, .. }) = compiled
+            .iter()
+            .find(|(_, ir)| matches!(ir, IR::Draw { .. }))
+            .expect("draw should be present")
+        else {
+            unreachable!()
+        };
+
+        assert_eq!(dynamic.push_constants.data, 7u32.to_ne_bytes());
+        assert_eq!(draws(&compiled)[0].0, Some(PipelineId(0)));
     }
 
     #[test]

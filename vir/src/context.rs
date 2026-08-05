@@ -1,6 +1,10 @@
-use std::{ptr::NonNull, sync::Arc};
+use std::{cell::RefCell, ptr::NonNull, rc::Rc, sync::Arc};
 
 use ash::{khr, vk};
+use gpu_allocator::{
+    AllocatorDebugSettings,
+    vulkan::{Allocator as GpuAllocator, AllocatorCreateDesc},
+};
 
 pub mod access;
 pub mod command_buffer;
@@ -10,12 +14,13 @@ pub use access::Access;
 pub use command_buffer::CommandBuffer;
 pub use command_queue::{CommandQueue, DomainFlag};
 
-use crate::{PersistentAllocator, SuperFrameAllocator};
+use crate::{PersistentAllocator, SuperFrameAllocator, allocator::MemoryAllocator};
 
 pub struct Context {
     device: Arc<ash::Device>,
     physical_device: vk::PhysicalDevice,
     instance: Arc<ash::Instance>,
+    memory: MemoryAllocator,
     command_queues: Vec<CommandQueue>,
     swapchain_loader: khr::swapchain::Device,
     surface_loader: khr::surface::Instance,
@@ -24,17 +29,30 @@ pub struct Context {
 impl Context {
     pub fn new(
         device: ash::Device, physical_device: vk::PhysicalDevice, instance: ash::Instance, entry: &ash::Entry,
-    ) -> Self {
+    ) -> Result<Self, vk::Result> {
         let swapchain_loader = khr::swapchain::Device::new(&instance, &device);
         let surface_loader = khr::surface::Instance::new(entry, &instance);
-        Self {
+
+        // one memory allocator per device; every allocator handed out below shares it
+        let memory = GpuAllocator::new(&AllocatorCreateDesc {
+            instance: instance.clone(),
+            device: device.clone(),
+            physical_device,
+            debug_settings: AllocatorDebugSettings::default(),
+            buffer_device_address: true,
+            allocation_sizes: Default::default(),
+        })
+        .map_err(crate::allocator::map_allocation_error)?;
+
+        Ok(Self {
             device: Arc::new(device),
             physical_device,
             instance: Arc::new(instance),
+            memory: Rc::new(RefCell::new(memory)),
             command_queues: Vec::new(),
             swapchain_loader,
             surface_loader,
-        }
+        })
     }
 
     pub fn device(&self) -> &ash::Device { &self.device }
@@ -85,10 +103,10 @@ impl Context {
     }
 
     pub fn create_persistent_allocator(&self) -> PersistentAllocator {
-        PersistentAllocator::new(NonNull::from(self.device.as_ref()))
+        PersistentAllocator::new(NonNull::from(self.device.as_ref()), self.memory.clone())
     }
 
     pub fn create_super_frame_allocator(&self, frame_count: usize) -> SuperFrameAllocator {
-        SuperFrameAllocator::new(NonNull::from(self.device.as_ref()), frame_count)
+        SuperFrameAllocator::new(NonNull::from(self.device.as_ref()), self.memory.clone(), frame_count)
     }
 }

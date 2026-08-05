@@ -31,6 +31,8 @@ mod decoration {
     pub const BUFFER_BLOCK: u32 = 3;
     pub const ARRAY_STRIDE: u32 = 6;
     pub const MATRIX_STRIDE: u32 = 7;
+    pub const BUILT_IN: u32 = 11;
+    pub const LOCATION: u32 = 30;
     pub const BINDING: u32 = 33;
     pub const DESCRIPTOR_SET: u32 = 34;
     pub const OFFSET: u32 = 35;
@@ -38,6 +40,7 @@ mod decoration {
 
 mod storage_class {
     pub const UNIFORM_CONSTANT: u32 = 0;
+    pub const INPUT: u32 = 1;
     pub const UNIFORM: u32 = 2;
     pub const PUSH_CONSTANT: u32 = 9;
     pub const STORAGE_BUFFER: u32 = 12;
@@ -57,17 +60,37 @@ pub struct DescriptorBinding {
     pub variable_count: bool,
 }
 
+/// One `Location`-decorated input of a vertex shader, in the order the pipeline packs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VertexInput {
+    pub location: u32,
+    pub format: vk::Format,
+    pub size: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct Reflection {
     pub stage: vk::ShaderStageFlags,
     pub entry_point: CString,
     pub bindings: Vec<DescriptorBinding>,
+    /// Where the stage's push constant block starts. Zero when the stage has none.
+    pub push_constant_offset: u32,
+    /// How many bytes the block spans from `push_constant_offset`. Zero when the stage has none.
     pub push_constant_size: u32,
+    /// Empty for every stage but the vertex stage.
+    pub vertex_inputs: Vec<VertexInput>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScalarKind {
+    Float,
+    Sint,
+    Uint,
 }
 
 #[derive(Debug, Clone)]
 enum TypeInfo {
-    Scalar { width: u32 },
+    Scalar { kind: ScalarKind, width: u32 },
     Vector { component: u32, count: u32 },
     Matrix { column: u32, count: u32 },
     Image { dim: u32, sampled: u32 },
@@ -129,10 +152,24 @@ fn parse(spirv: &[u32]) -> Option<Parsed> {
             op::TYPE_VOID | op::TYPE_BOOL if !operands.is_empty() => {
                 parsed.types.insert(operands[0], TypeInfo::Opaque);
             },
-            op::TYPE_INT | op::TYPE_FLOAT if operands.len() >= 2 => {
-                parsed
-                    .types
-                    .insert(operands[0], TypeInfo::Scalar { width: operands[1] });
+            op::TYPE_FLOAT if operands.len() >= 2 => {
+                parsed.types.insert(
+                    operands[0],
+                    TypeInfo::Scalar {
+                        kind: ScalarKind::Float,
+                        width: operands[1],
+                    },
+                );
+            },
+            op::TYPE_INT if operands.len() >= 3 => {
+                let kind = if operands[2] == 0 { ScalarKind::Uint } else { ScalarKind::Sint };
+                parsed.types.insert(
+                    operands[0],
+                    TypeInfo::Scalar {
+                        kind,
+                        width: operands[1],
+                    },
+                );
             },
             op::TYPE_VECTOR if operands.len() >= 3 => {
                 parsed.types.insert(
@@ -265,7 +302,7 @@ impl Parsed {
         }
 
         match self.types.get(&ty) {
-            Some(TypeInfo::Scalar { width }) => width / 8,
+            Some(TypeInfo::Scalar { width, .. }) => width / 8,
             Some(TypeInfo::Vector { component, count }) => self.type_size(*component, depth + 1) * count,
             Some(TypeInfo::Matrix { column, count }) => {
                 self.decoration(ty, decoration::MATRIX_STRIDE)
@@ -293,6 +330,55 @@ impl Parsed {
                 .unwrap_or(0),
             _ => 0,
         }
+    }
+
+    /// The first byte a push constant block occupies.
+    ///
+    /// A block whose members all sit past some offset only needs a range that starts there, which
+    /// is what the shader was compiled against.
+    fn block_start(&self, ty: u32) -> u32 {
+        match self.types.get(&ty) {
+            Some(TypeInfo::Struct { members }) => (0..members.len() as u32)
+                .map(|member| self.member_decoration(ty, member, decoration::OFFSET).unwrap_or(0))
+                .min()
+                .unwrap_or(0),
+            _ => 0,
+        }
+    }
+
+    /// The attribute format a vertex input of this type is read through.
+    ///
+    /// Only 32-bit components are handled: anything wider, and matrices, span more than one
+    /// location, which the single-binding packing below has no way to express.
+    fn vertex_format(&self, ty: u32) -> Option<vk::Format> {
+        let (kind, width, count) = match self.types.get(&ty)? {
+            TypeInfo::Scalar { kind, width } => (*kind, *width, 1),
+            TypeInfo::Vector { component, count } => match self.types.get(component)? {
+                TypeInfo::Scalar { kind, width } => (*kind, *width, *count),
+                _ => return None,
+            },
+            _ => return None,
+        };
+
+        if width != 32 {
+            return None;
+        }
+
+        Some(match (kind, count) {
+            (ScalarKind::Float, 1) => vk::Format::R32_SFLOAT,
+            (ScalarKind::Float, 2) => vk::Format::R32G32_SFLOAT,
+            (ScalarKind::Float, 3) => vk::Format::R32G32B32_SFLOAT,
+            (ScalarKind::Float, 4) => vk::Format::R32G32B32A32_SFLOAT,
+            (ScalarKind::Sint, 1) => vk::Format::R32_SINT,
+            (ScalarKind::Sint, 2) => vk::Format::R32G32_SINT,
+            (ScalarKind::Sint, 3) => vk::Format::R32G32B32_SINT,
+            (ScalarKind::Sint, 4) => vk::Format::R32G32B32A32_SINT,
+            (ScalarKind::Uint, 1) => vk::Format::R32_UINT,
+            (ScalarKind::Uint, 2) => vk::Format::R32G32_UINT,
+            (ScalarKind::Uint, 3) => vk::Format::R32G32B32_UINT,
+            (ScalarKind::Uint, 4) => vk::Format::R32G32B32A32_UINT,
+            _ => return None,
+        })
     }
 
     fn descriptor_type(&self, storage_class: u32, pointee: u32) -> Option<vk::DescriptorType> {
@@ -353,7 +439,9 @@ pub fn reflect(spirv: &[u32]) -> Result<Reflection, vk::Result> {
     };
 
     let mut bindings = Vec::new();
-    let mut push_constant_size = 0;
+    let mut vertex_inputs = Vec::new();
+    // the stage's push constants as a half-open byte range; `None` until one shows up
+    let mut push_constants: Option<(u32, u32)> = None;
 
     for (variable, pointer_type, storage_class) in &parsed.variables {
         let Some(TypeInfo::Pointer { pointee, .. }) = parsed.types.get(pointer_type) else {
@@ -361,7 +449,39 @@ pub fn reflect(spirv: &[u32]) -> Result<Reflection, vk::Result> {
         };
 
         if *storage_class == storage_class::PUSH_CONSTANT {
-            push_constant_size = push_constant_size.max(parsed.type_size(*pointee, 0));
+            let start = parsed.block_start(*pointee);
+            let end = parsed.type_size(*pointee, 0);
+            if end > start {
+                push_constants = Some(match push_constants {
+                    Some((first, last)) => (first.min(start), last.max(end)),
+                    None => (start, end),
+                });
+            }
+            continue;
+        }
+
+        // fragment stages have `Input` variables too, but those are interpolants, not attributes
+        if *storage_class == storage_class::INPUT {
+            if stage != vk::ShaderStageFlags::VERTEX {
+                continue;
+            }
+            // builtins like SV_VertexID arrive on `Input` but are fed by the driver
+            if parsed.has_decoration(*variable, decoration::BUILT_IN) {
+                continue;
+            }
+            let Some(location) = parsed.decoration(*variable, decoration::LOCATION) else {
+                continue;
+            };
+            let Some(format) = parsed.vertex_format(*pointee) else {
+                tracing::warn!(location, "unsupported vertex input type; the attribute is dropped");
+                continue;
+            };
+
+            vertex_inputs.push(VertexInput {
+                location,
+                format,
+                size: parsed.type_size(*pointee, 0),
+            });
             continue;
         }
 
@@ -387,12 +507,20 @@ pub fn reflect(spirv: &[u32]) -> Result<Reflection, vk::Result> {
     }
 
     bindings.sort_unstable_by_key(|b| (b.set, b.binding));
+    vertex_inputs.sort_unstable_by_key(|input| input.location);
+
+    let (push_constant_offset, push_constant_size) = match push_constants {
+        Some((start, end)) => (start, end - start),
+        None => (0, 0),
+    };
 
     Ok(Reflection {
         stage,
         entry_point: entry_point.clone(),
         bindings,
+        push_constant_offset,
         push_constant_size,
+        vertex_inputs,
     })
 }
 
@@ -497,7 +625,97 @@ mod tests {
     #[test]
     fn sizes_push_constants_from_member_offsets() {
         let reflection = reflect(&module()).expect("module should reflect");
+        assert_eq!(reflection.push_constant_offset, 0);
         assert_eq!(reflection.push_constant_size, 20);
+    }
+
+    #[test]
+    fn a_push_constant_block_that_starts_late_reports_the_offset_it_starts_at() {
+        let mut words = module();
+        // move the block's first member from 0 to 32, past the second one
+        let member_offset = words
+            .windows(5)
+            .position(|w| w[0] == (5 << 16) | op::MEMBER_DECORATE as u32 && w[1..4] == [16, 0, decoration::OFFSET])
+            .expect("member decoration should be present");
+        words[member_offset + 4] = 32;
+
+        let reflection = reflect(&words).expect("module should reflect");
+        // members at 16 and 32, the widest ending at 48
+        assert_eq!(reflection.push_constant_offset, 16);
+        assert_eq!(reflection.push_constant_size, 32);
+    }
+
+    #[test]
+    fn a_shader_with_no_push_constants_reports_an_empty_range() {
+        let reflection = reflect(&vertex_module()).expect("module should reflect");
+        assert_eq!(reflection.push_constant_offset, 0);
+        assert_eq!(reflection.push_constant_size, 0);
+    }
+
+    #[test]
+    fn ignores_stage_inputs_outside_the_vertex_stage() {
+        let reflection = reflect(&module()).expect("module should reflect");
+        assert_eq!(reflection.stage, vk::ShaderStageFlags::FRAGMENT);
+        assert!(reflection.vertex_inputs.is_empty());
+    }
+
+    /// A vertex module with two `Location`-decorated inputs and one builtin.
+    fn vertex_module() -> Vec<u32> {
+        let mut words = vec![MAGIC, 0x0001_0300, 0, 100, 0];
+
+        let mut entry = vec![0, 99];
+        entry.extend(literal("vs_main"));
+        words.extend(inst(op::ENTRY_POINT, &entry));
+
+        // declared out of location order, to prove the result is sorted
+        words.extend(inst(op::DECORATE, &[9, decoration::LOCATION, 1]));
+        words.extend(inst(op::DECORATE, &[5, decoration::LOCATION, 0]));
+        // SV_VertexID lands here: an `Input` variable that the driver feeds
+        words.extend(inst(op::DECORATE, &[13, decoration::BUILT_IN, 42]));
+
+        words.extend(inst(op::TYPE_FLOAT, &[1, 32]));
+        words.extend(inst(op::TYPE_VECTOR, &[2, 1, 2]));
+        words.extend(inst(op::TYPE_VECTOR, &[3, 1, 3]));
+        words.extend(inst(op::TYPE_INT, &[11, 32, 0]));
+
+        words.extend(inst(op::TYPE_POINTER, &[4, storage_class::INPUT, 2]));
+        words.extend(inst(op::VARIABLE, &[4, 5, storage_class::INPUT]));
+
+        words.extend(inst(op::TYPE_POINTER, &[8, storage_class::INPUT, 3]));
+        words.extend(inst(op::VARIABLE, &[8, 9, storage_class::INPUT]));
+
+        words.extend(inst(op::TYPE_POINTER, &[12, storage_class::INPUT, 11]));
+        words.extend(inst(op::VARIABLE, &[12, 13, storage_class::INPUT]));
+
+        // an unsupported input: a 4x4 matrix spans four locations
+        words.extend(inst(op::DECORATE, &[16, decoration::LOCATION, 4]));
+        words.extend(inst(op::TYPE_VECTOR, &[14, 1, 4]));
+        words.extend(inst(op::TYPE_MATRIX, &[17, 14, 4]));
+        words.extend(inst(op::TYPE_POINTER, &[15, storage_class::INPUT, 17]));
+        words.extend(inst(op::VARIABLE, &[15, 16, storage_class::INPUT]));
+
+        words
+    }
+
+    #[test]
+    fn reads_vertex_inputs_in_location_order() {
+        let reflection = reflect(&vertex_module()).expect("module should reflect");
+        assert_eq!(reflection.stage, vk::ShaderStageFlags::VERTEX);
+        assert_eq!(
+            reflection.vertex_inputs,
+            vec![
+                VertexInput {
+                    location: 0,
+                    format: vk::Format::R32G32_SFLOAT,
+                    size: 8,
+                },
+                VertexInput {
+                    location: 1,
+                    format: vk::Format::R32G32B32_SFLOAT,
+                    size: 12,
+                },
+            ]
+        );
     }
 
     #[test]
