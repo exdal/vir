@@ -42,6 +42,21 @@ struct ImageType {
 
 fn name_of(name: &str) -> ir::Name { (!name.is_empty()).then(|| Arc::from(name)) }
 
+/// `count` scaled and rounded up, since a fraction of an invocation still has to be dispatched.
+fn scaled(count: u64, scale: f32) -> u32 {
+    let scaled = (count as f64 * scale as f64).ceil();
+    if !scaled.is_finite() {
+        tracing::warn!(
+            count,
+            scale,
+            "invocation count does not scale to a number; it is taken to be none"
+        );
+        return 0;
+    }
+
+    scaled.clamp(0.0, u32::MAX as f64) as u32
+}
+
 #[derive(Default)]
 pub struct Module {
     types: HashMap<ir::Type, ValueId>,
@@ -437,16 +452,15 @@ impl Module {
                     IR::BeginCompute { resources, .. } => {
                         resources.iter().rev().for_each(|(id, _)| stack.push(*id));
                     },
-                    IR::Dispatch {
-                        pass,
-                        groups_x,
-                        groups_y,
-                        groups_z,
-                        ..
-                    } => {
-                        stack.push(*groups_z);
-                        stack.push(*groups_y);
-                        stack.push(*groups_x);
+                    IR::Dispatch { pass, size, .. } => {
+                        match size {
+                            ir::DispatchSize::Groups { x, y, z } | ir::DispatchSize::Invocations { x, y, z } => {
+                                stack.push(*z);
+                                stack.push(*y);
+                                stack.push(*x);
+                            },
+                            ir::DispatchSize::Indirect { buffer, .. } => stack.push(*buffer),
+                        }
                         stack.push(*pass);
                     },
                     IR::EndCompute { pass } => {
@@ -722,6 +736,13 @@ impl Module {
                     }
                 },
 
+                IR::Dispatch {
+                    size: ir::DispatchSize::Indirect { buffer, .. },
+                    ..
+                } => {
+                    buffer_barrier!(self.resource_root(*buffer), Access::IndirectRead);
+                },
+
                 IR::Release { resource, access, .. } => {
                     transition!(*resource, *access, self.resolve_access(*access));
                 },
@@ -820,36 +841,21 @@ impl Module {
         }
     }
 
-    fn resolve_image(&self, id: ValueId) -> Option<ImageType> {
+    fn resolve_resource(&self, id: ValueId) -> Option<&IR> {
         let mut id = id;
 
         for _ in 0..256 {
-            match self.instructions.get(id.0 as usize)? {
-                IR::ConstructImage {
-                    format,
-                    samples,
-                    extent,
-                    ..
-                } => {
-                    let extent = match self.instructions.get(extent.0 as usize)? {
-                        IR::Constant(ir::Constant::Extent3D(extent)) => *extent,
-                        _ => return None,
-                    };
-
-                    return Some(ImageType {
-                        format: *format,
-                        samples: *samples,
-                        extent,
-                    });
-                },
+            let ir = self.instructions.get(id.0 as usize)?;
+            id = match ir {
+                IR::ConstructImage { .. } | IR::ConstructBuffer { .. } => return Some(ir),
                 // every element of an attachment array describes the same image
-                IR::Array { elements, .. } => id = *elements.first()?,
-                IR::Index { array, .. } => id = *array,
-                IR::Clear { attachment, .. } => id = *attachment,
-                IR::Blit { dst, .. } => id = *dst,
-                IR::CopyBufferToImage { image, .. } => id = *image,
-                IR::BeginRendering { color_attachments, .. } => id = *color_attachments.first()?,
-                IR::BeginCompute { resources, .. } => id = resources.first()?.0,
+                IR::Array { elements, .. } => *elements.first()?,
+                IR::Index { array, .. } => *array,
+                IR::Clear { attachment, .. } => *attachment,
+                IR::Blit { dst, .. } => *dst,
+                IR::CopyBufferToImage { image, .. } => *image,
+                IR::BeginRendering { color_attachments, .. } => *color_attachments.first()?,
+                IR::BeginCompute { resources, .. } => resources.first()?.0,
                 IR::BindPipeline { pass, .. }
                 | IR::SetState { pass, .. }
                 | IR::BindVertexBuffers { pass, .. }
@@ -859,13 +865,41 @@ impl Module {
                 | IR::DrawIndexed { pass, .. }
                 | IR::EndRendering { pass }
                 | IR::Dispatch { pass, .. }
-                | IR::EndCompute { pass } => id = *pass,
-                IR::Acquire { resource, .. } | IR::Release { resource, .. } => id = *resource,
+                | IR::EndCompute { pass } => *pass,
+                IR::Acquire { resource, .. } | IR::Release { resource, .. } => *resource,
                 _ => return None,
-            }
+            };
         }
 
         None
+    }
+
+    fn resolve_image(&self, id: ValueId) -> Option<ImageType> {
+        let IR::ConstructImage {
+            format,
+            samples,
+            extent,
+            ..
+        } = self.resolve_resource(id)?
+        else {
+            return None;
+        };
+
+        match self.instructions.get(extent.0 as usize)? {
+            IR::Constant(ir::Constant::Extent3D(extent)) => Some(ImageType {
+                format: *format,
+                samples: *samples,
+                extent: *extent,
+            }),
+            _ => None,
+        }
+    }
+
+    fn resolve_buffer_size(&self, id: ValueId) -> Option<u64> {
+        match self.resolve_resource(id)? {
+            IR::ConstructBuffer { buffer, .. } => Some(buffer.size()),
+            _ => None,
+        }
     }
 
     fn resolve_extent_2d(&self, id: ValueId) -> Option<vk::Extent2D> {
@@ -1254,19 +1288,80 @@ impl ComputePass<'_> {
         self
     }
 
-    pub fn dispatch(mut self, groups_x: u32, groups_y: u32, groups_z: u32) -> Self {
-        let groups_x = self.module.lower_u32(groups_x);
-        let groups_y = self.module.lower_u32(groups_y);
-        let groups_z = self.module.lower_u32(groups_z);
+    fn dispatch_size(mut self, size: ir::DispatchSize) -> Self {
         self.id = self.module.emit(IR::Dispatch {
             pass: self.id,
-            groups_x,
-            groups_y,
-            groups_z,
+            size,
             pipeline: None,
             push_constants: Default::default(),
         });
         self
+    }
+
+    pub fn dispatch(self, groups_x: u32, groups_y: u32, groups_z: u32) -> Self {
+        let x = self.module.lower_u32(groups_x);
+        let y = self.module.lower_u32(groups_y);
+        let z = self.module.lower_u32(groups_z);
+        self.dispatch_size(ir::DispatchSize::Groups { x, y, z })
+    }
+
+    /// Dispatches at least this many invocations per axis, rounded up to whole workgroups of
+    /// whatever the bound pipeline declares.
+    pub fn dispatch_invocations(self, invocations_x: u32, invocations_y: u32, invocations_z: u32) -> Self {
+        let x = self.module.lower_u32(invocations_x);
+        let y = self.module.lower_u32(invocations_y);
+        let z = self.module.lower_u32(invocations_z);
+        self.dispatch_size(ir::DispatchSize::Invocations { x, y, z })
+    }
+
+    /// Dispatches one invocation per pixel of `image`, width along x, height along y and depth
+    /// along z.
+    pub fn dispatch_invocations_per_pixel(self, image: ValueId) -> Self {
+        self.dispatch_invocations_per_pixel_scaled(image, [1.0; 3])
+    }
+
+    /// Dispatches [`Self::dispatch_invocations_per_pixel`] scaled per axis: above one is more
+    /// invocations than pixels, below one is fewer. Rounding up to whole workgroups happens after
+    /// the scaling.
+    pub fn dispatch_invocations_per_pixel_scaled(self, image: ValueId, scale: [f32; 3]) -> Self {
+        let Some(extent) = self.module.resolve_image(image).map(|image| image.extent) else {
+            tracing::warn!(%image, "cannot infer the extent to dispatch over; the dispatch is dropped");
+            return self;
+        };
+
+        self.dispatch_invocations(
+            scaled(extent.width as u64, scale[0]),
+            scaled(extent.height as u64, scale[1]),
+            scaled(extent.depth as u64, scale[2]),
+        )
+    }
+
+    /// Dispatches one invocation per `element_size` bytes of `buffer`, along the x-axis only.
+    pub fn dispatch_invocations_per_element(self, buffer: ValueId, element_size: u64) -> Self {
+        self.dispatch_invocations_per_element_scaled(buffer, element_size, 1.0)
+    }
+
+    /// Dispatches [`Self::dispatch_invocations_per_element`] scaled: above one is more invocations
+    /// than elements, below one is fewer.
+    pub fn dispatch_invocations_per_element_scaled(self, buffer: ValueId, element_size: u64, scale: f32) -> Self {
+        if element_size == 0 {
+            tracing::warn!(%buffer, "elements of no size have no count to dispatch over; the dispatch is dropped");
+            return self;
+        }
+
+        let Some(size) = self.module.resolve_buffer_size(buffer) else {
+            tracing::warn!(%buffer, "cannot infer the element count to dispatch over; the dispatch is dropped");
+            return self;
+        };
+
+        self.dispatch_invocations(scaled(size / element_size, scale), 1, 1)
+    }
+
+    /// Dispatches the group counts the device reads out of `buffer` itself.
+    pub fn dispatch_indirect(self, buffer: ValueId) -> Self { self.dispatch_indirect_at(buffer, 0) }
+
+    pub fn dispatch_indirect_at(self, buffer: ValueId, offset: u64) -> Self {
+        self.dispatch_size(ir::DispatchSize::Indirect { buffer, offset })
     }
 
     pub fn end_compute(self) -> ValueId { self.module.emit(IR::EndCompute { pass: self.id }) }
@@ -2037,9 +2132,7 @@ mod tests {
             IR::Dispatch {
                 pipeline,
                 push_constants,
-                groups_x,
-                groups_y,
-                groups_z,
+                size: ir::DispatchSize::Groups { x, y, z },
                 ..
             },
         ) = compiled
@@ -2054,11 +2147,177 @@ mod tests {
         assert_eq!(push_constants.data, 7u32.to_ne_bytes());
         assert_eq!(
             [
-                u32_constant(&module, groups_x),
-                u32_constant(&module, groups_y),
-                u32_constant(&module, groups_z)
+                u32_constant(&module, x),
+                u32_constant(&module, y),
+                u32_constant(&module, z)
             ],
             [8, 4, 1]
+        );
+    }
+
+    fn dispatch_sizes(instructions: &[ir::Instr]) -> Vec<ir::DispatchSize> {
+        instructions
+            .iter()
+            .filter_map(|(_, ir)| match ir {
+                IR::Dispatch { size, .. } => Some(*size),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn invocations(module: &Module, instructions: &[ir::Instr]) -> [u32; 3] {
+        match dispatch_sizes(instructions).as_slice() {
+            [ir::DispatchSize::Invocations { x, y, z }] => [
+                u32_constant(module, x),
+                u32_constant(module, y),
+                u32_constant(module, z),
+            ],
+            sizes => panic!("expected one dispatch sized in invocations, got {sizes:?}"),
+        }
+    }
+
+    /// The workgroup only enters the picture once a pipeline is bound, which is why the count
+    /// reaches the compiled module as the invocations the caller asked for.
+    #[test]
+    fn a_dispatch_sized_in_invocations_keeps_the_count_it_was_given() {
+        let (mut module, attachment) = module_with_attachment();
+
+        let end = module
+            .begin_compute()
+            .bind_pipeline(PipelineId(0))
+            .write(attachment)
+            .dispatch_invocations(1920, 1080, 1)
+            .end_compute();
+
+        let compiled = module.compile(end);
+        assert_eq!(invocations(&module, &compiled), [1920, 1080, 1]);
+    }
+
+    #[test]
+    fn a_dispatch_per_pixel_covers_the_image_it_was_sized_from() {
+        let (mut module, attachment) = module_with_attachment();
+
+        let end = module
+            .begin_compute()
+            .bind_pipeline(PipelineId(0))
+            .write(attachment)
+            .dispatch_invocations_per_pixel(attachment)
+            .end_compute();
+
+        let compiled = module.compile(end);
+        assert_eq!(invocations(&module, &compiled), [WIDTH, HEIGHT, 1]);
+    }
+
+    /// Scaling rounds up, so an axis that scales to a fraction of an invocation still gets one.
+    #[test]
+    fn a_scaled_dispatch_per_pixel_rounds_every_axis_up() {
+        let (mut module, attachment) = module_with_attachment();
+
+        let end = module
+            .begin_compute()
+            .bind_pipeline(PipelineId(0))
+            .write(attachment)
+            .dispatch_invocations_per_pixel_scaled(attachment, [0.5, 2.0, 0.25])
+            .end_compute();
+
+        let compiled = module.compile(end);
+        assert_eq!(invocations(&module, &compiled), [WIDTH / 2, HEIGHT * 2, 1]);
+    }
+
+    #[test]
+    fn a_dispatch_per_element_sizes_itself_on_the_x_axis_alone() {
+        let mut module = Module::default();
+        let buffer = module.import_buffer(&Buffer::new(vk::Buffer::null(), 800, 0, None));
+
+        let end = module
+            .begin_compute()
+            .bind_pipeline(PipelineId(0))
+            .write(buffer)
+            .dispatch_invocations_per_element(buffer, 20)
+            .end_compute();
+
+        let compiled = module.compile(end);
+        assert_eq!(invocations(&module, &compiled), [40, 1, 1]);
+    }
+
+    #[test]
+    fn a_scaled_dispatch_per_element_scales_the_element_count() {
+        let mut module = Module::default();
+        let buffer = module.import_buffer(&Buffer::new(vk::Buffer::null(), 800, 0, None));
+
+        let end = module
+            .begin_compute()
+            .bind_pipeline(PipelineId(0))
+            .write(buffer)
+            .dispatch_invocations_per_element_scaled(buffer, 20, 3.0)
+            .end_compute();
+
+        let compiled = module.compile(end);
+        assert_eq!(invocations(&module, &compiled), [120, 1, 1]);
+    }
+
+    /// A buffer of counts is no use to the device until the write that filled it is visible, and
+    /// nothing but the dispatch itself says that it will be read as commands.
+    #[test]
+    fn an_indirect_dispatch_waits_for_the_buffer_of_counts() {
+        let mut module = Module::default();
+        let image = module.transient_image(&untyped_info());
+        let commands = module.import_buffer(&Buffer::new(vk::Buffer::null(), 12, 0, None));
+
+        let end = module
+            .begin_compute()
+            .bind_pipeline(PipelineId(0))
+            .write(image)
+            .dispatch_indirect(commands)
+            .end_compute();
+
+        let compiled = module.compile(end);
+        assert_eq!(
+            memory_barriers(&module, &compiled),
+            vec![(Access::HostWrite, Access::IndirectRead)]
+        );
+        assert_eq!(
+            dispatch_sizes(&compiled),
+            vec![ir::DispatchSize::Indirect {
+                buffer: commands,
+                offset: 0
+            }]
+        );
+    }
+
+    /// The counts are filled once, so the second dispatch reading the same buffer waits on
+    /// nothing further.
+    #[test]
+    fn indirect_dispatches_out_of_one_buffer_wait_on_it_once() {
+        let mut module = Module::default();
+        let image = module.transient_image(&untyped_info());
+        let commands = module.import_buffer(&Buffer::new(vk::Buffer::null(), 24, 0, None));
+
+        let end = module
+            .begin_compute()
+            .bind_pipeline(PipelineId(0))
+            .write(image)
+            .dispatch_indirect(commands)
+            .dispatch_indirect_at(commands, 12)
+            .end_compute();
+
+        let compiled = module.compile(end);
+        assert_eq!(
+            dispatch_sizes(&compiled),
+            vec![
+                ir::DispatchSize::Indirect {
+                    buffer: commands,
+                    offset: 0
+                },
+                ir::DispatchSize::Indirect {
+                    buffer: commands,
+                    offset: 12
+                },
+            ]
+        );
+        assert_eq!(
+            memory_barriers(&module, &compiled),
+            vec![(Access::HostWrite, Access::IndirectRead)]
         );
     }
 

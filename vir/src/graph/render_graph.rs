@@ -770,6 +770,13 @@ impl RenderGraph {
         self.record_push_constants(pipeline, &dynamic.push_constants)
     }
 
+    fn local_size(&self, pipeline: PipelineId) -> [u32; 3] {
+        self.pipelines
+            .get(pipeline.0 as usize)
+            .and_then(|declared| declared.reflections.first())
+            .map_or([1; 3], |reflection| reflection.local_size)
+    }
+
     fn prepare_dispatch(
         &mut self, pipeline: Option<PipelineId>, push_constants: &PushConstants,
     ) -> Result<(), vk::Result> {
@@ -1115,9 +1122,7 @@ impl RenderGraph {
             IR::EndCompute { pass } => self.set_value(value_id, Value::Reference(*pass)),
             IR::Dispatch {
                 pass,
-                groups_x,
-                groups_y,
-                groups_z,
+                size,
                 pipeline,
                 push_constants,
             } => {
@@ -1125,10 +1130,26 @@ impl RenderGraph {
                 self.ensure_batch(ctx, allocator)?;
                 self.prepare_dispatch(*pipeline, push_constants)?;
 
-                let groups_x = self.get::<u32>(groups_x);
-                let groups_y = self.get::<u32>(groups_y);
-                let groups_z = self.get::<u32>(groups_z);
-                self.batch()?.dispatch(groups_x, groups_y, groups_z);
+                match size {
+                    ir::DispatchSize::Groups { x, y, z } => {
+                        let groups = [self.get::<u32>(x), self.get::<u32>(y), self.get::<u32>(z)];
+                        self.batch()?.dispatch(groups[0], groups[1], groups[2]);
+                    },
+                    ir::DispatchSize::Invocations { x, y, z } => {
+                        let invocations = [self.get::<u32>(x), self.get::<u32>(y), self.get::<u32>(z)];
+                        let local_size = pipeline.map_or([1; 3], |pipeline| self.local_size(pipeline));
+                        let groups = [
+                            invocations[0].div_ceil(local_size[0]),
+                            invocations[1].div_ceil(local_size[1]),
+                            invocations[2].div_ceil(local_size[2]),
+                        ];
+                        self.batch()?.dispatch(groups[0], groups[1], groups[2]);
+                    },
+                    ir::DispatchSize::Indirect { buffer, offset } => {
+                        let handle = self.get::<Buffer>(buffer).handle();
+                        self.batch()?.dispatch_indirect(handle, *offset);
+                    },
+                }
             },
             IR::MemoryBarrier { src_access, dst_access } => {
                 self.ensure_batch(ctx, allocator)?;

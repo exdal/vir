@@ -582,6 +582,7 @@ mod tests {
             push_constant_offset: 0,
             push_constant_size: 0,
             vertex_inputs,
+            local_size: [1, 1, 1],
         }
     }
 

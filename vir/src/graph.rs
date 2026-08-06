@@ -7,7 +7,7 @@ pub mod render_graph;
 pub mod value;
 
 pub use attachment::ImageAttachment;
-pub use ir::IR; // dont export Constant, i think its ok to use it as ir::Constant
+pub use ir::{DispatchSize, IR}; // dont export Constant, i think its ok to use it as ir::Constant
 pub use module::{ComputePass, Module, RenderPass};
 pub use pass::PassCallback;
 pub use render_graph::RenderGraph;

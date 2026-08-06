@@ -175,6 +175,10 @@ impl CommandBuffer {
         }
     }
 
+    pub fn dispatch_indirect(&self, buffer: vk::Buffer, offset: vk::DeviceSize) {
+        unsafe { self.device.as_ref().cmd_dispatch_indirect(self.handle, buffer, offset) }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn blit_image(
         &self, src: vk::Image, src_layout: vk::ImageLayout, dst: vk::Image, dst_layout: vk::ImageLayout,

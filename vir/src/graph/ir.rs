@@ -48,6 +48,13 @@ pub enum Constant {
     ClearValue(ClearValue),
 }
 
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+pub enum DispatchSize {
+    Groups { x: ValueId, y: ValueId, z: ValueId },
+    Invocations { x: ValueId, y: ValueId, z: ValueId },
+    Indirect { buffer: ValueId, offset: u64 },
+}
+
 #[derive(Clone, Hash, PartialEq, Eq)]
 pub enum IR {
     Type(Type),
@@ -177,9 +184,7 @@ pub enum IR {
     },
     Dispatch {
         pass: ValueId,
-        groups_x: ValueId,
-        groups_y: ValueId,
-        groups_z: ValueId,
+        size: DispatchSize,
         pipeline: Option<PipelineId>,
         push_constants: PushConstants,
     },
@@ -781,21 +786,30 @@ impl IR {
                     ))
                 )
             },
-            IR::Dispatch {
-                groups_x,
-                groups_y,
-                groups_z,
-                pipeline,
-                ..
-            } => {
-                write!(
-                    f,
-                    "dispatch groups_x={} groups_y={} groups_z={} {}",
-                    p.operand(*groups_x),
-                    p.operand(*groups_y),
-                    p.operand(*groups_z),
-                    fmt_pipeline(pipeline)
-                )
+            IR::Dispatch { size, pipeline, .. } => {
+                match size {
+                    DispatchSize::Groups { x, y, z } => write!(
+                        f,
+                        "dispatch groups_x={} groups_y={} groups_z={}",
+                        p.operand(*x),
+                        p.operand(*y),
+                        p.operand(*z)
+                    )?,
+                    DispatchSize::Invocations { x, y, z } => write!(
+                        f,
+                        "dispatch invocations_x={} invocations_y={} invocations_z={}",
+                        p.operand(*x),
+                        p.operand(*y),
+                        p.operand(*z)
+                    )?,
+                    DispatchSize::Indirect { buffer, offset } => {
+                        write!(f, "dispatch.indirect {}", p.operand(*buffer))?;
+                        if *offset != 0 {
+                            write!(f, " offset={offset}")?;
+                        }
+                    },
+                }
+                write!(f, " {}", fmt_pipeline(pipeline))
             },
             IR::EndCompute { .. } => write!(f, "end_compute"),
             IR::MemoryBarrier { src_access, dst_access } => write!(

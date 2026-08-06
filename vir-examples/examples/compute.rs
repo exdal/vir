@@ -155,7 +155,6 @@ impl Example for Compute {
             time: if self.ui.animate { frame.elapsed } else { 0.0 },
             scale: ring_scale(frame.target.extent),
         };
-        let groups = count.div_ceil(WORKGROUP_SIZE);
 
         let instances = frame.module.import_buffer(&instances);
         let vertices = frame.module.import_buffer(&vertices);
@@ -169,7 +168,7 @@ impl Example for Compute {
             .bind_pipeline(self.place)
             .write(instances)
             .push_constants(&push)
-            .dispatch(groups, 1, 1)
+            .dispatch_invocations(count, 1, 1)
             .end_compute();
 
         // a region stands in for the first resource it declared, so writing the vertices first
@@ -183,7 +182,7 @@ impl Example for Compute {
             .write(vertices)
             .read(placed)
             .push_constants(&push)
-            .dispatch(groups, 1, 1)
+            .dispatch(count, 1, 1)
             .end_compute();
 
         let target = frame.module.clear(frame.swapchain_image, BACKGROUND);
@@ -282,6 +281,7 @@ mod tests {
             let reflection = shader::reflect(&read_spirv(spirv)).expect("shader should reflect");
 
             assert_eq!(reflection.stage, vk::ShaderStageFlags::COMPUTE);
+            assert_eq!(reflection.local_size, [WORKGROUP_SIZE, 1, 1]);
             assert!(reflection.bindings.is_empty());
             assert_eq!(reflection.push_constant_offset, 0);
             assert_eq!(reflection.push_constant_size as usize, size_of::<PushConstants>());

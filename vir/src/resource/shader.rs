@@ -7,6 +7,7 @@ const HEADER_WORDS: usize = 5;
 
 mod op {
     pub const ENTRY_POINT: u16 = 15;
+    pub const EXECUTION_MODE: u16 = 16;
     pub const TYPE_VOID: u16 = 19;
     pub const TYPE_BOOL: u16 = 20;
     pub const TYPE_INT: u16 = 21;
@@ -24,7 +25,13 @@ mod op {
     pub const VARIABLE: u16 = 59;
     pub const DECORATE: u16 = 71;
     pub const MEMBER_DECORATE: u16 = 72;
+    pub const EXECUTION_MODE_ID: u16 = 331;
     pub const TYPE_ACCELERATION_STRUCTURE: u16 = 5341;
+}
+
+mod execution_mode {
+    pub const LOCAL_SIZE: u32 = 17;
+    pub const LOCAL_SIZE_ID: u32 = 38;
 }
 
 mod decoration {
@@ -78,6 +85,8 @@ pub struct Reflection {
     pub push_constant_size: u32,
     /// Empty for every stage but the vertex stage.
     pub vertex_inputs: Vec<VertexInput>,
+    /// The workgroup the stage declares. `[1, 1, 1]` for every stage but the compute stage.
+    pub local_size: [u32; 3],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +120,10 @@ struct Parsed {
     member_decorations: HashMap<(u32, u32, u32), Vec<u32>>,
     constants: HashMap<u32, u32>,
     variables: Vec<(u32, u32, u32)>,
+    local_size: Option<[u32; 3]>,
+    /// A `LocalSizeId` names constants rather than literals, which are only known once the whole
+    /// module has been walked.
+    local_size_id: Option<[u32; 3]>,
 }
 
 fn decode_literal_string(words: &[u32]) -> Option<(CString, usize)> {
@@ -147,6 +160,12 @@ fn parse(spirv: &[u32]) -> Option<Parsed> {
             op::ENTRY_POINT if operands.len() >= 3 => {
                 let (name, _) = decode_literal_string(&operands[2..])?;
                 parsed.entry_points.push((operands[0], name));
+            },
+            op::EXECUTION_MODE if operands.len() >= 5 && operands[1] == execution_mode::LOCAL_SIZE => {
+                parsed.local_size = Some([operands[2], operands[3], operands[4]]);
+            },
+            op::EXECUTION_MODE_ID if operands.len() >= 5 && operands[1] == execution_mode::LOCAL_SIZE_ID => {
+                parsed.local_size_id = Some([operands[2], operands[3], operands[4]]);
             },
             op::TYPE_VOID | op::TYPE_BOOL if !operands.is_empty() => {
                 parsed.types.insert(operands[0], TypeInfo::Opaque);
@@ -263,6 +282,20 @@ fn parse(spirv: &[u32]) -> Option<Parsed> {
 }
 
 impl Parsed {
+    /// The workgroup the module declares, whether it spelled it as literals or as constants.
+    fn declared_local_size(&self) -> Option<[u32; 3]> {
+        if let Some(local_size) = self.local_size {
+            return Some(local_size);
+        }
+
+        let ids = self.local_size_id?;
+        Some([
+            *self.constants.get(&ids[0])?,
+            *self.constants.get(&ids[1])?,
+            *self.constants.get(&ids[2])?,
+        ])
+    }
+
     fn decoration(&self, target: u32, decoration: u32) -> Option<u32> {
         self.decorations.get(&(target, decoration))?.first().copied()
     }
@@ -517,6 +550,16 @@ pub fn reflect(spirv: &[u32]) -> Result<Reflection, vk::Result> {
         None => (0, 0),
     };
 
+    let local_size = match parsed.declared_local_size() {
+        Some(local_size) if local_size.iter().all(|axis| *axis > 0) => local_size,
+        _ => {
+            if stage == vk::ShaderStageFlags::COMPUTE {
+                tracing::warn!("compute shader declares no workgroup size; it is taken to be one invocation");
+            }
+            [1, 1, 1]
+        },
+    };
+
     Ok(Reflection {
         stage,
         entry_point: entry_point.clone(),
@@ -524,6 +567,7 @@ pub fn reflect(spirv: &[u32]) -> Result<Reflection, vk::Result> {
         push_constant_offset,
         push_constant_size,
         vertex_inputs,
+        local_size,
     })
 }
 
@@ -719,6 +763,53 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// A compute module whose workgroup is spelled the way `[numthreads]` compiles down to.
+    fn compute_module(mode: u16, local_size: [u32; 3]) -> Vec<u32> {
+        let mut words = vec![MAGIC, 0x0001_0300, 0, 100, 0];
+
+        let mut entry = vec![5, 99];
+        entry.extend(literal("cs_main"));
+        words.extend(inst(op::ENTRY_POINT, &entry));
+
+        let operands = match mode {
+            op::EXECUTION_MODE_ID => [99, execution_mode::LOCAL_SIZE_ID, 30, 31, 32],
+            _ => [
+                99,
+                execution_mode::LOCAL_SIZE,
+                local_size[0],
+                local_size[1],
+                local_size[2],
+            ],
+        };
+        words.extend(inst(mode, &operands));
+
+        words.extend(inst(op::TYPE_INT, &[11, 32, 0]));
+        for (id, axis) in [30, 31, 32].into_iter().zip(local_size) {
+            words.extend(inst(op::CONSTANT, &[11, id, axis]));
+        }
+
+        words
+    }
+
+    #[test]
+    fn reads_the_workgroup_a_compute_shader_declares() {
+        let reflection = reflect(&compute_module(op::EXECUTION_MODE, [64, 2, 1])).expect("module should reflect");
+        assert_eq!(reflection.stage, vk::ShaderStageFlags::COMPUTE);
+        assert_eq!(reflection.local_size, [64, 2, 1]);
+    }
+
+    #[test]
+    fn reads_a_workgroup_that_names_constants_rather_than_literals() {
+        let reflection = reflect(&compute_module(op::EXECUTION_MODE_ID, [8, 8, 4])).expect("module should reflect");
+        assert_eq!(reflection.local_size, [8, 8, 4]);
+    }
+
+    #[test]
+    fn a_stage_with_no_workgroup_reports_one_invocation() {
+        let reflection = reflect(&vertex_module()).expect("module should reflect");
+        assert_eq!(reflection.local_size, [1, 1, 1]);
     }
 
     #[test]
