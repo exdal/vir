@@ -162,7 +162,11 @@ fn parse(spirv: &[u32]) -> Option<Parsed> {
                 );
             },
             op::TYPE_INT if operands.len() >= 3 => {
-                let kind = if operands[2] == 0 { ScalarKind::Uint } else { ScalarKind::Sint };
+                let kind = if operands[2] == 0 {
+                    ScalarKind::Uint
+                } else {
+                    ScalarKind::Sint
+                };
                 parsed.types.insert(
                     operands[0],
                     TypeInfo::Scalar {
@@ -306,7 +310,7 @@ impl Parsed {
             Some(TypeInfo::Vector { component, count }) => self.type_size(*component, depth + 1) * count,
             Some(TypeInfo::Matrix { column, count }) => {
                 self.decoration(ty, decoration::MATRIX_STRIDE)
-                    .map_or_else(|| self.type_size(*column, depth + 1), |stride| stride)
+                    .unwrap_or_else(|| self.type_size(*column, depth + 1))
                     * count
             },
             Some(TypeInfo::Array { element, length }) => {

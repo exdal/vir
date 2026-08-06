@@ -6,13 +6,26 @@ use slang::Downcast;
 /// Every Slang module, with the entry points to pull out of it and the file each one is
 /// written to. A module is linked on its own, so entry point names only have to be unique
 /// within their module.
-const MODULES: [(&str, &[(&str, &str)]); 2] = [
-    ("triangle.slang", &[
-        ("vs_main", "triangle.vert.spv"),
-        ("fs_main", "triangle.frag.spv"),
-        ("vs_buffer", "triangle_buffer.vert.spv"),
-    ]),
-    ("egui.slang", &[("vs_main", "egui.vert.spv"), ("fs_main", "egui.frag.spv")]),
+const MODULES: [(&str, &[(&str, &str)]); 4] = [
+    (
+        "triangle.slang",
+        &[("vs_main", "triangle.vert.spv"), ("fs_main", "triangle.frag.spv")],
+    ),
+    (
+        "vertex_buffer.slang",
+        &[
+            ("vs_main", "vertex_buffer.vert.spv"),
+            ("fs_main", "vertex_buffer.frag.spv"),
+        ],
+    ),
+    (
+        "texture.slang",
+        &[("vs_main", "texture.vert.spv"), ("fs_main", "texture.frag.spv")],
+    ),
+    (
+        "egui.slang",
+        &[("vs_main", "egui.vert.spv"), ("fs_main", "egui.frag.spv")],
+    ),
 ];
 
 fn main() -> Result<(), Box<dyn Error>> {

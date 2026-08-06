@@ -99,7 +99,7 @@ impl FromValue for Vec<ValueId> {
 impl FromValue for ValueId {
     fn from_value(value: &Value) -> Self {
         match value {
-            Value::Reference(v) => v.clone(),
+            Value::Reference(v) => *v,
             _ => panic!("expected Reference, got {:?}", value),
         }
     }
@@ -108,7 +108,7 @@ impl FromValue for ValueId {
 impl FromValue for Access {
     fn from_value(value: &Value) -> Self {
         match value {
-            Value::Access(v) => v.clone(),
+            Value::Access(v) => *v,
             _ => panic!("expected Access, got {:?}", value),
         }
     }
@@ -117,7 +117,7 @@ impl FromValue for Access {
 impl FromValue for ClearValue {
     fn from_value(value: &Value) -> Self {
         match value {
-            Value::ClearValue(v) => v.clone(),
+            Value::ClearValue(v) => *v,
             _ => panic!("expected ClearValue, got {:?}", value),
         }
     }

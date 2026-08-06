@@ -44,16 +44,6 @@ struct SemaphoreSubmitInfo {
     access: Access,
 }
 
-impl SemaphoreSubmitInfo {
-    fn default() -> Self {
-        Self {
-            semaphore: vk::Semaphore::null(),
-            value: 0,
-            access: Access::None,
-        }
-    }
-}
-
 impl From<&SemaphoreSubmitInfo> for vk::SemaphoreSubmitInfo<'_> {
     fn from(info: &SemaphoreSubmitInfo) -> Self {
         vk::SemaphoreSubmitInfo::default()

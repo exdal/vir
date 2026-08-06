@@ -3,6 +3,10 @@ name = "vir-examples"
 version = "0.0.0"
 edition = "2024"
 
+[lib]
+name = "vir_examples"
+path = "src/lib.rs"
+
 [dependencies]
 vir = { path = "../vir" }
 ash = { workspace = true }
@@ -12,7 +16,29 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 egui = { workspace = true }
 egui-winit = { workspace = true }
+image = { workspace = true }
 
 # Slang is an example-side concern: `vir` itself only ever consumes SPIR-V.
 [build-dependencies]
 shader-slang = { workspace = true }
+
+# Each example asserts on the shaders it owns, so `cargo test` has to reach into them.
+[[example]]
+name = "triangle"
+test = true
+
+[[example]]
+name = "vertex_buffer"
+test = true
+
+[[example]]
+name = "offscreen"
+test = true
+
+[[example]]
+name = "texture"
+test = true
+
+[[example]]
+name = "egui"
+test = true

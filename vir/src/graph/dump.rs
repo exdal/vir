@@ -18,10 +18,9 @@ pub fn dump(instructions: &[Instr]) -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "; render graph: {} instructions, {passes} passes, {barriers} barriers",
+        "; render graph: {} instructions, {passes} passes, {barriers} barriers, {folded} types",
         instructions.len()
     );
-    let _ = writeln!(out, "; {folded} types and constants are printed where they are used\n");
 
     let mut indent = "";
     for (id, ir) in instructions {

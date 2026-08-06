@@ -12,11 +12,6 @@ struct VSOutput {
     float3 color : COLOR;
 };
 
-struct VSInput {
-    float2 position : POSITION;
-    float3 color : COLOR;
-};
-
 static const float2 POSITIONS[3] = {
     float2(0.0, -0.5),
     float2(0.5, 0.5),
@@ -34,14 +29,6 @@ VSOutput vs_main(uint vertex_id: SV_VertexID) {
     VSOutput output;
     output.position = float4(POSITIONS[vertex_id] * push.scale + push.offset, 0.0, 1.0);
     output.color = COLORS[vertex_id];
-    return output;
-}
-
-[shader("vertex")]
-VSOutput vs_buffer(VSInput input) {
-    VSOutput output;
-    output.position = float4(input.position, 0.0, 1.0);
-    output.color = input.color;
     return output;
 }
 

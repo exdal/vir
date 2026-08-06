@@ -35,13 +35,13 @@ use vir::{
 /// The block `egui.slang` declares.
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct PushConstants {
+struct PushConstants {
     screen_size: [f32; 2],
     texture_index: u32,
 }
 
 /// Where `texture_index` sits in the block, since a draw pushes it on its own.
-pub const TEXTURE_INDEX_OFFSET: u32 = 8;
+const TEXTURE_INDEX_OFFSET: u32 = 8;
 
 /// egui hands over `Color32`, which is sRGB with premultiplied alpha, so an `_SRGB` format is
 /// what makes a sample come back linear the way the shader expects.
@@ -503,5 +503,98 @@ impl EguiPass {
         }
 
         pass.end_rendering()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use vir::{
+        DescriptorBinding,
+        VertexAttribute,
+        VertexLayout,
+        resource::{pipeline::push_constant_ranges, shader},
+    };
+
+    use super::*;
+    use crate::{EGUI_FRAG_SPV, EGUI_VERT_SPV, read_spirv};
+
+    /// The whole backend rests on this: `epaint::Vertex` is `[f32;2], [f32;2], [u8;4]`, and
+    /// reflection only derives 32-bit attribute formats, so the shader declares the packed
+    /// `Color32` as a `uint`. That has to land on the same 20 bytes epaint uploads. An egui bump
+    /// that changes `Vertex` should fail here rather than render garbage.
+    #[test]
+    fn the_reflected_vertex_layout_matches_epaint() {
+        let reflections = [
+            shader::reflect(&read_spirv(EGUI_VERT_SPV)).expect("vertex shader should reflect"),
+            shader::reflect(&read_spirv(EGUI_FRAG_SPV)).expect("fragment shader should reflect"),
+        ];
+
+        let layout = VertexLayout::interleaved(&reflections);
+        assert_eq!(layout.stride as usize, size_of::<EguiVertex>());
+        assert_eq!(
+            layout.attributes,
+            vec![
+                VertexAttribute {
+                    location: 0,
+                    format: vk::Format::R32G32_SFLOAT,
+                    offset: 0,
+                },
+                VertexAttribute {
+                    location: 1,
+                    format: vk::Format::R32G32_SFLOAT,
+                    offset: 8,
+                },
+                VertexAttribute {
+                    location: 2,
+                    format: vk::Format::R32_UINT,
+                    offset: 16,
+                },
+            ]
+        );
+    }
+
+    /// The vertex stage reads the screen size out of the block and the fragment stage the
+    /// texture index, so one range covers both and spans exactly the struct the pass pushes.
+    #[test]
+    fn the_push_constant_range_covers_both_stages() {
+        let reflect = |spirv| shader::reflect(&read_spirv(spirv)).expect("shader should reflect");
+
+        let ranges = push_constant_ranges(&[reflect(EGUI_VERT_SPV), reflect(EGUI_FRAG_SPV)]);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(
+            ranges[0].stage_flags,
+            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT
+        );
+        assert_eq!(ranges[0].offset, 0);
+        assert_eq!(ranges[0].size as usize, size_of::<PushConstants>());
+
+        // and the index has to be the tail of the block, since a draw pushes it alone
+        assert_eq!(
+            TEXTURE_INDEX_OFFSET as usize,
+            size_of::<PushConstants>() - size_of::<u32>()
+        );
+    }
+
+    /// The whole bindless path rests on this shape: a variable-count combined image sampler
+    /// array is what a pipeline layout recognises as the slot the graph's texture table is
+    /// written into, so a shader that reflects as anything else silently samples nothing.
+    #[test]
+    fn the_fragment_shader_declares_the_bindless_texture_table() {
+        let reflection = shader::reflect(&read_spirv(EGUI_FRAG_SPV)).expect("shader should reflect");
+
+        assert_eq!(
+            reflection.bindings,
+            vec![DescriptorBinding {
+                set: 0,
+                binding: 0,
+                descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                count: 1,
+                variable_count: true,
+            }]
+        );
+
+        // and the vertex stage stays out of it, so the table is fragment-only
+        let vertex = shader::reflect(&read_spirv(EGUI_VERT_SPV)).expect("shader should reflect");
+        assert!(vertex.bindings.is_empty());
     }
 }
