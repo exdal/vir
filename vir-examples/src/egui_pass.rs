@@ -1,18 +1,33 @@
+use std::collections::HashMap;
+
 use ash::vk;
-use egui::epaint::{ClippedPrimitive, Primitive, Vertex as EguiVertex};
+use egui::{
+    TextureFilter,
+    TextureOptions,
+    TextureWrapMode,
+    TexturesDelta,
+    epaint::{ClippedPrimitive, ImageData, ImageDelta, Primitive, Vertex as EguiVertex},
+};
 use vir::{
     BlendPreset,
     Buffer,
+    BufferImageCopy,
     BufferInfo,
+    Context,
     DynamicStateFlags,
     FrameAllocator,
     GraphicsPipelineInfo,
+    Image,
+    ImageAttachment,
+    ImageInfo,
     MemoryLocation,
     Module,
+    PersistentAllocator,
     PipelineId,
     RasterizationState,
     Rect2D,
     RenderGraph,
+    SamplerInfo,
     ValueId,
     allocator::Allocator,
 };
@@ -22,32 +37,74 @@ use vir::{
 #[derive(Clone, Copy)]
 pub struct PushConstants {
     screen_size: [f32; 2],
+    texture_index: u32,
+}
+
+/// Where `texture_index` sits in the block, since a draw pushes it on its own.
+pub const TEXTURE_INDEX_OFFSET: u32 = 8;
+
+/// egui hands over `Color32`, which is sRGB with premultiplied alpha, so an `_SRGB` format is
+/// what makes a sample come back linear the way the shader expects.
+const TEXTURE_FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
+
+/// One of egui's textures as the GPU holds it.
+struct Texture {
+    image: Image,
+    image_view: vk::ImageView,
+    /// The texture's slot in the graph's bindless table, which is what a draw pushes.
+    slot: vir::TextureId,
+    extent: vk::Extent2D,
+    options: TextureOptions,
+    /// The layout the last frame that touched it left it in.
+    layout: vk::ImageLayout,
+}
+
+impl Texture {
+    fn attachment(&self) -> ImageAttachment {
+        ImageAttachment::from_image(&self.image, self.layout).with_image_view(self.image_view)
+    }
 }
 
 /// One primitive's slice of the frame's shared buffers.
 struct MeshDraw {
     clip: vk::Rect2D,
+    texture: egui::TextureId,
     index_offset: u32,
     index_count: u32,
     vertex_offset: i32,
 }
 
-/// A frame's worth of tessellated geometry, already uploaded.
+/// One texture patch staged in host memory, waiting for the copy that lands it.
+struct Upload {
+    texture: egui::TextureId,
+    staging: Buffer,
+    region: BufferImageCopy,
+}
+
+/// A frame's worth of tessellated geometry and texture patches, already staged.
 pub struct EguiFrame {
     vertices: Buffer,
     indices: Buffer,
     draws: Vec<MeshDraw>,
+    uploads: Vec<Upload>,
     screen_size_in_points: [f32; 2],
 }
 
 impl EguiFrame {
-    pub fn is_empty(&self) -> bool { self.draws.is_empty() }
+    pub fn is_empty(&self) -> bool { self.draws.is_empty() && self.uploads.is_empty() }
 
     pub fn draw_count(&self) -> usize { self.draws.len() }
+
+    pub fn upload_count(&self) -> usize { self.uploads.len() }
 }
 
 pub struct EguiPass {
     pipeline: PipelineId,
+    textures: HashMap<egui::TextureId, Texture>,
+    samplers: HashMap<TextureOptions, vk::Sampler>,
+    /// Textures egui freed last frame, which the frame it freed them in may still have
+    /// painted with.
+    pending_free: Vec<egui::TextureId>,
 }
 
 /// Clips `rect`, which egui gives in points, to the framebuffer it is being drawn into.
@@ -69,6 +126,21 @@ fn scissor_from_clip(clip: egui::Rect, pixels_per_point: f32, target: vk::Extent
     }
 }
 
+fn filter(filter: TextureFilter) -> vk::Filter {
+    match filter {
+        TextureFilter::Nearest => vk::Filter::NEAREST,
+        TextureFilter::Linear => vk::Filter::LINEAR,
+    }
+}
+
+fn address_mode(wrap: TextureWrapMode) -> vk::SamplerAddressMode {
+    match wrap {
+        TextureWrapMode::ClampToEdge => vk::SamplerAddressMode::CLAMP_TO_EDGE,
+        TextureWrapMode::Repeat => vk::SamplerAddressMode::REPEAT,
+        TextureWrapMode::MirroredRepeat => vk::SamplerAddressMode::MIRRORED_REPEAT,
+    }
+}
+
 impl EguiPass {
     pub fn new(graph: &mut RenderGraph, vertex_spirv: &[u32], fragment_spirv: &[u32]) -> Result<Self, vk::Result> {
         let pipeline = graph.declare_pipeline(
@@ -77,15 +149,181 @@ impl EguiPass {
                 .with_shader(fragment_spirv),
         )?;
 
-        Ok(Self { pipeline })
+        Ok(Self {
+            pipeline,
+            textures: HashMap::new(),
+            samplers: HashMap::new(),
+            pending_free: Vec::new(),
+        })
     }
 
-    /// Flattens every mesh into one vertex and one index buffer taken from this frame's
-    /// allocator, so the whole UI draws out of a single binding.
+    /// Hands every texture and sampler back. The device has to be idle first.
+    pub fn destroy(&mut self, graph: &mut RenderGraph, allocator: &mut PersistentAllocator) {
+        for (_, texture) in self.textures.drain() {
+            graph.unregister_texture(texture.slot);
+            allocator.deallocate_image_view(texture.image_view);
+            allocator.deallocate_image(texture.image);
+        }
+
+        for (_, sampler) in self.samplers.drain() {
+            allocator.deallocate_sampler(sampler);
+        }
+    }
+
+    fn sampler(
+        &mut self, allocator: &mut PersistentAllocator, options: TextureOptions,
+    ) -> Result<vk::Sampler, vk::Result> {
+        if let Some(sampler) = self.samplers.get(&options) {
+            return Ok(*sampler);
+        }
+
+        let sampler = allocator.allocate_sampler(
+            &SamplerInfo::default()
+                .with_mag_filter(filter(options.magnification))
+                .with_min_filter(filter(options.minification))
+                .with_address_mode(address_mode(options.wrap_mode)),
+        )?;
+        self.samplers.insert(options, sampler);
+
+        Ok(sampler)
+    }
+
+    /// Turns this frame's texture deltas into staged patches, creating whatever images they
+    /// name along the way.
+    ///
+    /// egui frees a texture *after* the frame that painted with it, so a free is held over to
+    /// the next call rather than acted on here. Whatever does get destroyed is destroyed
+    /// behind a wait, since work submitted for earlier frames may still be sampling it.
+    ///
+    /// The deltas are taken by value because handling them is the whole contract: egui asserts
+    /// on a `TexturesDelta` that is dropped with anything left in it.
+    fn stage_textures(
+        &mut self, ctx: &Context, graph: &mut RenderGraph, persistent: &mut PersistentAllocator,
+        allocator: &mut FrameAllocator, mut textures_delta: TexturesDelta,
+    ) -> Result<Vec<Upload>, vk::Result> {
+        let mut uploads = Vec::new();
+        let mut retired = Vec::new();
+
+        for id in std::mem::take(&mut self.pending_free) {
+            match self.textures.remove(&id) {
+                Some(texture) => retired.push(texture),
+                None => tracing::warn!(?id, "egui freed a texture that was never uploaded"),
+            }
+        }
+
+        for (id, deltas) in &textures_delta.set {
+            for delta in deltas {
+                let ImageData::Color(image) = &delta.image;
+                let size = vk::Extent2D {
+                    width: image.size[0] as u32,
+                    height: image.size[1] as u32,
+                };
+                if size.width == 0 || size.height == 0 {
+                    continue;
+                }
+
+                if !self.prepare_target(graph, persistent, &mut retired, *id, delta, size)? {
+                    continue;
+                }
+
+                let mut staging =
+                    allocator.allocate_buffer(&BufferInfo::staging(size_of_val(image.pixels.as_slice()) as u64))?;
+                staging.write(0, &image.pixels)?;
+
+                let offset = match delta.pos {
+                    Some([x, y]) => vk::Offset2D {
+                        x: x as i32,
+                        y: y as i32,
+                    },
+                    None => vk::Offset2D::default(),
+                };
+
+                uploads.push(Upload {
+                    texture: *id,
+                    staging,
+                    region: BufferImageCopy::region(offset, size),
+                });
+            }
+        }
+
+        self.pending_free.extend(textures_delta.free.iter().copied());
+        textures_delta.clear();
+
+        if !retired.is_empty() {
+            // the only thing that says an earlier frame is done sampling these
+            unsafe { ctx.device().device_wait_idle() }?;
+            for texture in retired {
+                graph.unregister_texture(texture.slot);
+                persistent.deallocate_image_view(texture.image_view);
+                persistent.deallocate_image(texture.image);
+            }
+        }
+
+        Ok(uploads)
+    }
+
+    /// Makes sure `id` names an image this delta can be copied into, pushing whatever image
+    /// had to be replaced to get there onto `retired`.
+    ///
+    /// A whole delta that changes the size or the sampling of a texture replaces it; a partial
+    /// one only ever patches what is already there.
+    fn prepare_target(
+        &mut self, graph: &mut RenderGraph, allocator: &mut PersistentAllocator, retired: &mut Vec<Texture>,
+        id: egui::TextureId, delta: &ImageDelta, size: vk::Extent2D,
+    ) -> Result<bool, vk::Result> {
+        let existing = self.textures.get(&id);
+
+        if delta.pos.is_some() {
+            if existing.is_none() {
+                tracing::warn!(
+                    ?id,
+                    "egui patched a texture that was never uploaded; the patch is dropped"
+                );
+                return Ok(false);
+            }
+
+            return Ok(true);
+        }
+
+        if existing.is_some_and(|texture| texture.extent == size && texture.options == delta.options) {
+            return Ok(true);
+        }
+
+        let sampler = self.sampler(allocator, delta.options)?;
+        let info = ImageInfo::texture(size, TEXTURE_FORMAT).with_name(format!("egui texture {id:?}"));
+        let image = allocator.allocate_image(&info)?;
+        let image_view = allocator.allocate_image_view(
+            image.handle(),
+            TEXTURE_FORMAT,
+            vk::ImageViewType::TYPE_2D,
+            image.subresource_range(),
+        )?;
+
+        let texture = Texture {
+            image,
+            image_view,
+            slot: graph.register_texture(image_view, sampler),
+            extent: size,
+            options: delta.options,
+            layout: vk::ImageLayout::UNDEFINED,
+        };
+
+        retired.extend(self.textures.insert(id, texture));
+
+        Ok(true)
+    }
+
+    /// Stages this frame's texture patches, then flattens every mesh into one vertex and one
+    /// index buffer taken from this frame's allocator, so the whole UI draws out of a single
+    /// binding.
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare(
-        &self, allocator: &mut FrameAllocator, primitives: &[ClippedPrimitive], pixels_per_point: f32,
-        target: vk::Extent2D,
+        &mut self, ctx: &Context, graph: &mut RenderGraph, persistent: &mut PersistentAllocator,
+        allocator: &mut FrameAllocator, textures_delta: TexturesDelta, primitives: &[ClippedPrimitive],
+        pixels_per_point: f32, target: vk::Extent2D,
     ) -> Result<EguiFrame, vk::Result> {
+        let uploads = self.stage_textures(ctx, graph, persistent, allocator, textures_delta)?;
+
         let mut vertices: Vec<EguiVertex> = Vec::new();
         let mut indices: Vec<u32> = Vec::new();
         let mut draws = Vec::new();
@@ -98,6 +336,10 @@ impl EguiPass {
             if mesh.indices.is_empty() {
                 continue;
             }
+            if !self.textures.contains_key(&mesh.texture_id) {
+                tracing::warn!(id = ?mesh.texture_id, "mesh names a texture that was never uploaded; it is dropped");
+                continue;
+            }
 
             let clip = scissor_from_clip(primitive.clip_rect, pixels_per_point, target);
             // a zero-area scissor is legal but the draw would be wasted work
@@ -107,6 +349,7 @@ impl EguiPass {
 
             draws.push(MeshDraw {
                 clip,
+                texture: mesh.texture_id,
                 index_offset: indices.len() as u32,
                 index_count: mesh.indices.len() as u32,
                 vertex_offset: vertices.len() as i32,
@@ -126,13 +369,13 @@ impl EguiPass {
                 vertices: Buffer::default(),
                 indices: Buffer::default(),
                 draws,
+                uploads,
                 screen_size_in_points,
             });
         }
 
-        let mut vertex_buffer = allocator.allocate_buffer(
-            &BufferInfo::vertex(size_of_val(vertices.as_slice()) as u64).with_name("egui vertices"),
-        )?;
+        let mut vertex_buffer = allocator
+            .allocate_buffer(&BufferInfo::vertex(size_of_val(vertices.as_slice()) as u64).with_name("egui vertices"))?;
         vertex_buffer.write(0, &vertices)?;
 
         let mut index_buffer = allocator.allocate_buffer(
@@ -149,21 +392,65 @@ impl EguiPass {
             vertices: vertex_buffer,
             indices: index_buffer,
             draws,
+            uploads,
             screen_size_in_points,
         })
     }
 
-    /// Records the UI over `target`, returning the version of it the pass produced.
-    pub fn record(&self, module: &mut Module, target: ValueId, frame: &EguiFrame) -> ValueId {
+    /// Records this frame's texture copies and then the UI over `target`, returning the version
+    /// of it the pass produced.
+    pub fn record(&mut self, module: &mut Module, target: ValueId, frame: &EguiFrame) -> ValueId {
         if frame.is_empty() {
             return target;
         }
 
-        let vertices = module.import_buffer(&frame.vertices);
-        let indices = module.import_buffer(&frame.indices);
+        // one value per texture: importing the same image twice would hand the graph two
+        // independent histories of one resource, and it would barrier them apart
+        let mut values: Vec<(egui::TextureId, ValueId)> = Vec::new();
+
+        fn value_of(
+            module: &mut Module, values: &mut Vec<(egui::TextureId, ValueId)>, id: egui::TextureId, texture: &Texture,
+        ) -> usize {
+            match values.iter().position(|(other, _)| *other == id) {
+                Some(index) => index,
+                None => {
+                    let value = module.import_attachment(&texture.attachment());
+                    module.set_name(value, format!("egui texture {id:?}"));
+                    values.push((id, value));
+                    values.len() - 1
+                },
+            }
+        }
+
+        for upload in &frame.uploads {
+            let Some(texture) = self.textures.get(&upload.texture) else {
+                continue;
+            };
+
+            let index = value_of(module, &mut values, upload.texture, texture);
+            let staging = module.import_buffer(&upload.staging);
+            module.set_name(staging, format!("egui staging {:?}", upload.texture));
+            values[index].1 = module.copy_buffer_to_image_region(staging, values[index].1, upload.region);
+        }
+
+        for draw in &frame.draws {
+            let Some(texture) = self.textures.get(&draw.texture) else {
+                continue;
+            };
+            value_of(module, &mut values, draw.texture, texture);
+        }
+
+        let geometry = (!frame.draws.is_empty()).then(|| {
+            let vertices = module.import_buffer(&frame.vertices);
+            let indices = module.import_buffer(&frame.indices);
+            module.set_name(vertices, "egui vertices");
+            module.set_name(indices, "egui indices");
+            (vertices, indices)
+        });
 
         let mut pass = module
             .begin_rendering(&[target])
+            .with_name("egui")
             .bind_graphics_pipeline(self.pipeline)
             .set_dynamic_state(DynamicStateFlags::Viewport | DynamicStateFlags::Scissor)
             .set_viewport(0, Rect2D::framebuffer())
@@ -174,11 +461,26 @@ impl EguiPass {
             })
             .push_constants(&PushConstants {
                 screen_size: frame.screen_size_in_points,
-            })
-            .bind_vertex_buffer(0, vertices)
-            .bind_index_buffer(indices, vk::IndexType::UINT32);
+                texture_index: 0,
+            });
+
+        // naming every texture the frame touched, and not just the ones a draw reads, is what
+        // keeps a copy with no draw behind it reachable from the graph's roots
+        for (_, value) in &values {
+            pass = pass.sample_image(*value);
+        }
+
+        if let Some((vertices, indices)) = geometry {
+            pass = pass
+                .bind_vertex_buffer(0, vertices)
+                .bind_index_buffer(indices, vk::IndexType::UINT32);
+        }
 
         for draw in &frame.draws {
+            let Some(texture) = self.textures.get(&draw.texture) else {
+                continue;
+            };
+
             pass = pass
                 .set_scissor(
                     0,
@@ -189,7 +491,15 @@ impl EguiPass {
                         draw.clip.extent.height,
                     ),
                 )
+                .push_constants_at(TEXTURE_INDEX_OFFSET, &texture.slot.0)
                 .draw_indexed_range(draw.index_count, 1, draw.index_offset, draw.vertex_offset, 0);
+        }
+
+        // the region left every one of them in the layout a shader read wants
+        for (id, _) in &values {
+            if let Some(texture) = self.textures.get_mut(id) {
+                texture.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+            }
         }
 
         pass.end_rendering()

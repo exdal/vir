@@ -29,6 +29,9 @@ impl BufferInfo {
         Self::new(size, vk::BufferUsageFlags::VERTEX_BUFFER, MemoryLocation::CpuToGpu)
     }
 
+    /// A host-visible buffer to stage a copy into device-local memory out of.
+    pub fn staging(size: u64) -> Self { Self::new(size, vk::BufferUsageFlags::TRANSFER_SRC, MemoryLocation::CpuToGpu) }
+
     pub fn with_usage(mut self, usage: vk::BufferUsageFlags) -> Self {
         self.usage |= usage;
         self

@@ -112,11 +112,33 @@ pub fn push_constant_ranges(reflections: &[Reflection]) -> Vec<vk::PushConstantR
         .collect()
 }
 
+/// One descriptor set of a [`PipelineLayout`], with what a pool needs to allocate it.
+#[derive(Debug, Default, Clone)]
+pub struct SetLayout {
+    pub handle: vk::DescriptorSetLayout,
+    /// How many descriptors of each type the set holds.
+    pub sizes: Vec<(vk::DescriptorType, u32)>,
+    /// The count the set's variable-count binding is allocated with, or zero when it has none.
+    pub variable_count: u32,
+}
+
+/// The binding a graph writes its texture table into.
+///
+/// A variable-count combined image sampler array is the shape the table is written in, so
+/// that is what a layout advertises here; a pipeline whose shaders declare anything else
+/// simply gets no table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextureBinding {
+    pub set: u32,
+    pub binding: u32,
+}
+
 #[derive(Debug, Default)]
 pub struct PipelineLayout {
     pub handle: vk::PipelineLayout,
-    pub set_layouts: Vec<vk::DescriptorSetLayout>,
+    pub sets: Vec<SetLayout>,
     pub push_constant_ranges: Vec<vk::PushConstantRange>,
+    pub texture_binding: Option<TextureBinding>,
 }
 
 impl PipelineLayout {
@@ -171,22 +193,33 @@ impl PipelineLayout {
         }
 
         let set_count = merged.keys().map(|(set, _)| set + 1).max().unwrap_or(0);
-        let mut set_layouts = Vec::with_capacity(set_count as usize);
+        let mut sets: Vec<SetLayout> = Vec::with_capacity(set_count as usize);
+        let mut texture_binding = None;
+
+        let destroy_sets = |sets: &[SetLayout]| {
+            sets.iter()
+                .for_each(|set| unsafe { device.destroy_descriptor_set_layout(set.handle, None) });
+        };
 
         for set in 0..set_count {
             let entries = merged.range((set, 0)..(set + 1, 0));
 
             let mut bindings = Vec::new();
             let mut binding_flags = Vec::new();
-            let mut any_variable = false;
+            let mut sizes = Vec::new();
+            let mut variable_count = 0;
 
             for ((_, binding), info) in entries {
                 let count = if info.variable_count {
-                    any_variable = true;
+                    variable_count = max_variable_descriptor_count;
                     max_variable_descriptor_count
                 } else {
                     info.count
                 };
+
+                if info.variable_count && info.descriptor_type == vk::DescriptorType::COMBINED_IMAGE_SAMPLER {
+                    texture_binding = Some(TextureBinding { set, binding: *binding });
+                }
 
                 bindings.push(
                     vk::DescriptorSetLayoutBinding::default()
@@ -203,28 +236,33 @@ impl PipelineLayout {
                 } else {
                     vk::DescriptorBindingFlags::empty()
                 });
+
+                sizes.push((info.descriptor_type, count));
             }
 
             let mut flags_info = vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&binding_flags);
             let mut create_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
-            if any_variable {
+            if variable_count > 0 {
                 create_info = create_info
                     .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL)
                     .push_next(&mut flags_info);
             }
 
             match unsafe { device.create_descriptor_set_layout(&create_info, None) } {
-                Ok(layout) => set_layouts.push(layout),
+                Ok(handle) => sets.push(SetLayout {
+                    handle,
+                    sizes,
+                    variable_count,
+                }),
                 Err(err) => {
-                    set_layouts
-                        .iter()
-                        .for_each(|layout| unsafe { device.destroy_descriptor_set_layout(*layout, None) });
+                    destroy_sets(&sets);
                     return Err(err);
                 },
             }
         }
 
         let push_constant_ranges = push_constant_ranges(reflections);
+        let set_layouts = sets.iter().map(|set| set.handle).collect::<Vec<_>>();
 
         let create_info = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(&set_layouts)
@@ -233,26 +271,25 @@ impl PipelineLayout {
         let handle = match unsafe { device.create_pipeline_layout(&create_info, None) } {
             Ok(handle) => handle,
             Err(err) => {
-                set_layouts
-                    .iter()
-                    .for_each(|layout| unsafe { device.destroy_descriptor_set_layout(*layout, None) });
+                destroy_sets(&sets);
                 return Err(err);
             },
         };
 
         Ok(Self {
             handle,
-            set_layouts,
+            sets,
             push_constant_ranges,
+            texture_binding,
         })
     }
 
     pub(crate) fn destroy(&self, device: &ash::Device) {
         unsafe {
             device.destroy_pipeline_layout(self.handle, None);
-            self.set_layouts
+            self.sets
                 .iter()
-                .for_each(|layout| device.destroy_descriptor_set_layout(*layout, None));
+                .for_each(|set| device.destroy_descriptor_set_layout(set.handle, None));
         }
     }
 }

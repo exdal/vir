@@ -12,6 +12,7 @@ use crate::{
     ClearValue,
     CommandBuffer,
     Context,
+    DescriptorSets,
     DomainFlag,
     DynamicValues,
     GraphicsPipelineInfo,
@@ -24,11 +25,12 @@ use crate::{
     PipelineState,
     PushConstants,
     ResolvedViewport,
+    TextureId,
     Value,
     ValueId,
     VertexLayout,
     core::ScopedStack,
-    graph::{ir, value::FromValue},
+    graph::{dump, ir, value::FromValue},
     resource::{
         self,
         pipeline::{PipelineRequest, create_pipelines},
@@ -138,11 +140,14 @@ fn subresource_layers(attachment: &ImageAttachment) -> vk::ImageSubresourceLayer
 }
 
 fn blit_offsets(extent: vk::Extent3D) -> [vk::Offset3D; 2] {
-    [vk::Offset3D::default(), vk::Offset3D {
-        x: extent.width as i32,
-        y: extent.height as i32,
-        z: extent.depth.max(1) as i32,
-    }]
+    [
+        vk::Offset3D::default(),
+        vk::Offset3D {
+            x: extent.width as i32,
+            y: extent.height as i32,
+            z: extent.depth.max(1) as i32,
+        },
+    ]
 }
 
 struct DeclaredPipeline {
@@ -150,7 +155,15 @@ struct DeclaredPipeline {
     reflections: Vec<Reflection>,
     vertex: VertexLayout,
     layout: Option<PipelineLayout>,
+    descriptors: Option<DescriptorSets>,
+    written_textures: u64,
     variants: HashMap<PipelineState, vk::Pipeline>,
+}
+
+#[derive(Clone, Copy)]
+struct Texture {
+    image_view: vk::ImageView,
+    sampler: vk::Sampler,
 }
 
 pub const DEFAULT_VARIABLE_DESCRIPTOR_COUNT: u32 = 1024;
@@ -160,8 +173,12 @@ pub struct RenderGraph {
     pipelines: Vec<DeclaredPipeline>,
     variable_descriptor_count: u32,
     warned_push_constants: HashSet<PipelineId>,
+    textures: Vec<Option<Texture>>,
+    free_textures: Vec<u32>,
+    texture_revision: u64,
     values: Vec<Value>,
     bound_pipeline: Option<vk::Pipeline>,
+    bound_layout: Option<vk::PipelineLayout>,
     render_area: vk::Rect2D,
     recorded_viewports: Vec<ResolvedViewport>,
     recorded_scissors: Vec<vk::Rect2D>,
@@ -181,8 +198,12 @@ impl RenderGraph {
             pipelines: Vec::new(),
             variable_descriptor_count: DEFAULT_VARIABLE_DESCRIPTOR_COUNT,
             warned_push_constants: HashSet::new(),
+            textures: Vec::new(),
+            free_textures: Vec::new(),
+            texture_revision: 0,
             values: Vec::new(),
             bound_pipeline: None,
+            bound_layout: None,
             render_area: vk::Rect2D::default(),
             recorded_viewports: Vec::new(),
             recorded_scissors: Vec::new(),
@@ -221,10 +242,97 @@ impl RenderGraph {
             reflections,
             vertex,
             layout: None,
+            descriptors: None,
+            written_textures: 0,
             variants: HashMap::new(),
         });
 
         Ok(id)
+    }
+
+    pub fn register_texture(&mut self, image_view: vk::ImageView, sampler: vk::Sampler) -> TextureId {
+        let texture = Some(Texture { image_view, sampler });
+        self.texture_revision += 1;
+
+        match self.free_textures.pop() {
+            Some(index) => {
+                self.textures[index as usize] = texture;
+                TextureId(index)
+            },
+            None => {
+                self.textures.push(texture);
+                TextureId(self.textures.len() as u32 - 1)
+            },
+        }
+    }
+
+    pub fn unregister_texture(&mut self, id: TextureId) {
+        let Some(slot) = self.textures.get_mut(id.0 as usize) else {
+            tracing::error!(%id, "texture was never registered with this graph");
+            return;
+        };
+        if slot.take().is_none() {
+            tracing::error!(%id, "texture slot is already free");
+            return;
+        }
+
+        self.free_textures.push(id.0);
+        self.texture_revision += 1;
+    }
+
+    fn update_descriptors(&mut self) {
+        let device_ptr = self.device;
+        let device = unsafe { device_ptr.as_ref() };
+        let revision = self.texture_revision;
+
+        let mut runs: Vec<(u32, Vec<vk::DescriptorImageInfo>)> = Vec::new();
+        for (index, texture) in self.textures.iter().enumerate() {
+            let Some(texture) = texture else {
+                continue;
+            };
+            let info = vk::DescriptorImageInfo::default()
+                .sampler(texture.sampler)
+                .image_view(texture.image_view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+
+            match runs.last_mut() {
+                Some((first, infos)) if *first as usize + infos.len() == index => infos.push(info),
+                _ => runs.push((index as u32, vec![info])),
+            }
+        }
+
+        for pipeline in &mut self.pipelines {
+            if pipeline.written_textures == revision {
+                continue;
+            }
+
+            let (Some(layout), Some(descriptors)) = (&pipeline.layout, &pipeline.descriptors) else {
+                continue;
+            };
+            let Some(table) = layout.texture_binding else {
+                continue;
+            };
+            let Some(set) = descriptors.set(table.set) else {
+                continue;
+            };
+
+            let writes = runs
+                .iter()
+                .map(|(first, infos)| {
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(table.binding)
+                        .dst_array_element(*first)
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .image_info(infos)
+                })
+                .collect::<Vec<_>>();
+
+            if !writes.is_empty() {
+                unsafe { device.update_descriptor_sets(&writes, &[]) };
+            }
+            pipeline.written_textures = revision;
+        }
     }
 
     fn construct_pipelines(&mut self, instructions: &[ir::Instr]) -> Result<(), vk::Result> {
@@ -264,14 +372,18 @@ impl RenderGraph {
 
         for (id, _) in &pending {
             let index = id.0 as usize;
-            if self.pipelines[index].layout.is_none() {
-                let layout = PipelineLayout::create(
-                    device,
-                    &self.pipelines[index].reflections,
-                    self.variable_descriptor_count,
-                )?;
-                self.pipelines[index].layout = Some(layout);
+            if self.pipelines[index].layout.is_some() {
+                continue;
             }
+
+            let layout = PipelineLayout::create(
+                device,
+                &self.pipelines[index].reflections,
+                self.variable_descriptor_count,
+            )?;
+            self.pipelines[index].descriptors = DescriptorSets::create(device, &layout)?;
+            self.pipelines[index].written_textures = 0;
+            self.pipelines[index].layout = Some(layout);
         }
 
         let requests = pending
@@ -308,6 +420,7 @@ impl RenderGraph {
         self.values.clear();
         self.values.resize(value_count, Value::None);
         self.bound_pipeline = None;
+        self.bound_layout = None;
         self.render_area = vk::Rect2D::default();
         self.recorded_viewports.clear();
         self.recorded_scissors.clear();
@@ -357,6 +470,7 @@ impl RenderGraph {
         let cmd_buf = allocator.allocate_command_buffer(queue.family_index())?;
         self.current_batch = Some(Batch::new(cmd_buf)?);
         self.bound_pipeline = None;
+        self.bound_layout = None;
         self.recorded_viewports.clear();
         self.recorded_scissors.clear();
         self.recorded_push_constants = None;
@@ -386,6 +500,7 @@ impl RenderGraph {
         &mut self, ctx: &Context, instructions: &[ir::Instr], allocator: &mut AllocatorKind,
     ) -> Result<(), vk::Result> {
         self.construct_pipelines(instructions)?;
+        self.update_descriptors();
         self.reset(instructions);
 
         for (value_id, node) in instructions {
@@ -514,8 +629,28 @@ impl RenderGraph {
         Ok(())
     }
 
-    /// Binds the pipeline permutation a draw resolved to and brings the dynamic state that
-    /// moved since the last draw up to date.
+    fn bind_descriptor_sets(&mut self, pipeline: PipelineId) -> Result<(), vk::Result> {
+        let bound = self.pipelines.get(pipeline.0 as usize).and_then(|declared| {
+            let layout = declared.layout.as_ref()?;
+            Some((layout.handle, declared.descriptors.as_ref().map(|d| d.sets().to_vec())))
+        });
+
+        let Some((handle, sets)) = bound else {
+            return Ok(());
+        };
+        if self.bound_layout == Some(handle) {
+            return Ok(());
+        }
+        self.bound_layout = Some(handle);
+
+        if let Some(sets) = sets {
+            self.batch()?
+                .bind_descriptor_sets(vk::PipelineBindPoint::GRAPHICS, handle, 0, &sets);
+        }
+
+        Ok(())
+    }
+
     fn prepare_draw(
         &mut self, pipeline: Option<PipelineId>, state: &PipelineState, dynamic: &DynamicValues,
     ) -> Result<(), vk::Result> {
@@ -532,7 +667,8 @@ impl RenderGraph {
             self.bound_pipeline = Some(handle);
         }
 
-        // dynamic state is only re-recorded when it moved since the last draw
+        self.bind_descriptor_sets(pipeline)?;
+
         let viewports = dynamic.viewports(self.render_area);
         if !viewports.is_empty() && viewports != self.recorded_viewports {
             let handles = viewports.iter().copied().map(vk::Viewport::from).collect::<Vec<_>>();
@@ -550,9 +686,7 @@ impl RenderGraph {
     }
 
     pub fn dump(instructions: &[ir::Instr]) {
-        instructions.iter().for_each(|(id, node)| {
-            println!("%{} = {}", id.0, node);
-        });
+        println!("{}", dump::dump(instructions));
     }
 
     fn execute_one(
@@ -575,7 +709,7 @@ impl RenderGraph {
                 let element = *elements.get(index).ok_or(vk::Result::ERROR_UNKNOWN)?;
                 self.set_value(value_id, Value::Reference(element));
             },
-            IR::ConstructBuffer { buffer, size: _ } => {
+            IR::ConstructBuffer { buffer, .. } => {
                 self.set_value(value_id, Value::Buffer(*buffer));
             },
             IR::ConstructImage {
@@ -591,6 +725,7 @@ impl RenderGraph {
                 layer_count,
                 usage,
                 initial_layout,
+                name,
             } => {
                 let extent = self.get::<vk::Extent3D>(extent);
                 let subresource_range = vk::ImageSubresourceRange {
@@ -611,7 +746,10 @@ impl RenderGraph {
                         array_layers: subresource_range.layer_count,
                         samples: *samples,
                         location: MemoryLocation::GpuOnly,
-                        name: format!("transient image {value_id}"),
+                        name: match name {
+                            Some(name) => name.to_string(),
+                            None => format!("transient image {value_id}"),
+                        },
                     })?
                 } else {
                     *image
@@ -712,9 +850,37 @@ impl RenderGraph {
                     *filter,
                 );
             },
+            IR::CopyBufferToImage { buffer, image, region } => {
+                self.ensure_batch(ctx, allocator)?;
+                self.set_value(value_id, Value::Reference(*image));
+
+                let buffer = self.get::<Buffer>(buffer);
+                let attachment = self.get::<ImageAttachment>(image);
+                let subresource_range = attachment.subresource_range();
+
+                let copy = vk::BufferImageCopy::default()
+                    .buffer_offset(region.buffer_offset)
+                    .image_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(subresource_range.aspect_mask)
+                            .mip_level(region.mip_level)
+                            .base_array_layer(subresource_range.base_array_layer)
+                            .layer_count(subresource_range.layer_count),
+                    )
+                    .image_offset(region.image_offset)
+                    .image_extent(region.image_extent);
+
+                self.batch()?.copy_buffer_to_image(
+                    buffer.handle(),
+                    attachment.image().into(),
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[copy],
+                );
+            },
             IR::BeginRendering {
                 color_attachments,
                 render_area,
+                ..
             } => {
                 self.ensure_batch(ctx, allocator)?;
 
@@ -755,7 +921,7 @@ impl RenderGraph {
                     None => self.set_value(value_id, Value::None),
                 }
             },
-            IR::BindPipeline { pass, .. } | IR::SetState { pass, .. } => {
+            IR::BindPipeline { pass, .. } | IR::SetState { pass, .. } | IR::SampleImage { pass, .. } => {
                 self.set_value(value_id, Value::Reference(*pass));
             },
             IR::BindVertexBuffers {
@@ -875,6 +1041,10 @@ impl Drop for RenderGraph {
         for declared in &self.pipelines {
             for handle in declared.variants.values() {
                 unsafe { device.destroy_pipeline(*handle, None) };
+            }
+
+            if let Some(descriptors) = &declared.descriptors {
+                descriptors.destroy(device);
             }
 
             if let Some(layout) = &declared.layout {

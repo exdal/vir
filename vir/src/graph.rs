@@ -1,4 +1,5 @@
 pub mod attachment;
+pub mod dump;
 pub mod ir;
 pub mod module;
 pub mod pass;

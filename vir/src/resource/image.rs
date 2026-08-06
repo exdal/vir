@@ -46,6 +46,19 @@ impl ImageInfo {
         }
     }
 
+    /// A texture a shader samples and the host fills through a copy.
+    pub fn texture(extent: vk::Extent2D, format: vk::Format) -> Self {
+        Self {
+            extent: vk::Extent3D::default()
+                .width(extent.width)
+                .height(extent.height)
+                .depth(1),
+            format,
+            usage: vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
+            ..Default::default()
+        }
+    }
+
     pub fn with_usage(mut self, usage: vk::ImageUsageFlags) -> Self {
         self.usage |= usage;
         self
@@ -76,6 +89,69 @@ impl ImageInfo {
             .aspect_mask(aspect_mask(self.format))
             .level_count(self.mip_levels)
             .layer_count(self.array_layers)
+    }
+}
+
+/// Which part of an image a buffer copy fills, and where in the buffer it reads from.
+///
+/// The buffer side is always tightly packed to `image_extent`, which is what an upload that
+/// staged exactly the region it is writing looks like.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BufferImageCopy {
+    pub buffer_offset: u64,
+    pub image_offset: vk::Offset3D,
+    pub image_extent: vk::Extent3D,
+    pub mip_level: u32,
+}
+
+impl Default for BufferImageCopy {
+    fn default() -> Self {
+        Self {
+            buffer_offset: 0,
+            image_offset: vk::Offset3D::default(),
+            image_extent: vk::Extent3D::default().depth(1),
+            mip_level: 0,
+        }
+    }
+}
+
+impl BufferImageCopy {
+    /// The whole of a 2D image.
+    pub fn whole(extent: vk::Extent3D) -> Self {
+        Self {
+            image_extent: extent,
+            ..Default::default()
+        }
+    }
+
+    /// A rectangle of a 2D image, offset in texels.
+    pub fn region(offset: vk::Offset2D, extent: vk::Extent2D) -> Self {
+        Self {
+            image_offset: vk::Offset3D {
+                x: offset.x,
+                y: offset.y,
+                z: 0,
+            },
+            image_extent: vk::Extent3D::default()
+                .width(extent.width)
+                .height(extent.height)
+                .depth(1),
+            ..Default::default()
+        }
+    }
+
+    pub fn with_buffer_offset(mut self, offset: u64) -> Self {
+        self.buffer_offset = offset;
+        self
+    }
+
+    pub fn with_mip_level(mut self, mip_level: u32) -> Self {
+        self.mip_level = mip_level;
+        self
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.image_extent.width == 0 || self.image_extent.height == 0 || self.image_extent.depth == 0
     }
 }
 

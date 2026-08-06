@@ -9,7 +9,7 @@ pub use self::{
     frame::{FrameAllocator, SuperFrameAllocator},
     persistent::PersistentAllocator,
 };
-use crate::{Buffer, BufferInfo, CommandBuffer, Image, ImageInfo};
+use crate::{Buffer, BufferInfo, CommandBuffer, Image, ImageInfo, SamplerInfo};
 
 pub type MemoryAllocator = Rc<RefCell<gpu_allocator::vulkan::Allocator>>;
 
@@ -34,6 +34,8 @@ pub trait Allocator: std::fmt::Debug {
         subresource_range: vk::ImageSubresourceRange,
     ) -> Result<vk::ImageView, vk::Result>;
     fn deallocate_image_view(&mut self, image_view: vk::ImageView);
+    fn allocate_sampler(&mut self, info: &SamplerInfo) -> Result<vk::Sampler, vk::Result>;
+    fn deallocate_sampler(&mut self, sampler: vk::Sampler);
     fn allocate_buffer(&mut self, info: &BufferInfo) -> Result<Buffer, vk::Result>;
     fn deallocate_buffer(&mut self, buffer: Buffer);
     fn allocate_image(&mut self, info: &ImageInfo) -> Result<Image, vk::Result>;
@@ -88,6 +90,20 @@ impl<'a> AllocatorKind<'a> {
         match self {
             AllocatorKind::Persistent(a) => a.deallocate_image_view(image_view),
             AllocatorKind::Frame(a) => a.deallocate_image_view(image_view),
+        }
+    }
+
+    pub fn allocate_sampler(&mut self, info: &SamplerInfo) -> Result<vk::Sampler, vk::Result> {
+        match self {
+            AllocatorKind::Persistent(a) => a.allocate_sampler(info),
+            AllocatorKind::Frame(a) => a.allocate_sampler(info),
+        }
+    }
+
+    pub fn deallocate_sampler(&mut self, sampler: vk::Sampler) {
+        match self {
+            AllocatorKind::Persistent(a) => a.deallocate_sampler(sampler),
+            AllocatorKind::Frame(a) => a.deallocate_sampler(sampler),
         }
     }
 

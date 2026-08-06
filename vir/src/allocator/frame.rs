@@ -3,7 +3,7 @@ use std::{ops::Add, ptr::NonNull};
 use ash::vk::{self, Handle};
 
 use super::{Allocator, MemoryAllocator, persistent::PersistentAllocator};
-use crate::{Buffer, BufferInfo, CommandBuffer, Image, ImageInfo};
+use crate::{Buffer, BufferInfo, CommandBuffer, Image, ImageInfo, SamplerInfo};
 
 #[derive(Debug)]
 pub struct FrameAllocator {
@@ -13,6 +13,7 @@ pub struct FrameAllocator {
     cmd_pool: vk::CommandPool,
     semaphores: Vec<vk::Semaphore>,
     image_views: Vec<vk::ImageView>,
+    samplers: Vec<vk::Sampler>,
     buffers: Vec<Buffer>,
     images: Vec<Image>,
     cmd_buffers: Vec<vk::CommandBuffer>,
@@ -28,6 +29,7 @@ impl FrameAllocator {
             cmd_pool: vk::CommandPool::null(),
             semaphores: Vec::default(),
             image_views: Vec::default(),
+            samplers: Vec::default(),
             buffers: Vec::default(),
             images: Vec::default(),
             cmd_buffers: Vec::default(),
@@ -86,6 +88,10 @@ impl FrameAllocator {
             .for_each(|view| self.upstream.deallocate_image_view(*view));
         self.image_views.clear();
 
+        for sampler in std::mem::take(&mut self.samplers) {
+            self.upstream.deallocate_sampler(sampler);
+        }
+
         // safe because `wait_idle` above already blocked until this frame's submits retired
         for buffer in std::mem::take(&mut self.buffers) {
             self.upstream.deallocate_buffer(buffer);
@@ -123,6 +129,10 @@ impl Drop for FrameAllocator {
         self.image_views
             .iter()
             .for_each(|view| self.upstream.deallocate_image_view(*view));
+
+        for sampler in std::mem::take(&mut self.samplers) {
+            self.upstream.deallocate_sampler(sampler);
+        }
 
         for buffer in std::mem::take(&mut self.buffers) {
             self.upstream.deallocate_buffer(buffer);
@@ -173,6 +183,12 @@ impl Allocator for FrameAllocator {
     }
 
     fn deallocate_image_view(&mut self, _: vk::ImageView) {}
+
+    fn allocate_sampler(&mut self, info: &SamplerInfo) -> Result<vk::Sampler, vk::Result> {
+        self.upstream.allocate_sampler(info).inspect(|x| self.samplers.push(*x))
+    }
+
+    fn deallocate_sampler(&mut self, _: vk::Sampler) {}
 
     fn allocate_buffer(&mut self, info: &BufferInfo) -> Result<Buffer, vk::Result> {
         self.upstream.allocate_buffer(info).inspect(|x| self.buffers.push(*x))

@@ -4,7 +4,7 @@ use ash::vk::{self, Handle};
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme};
 
 use super::{Allocator, MemoryAllocator, map_allocation_error};
-use crate::{Buffer, BufferInfo, CommandBuffer, Image, ImageInfo};
+use crate::{Buffer, BufferInfo, CommandBuffer, Image, ImageInfo, SamplerInfo};
 
 pub struct PersistentAllocator {
     device: NonNull<ash::Device>,
@@ -122,6 +122,16 @@ impl Allocator for PersistentAllocator {
         unsafe {
             self.device.as_ref().destroy_image_view(image_view, None);
         }
+    }
+
+    fn allocate_sampler(&mut self, info: &SamplerInfo) -> Result<vk::Sampler, vk::Result> {
+        let create_info = vk::SamplerCreateInfo::from(info);
+
+        unsafe { self.device.as_ref().create_sampler(&create_info, None) }
+    }
+
+    fn deallocate_sampler(&mut self, sampler: vk::Sampler) {
+        unsafe { self.device.as_ref().destroy_sampler(sampler, None) };
     }
 
     fn allocate_buffer(&mut self, info: &BufferInfo) -> Result<Buffer, vk::Result> {

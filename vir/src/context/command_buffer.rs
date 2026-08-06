@@ -107,6 +107,17 @@ impl CommandBuffer {
         }
     }
 
+    pub fn bind_descriptor_sets(
+        &self, bind_point: vk::PipelineBindPoint, layout: vk::PipelineLayout, first_set: u32,
+        sets: &[vk::DescriptorSet],
+    ) {
+        unsafe {
+            self.device
+                .as_ref()
+                .cmd_bind_descriptor_sets(self.handle, bind_point, layout, first_set, sets, &[])
+        }
+    }
+
     pub fn push_constants(
         &self, layout: vk::PipelineLayout, stage_flags: vk::ShaderStageFlags, offset: u32, data: &[u8],
     ) {
@@ -165,6 +176,16 @@ impl CommandBuffer {
             self.device
                 .as_ref()
                 .cmd_blit_image(self.handle, src, src_layout, dst, dst_layout, regions, filter);
+        }
+    }
+
+    pub fn copy_buffer_to_image(
+        &self, buffer: vk::Buffer, image: vk::Image, image_layout: vk::ImageLayout, regions: &[vk::BufferImageCopy],
+    ) {
+        unsafe {
+            self.device
+                .as_ref()
+                .cmd_copy_buffer_to_image(self.handle, buffer, image, image_layout, regions);
         }
     }
 

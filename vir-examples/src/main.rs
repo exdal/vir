@@ -191,8 +191,7 @@ struct App {
     ui: UiState,
 }
 
-/// What the debug panel is driving. Text does not render until the font atlas lands, so the
-/// panel is deliberately built out of shapes and widget frames.
+/// What the debug panel is driving.
 struct UiState {
     spin: bool,
     tint: f32,
@@ -224,8 +223,9 @@ fn build_ui(ctx: &egui::Context, ui_state: &mut UiState) {
         .default_pos([24.0, 24.0])
         .default_size([260.0, 160.0])
         .show(ctx, |ui| {
+            ui.label("the font atlas is a sampled texture, so this text is the upload path");
             ui.checkbox(&mut ui_state.spin, "spin");
-            ui.add(egui::Slider::new(&mut ui_state.tint, 0.0..=1.0));
+            ui.add(egui::Slider::new(&mut ui_state.tint, 0.0..=1.0).text("tint"));
             ui.separator();
             if ui.button("reset").clicked() {
                 *ui_state = UiState::default();
@@ -335,6 +335,8 @@ impl App {
             .descriptor_binding_sampled_image_update_after_bind(true)
             .descriptor_binding_storage_image_update_after_bind(true)
             .descriptor_binding_update_unused_while_pending(true)
+            .descriptor_binding_partially_bound(true)
+            .descriptor_binding_variable_descriptor_count(true)
             .runtime_descriptor_array(true)
             .timeline_semaphore(true)
             .buffer_device_address(true)
@@ -386,12 +388,7 @@ impl App {
                     .width(swapchain_extent.width)
                     .height(swapchain_extent.height)
                     .depth(1);
-                let image = Image::imported(
-                    image_handle,
-                    swapchain_format,
-                    extent,
-                    vk::SampleCountFlags::TYPE_1,
-                );
+                let image = Image::imported(image_handle, swapchain_format, extent, vk::SampleCountFlags::TYPE_1);
                 let subresource_range = vk::ImageSubresourceRange::default()
                     .aspect_mask(vk::ImageAspectFlags::COLOR)
                     .layer_count(1)
@@ -477,11 +474,9 @@ impl App {
 
         let raw_input = self.egui_state.take_egui_input(&self.window.handle);
         let ui = &mut self.ui;
-        let mut egui_output = self.egui_ctx.run_ui(raw_input, |root| build_ui(root.ctx(), ui));
+        let egui_output = self.egui_ctx.run_ui(raw_input, |root| build_ui(root.ctx(), ui));
         self.egui_state
             .handle_platform_output(&self.window.handle, egui_output.platform_output);
-
-        egui_output.textures_delta.clear();
 
         let pixels_per_point = egui_output.pixels_per_point;
         let primitives = self.egui_ctx.tessellate(egui_output.shapes, pixels_per_point);
@@ -492,12 +487,20 @@ impl App {
             .expect("swapchain must be created before rendering")
             .get_next_frame()?;
 
-        let egui_frame = self
-            .egui_pass
-            .prepare(next_frame, &primitives, pixels_per_point, target_extent)?;
+        let egui_frame = self.egui_pass.prepare(
+            &self.ctx,
+            &mut self.graph,
+            &mut self.persistent_allocator,
+            next_frame,
+            egui_output.textures_delta,
+            &primitives,
+            pixels_per_point,
+            target_extent,
+        )?;
         tracing::trace!(
             primitives = primitives.len(),
             draws = egui_frame.draw_count(),
+            uploads = egui_frame.upload_count(),
             pixels_per_point,
             "egui frame"
         );
@@ -519,10 +522,13 @@ impl App {
         let mut module = vir::Module::default();
         let swapchain_image = module.acquire_next_image(swapchain);
         let attachment = module.import_attachment(&offscreen);
+        module.set_name(attachment, "offscreen");
         let attachment = module.clear(attachment, rainbow(elapsed * 0.2));
 
         let static_vertices = module.import_buffer(&self.static_vertices);
         let spinning_vertices = module.import_buffer(&spinning_vertices);
+        module.set_name(static_vertices, "static triangle");
+        module.set_name(spinning_vertices, "spinning triangle");
 
         let sliding = PushConstants {
             offset: [0.25 * elapsed.sin(), 0.0],
@@ -532,6 +538,7 @@ impl App {
 
         let attachment = module
             .begin_rendering(&[attachment])
+            .with_name("sliding triangle")
             .bind_graphics_pipeline(self.triangle_pipeline)
             .set_viewport(0, Rect2D::framebuffer())
             .set_scissor(0, Rect2D::framebuffer())
@@ -546,6 +553,7 @@ impl App {
 
         let attachment = module
             .begin_rendering(&[attachment])
+            .with_name("corner triangle")
             .bind_graphics_pipeline(self.triangle_pipeline)
             .set_dynamic_state(DynamicStateFlags::Viewport | DynamicStateFlags::Scissor)
             .set_viewport(0, Rect2D::relative(0.5, 0.5, 0.5, 0.5))
@@ -560,6 +568,7 @@ impl App {
 
         let attachment = module
             .begin_rendering(&[attachment])
+            .with_name("vertex buffer triangles")
             .bind_graphics_pipeline(self.vertex_pipeline)
             .set_viewport(0, Rect2D::framebuffer())
             .set_scissor(0, Rect2D::framebuffer())
@@ -580,9 +589,8 @@ impl App {
             width: (offscreen.extent().width / 2).max(1),
             height: (offscreen.extent().height / 2).max(1),
         };
-        let scratch = module.transient_image(
-            &ImageInfo::color_target(half, offscreen.format()).with_name("half-res scratch"),
-        );
+        let scratch =
+            module.transient_image(&ImageInfo::color_target(half, offscreen.format()).with_name("half-res scratch"));
         let scratch = module.blit(attachment, scratch);
         let swapchain_image = module.blit(scratch, swapchain_image);
 
@@ -592,7 +600,9 @@ impl App {
         let resting = module.release(attachment, OFFSCREEN_RESTING_ACCESS, vir::DomainFlag::Graphics);
         let executable = module.compile_all(&[present, resting]);
 
-        if !self.dumped_ir && !egui_frame.is_empty() {
+        // the first frame egui produces is the font atlas upload with nothing drawn yet, which
+        // is not the one worth looking at
+        if !self.dumped_ir && egui_frame.draw_count() > 0 {
             RenderGraph::dump(executable.as_slice());
             self.dumped_ir = true;
         }
@@ -601,6 +611,17 @@ impl App {
             .execute(&self.ctx, executable.as_slice(), &mut frame_allocator)?;
 
         Ok(())
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        if let Err(err) = unsafe { self.ctx.device().device_wait_idle() } {
+            tracing::error!(?err, "failed to wait for the device before tearing the app down");
+            return;
+        }
+
+        self.egui_pass.destroy(&mut self.graph, &mut self.persistent_allocator);
     }
 }
 
@@ -650,9 +671,7 @@ impl ApplicationHandler for AppWrapper {
         }
     }
 
-    fn exiting(&mut self, _: &ActiveEventLoop) {
-        self.app = None;
-    }
+    fn exiting(&mut self, _: &ActiveEventLoop) { self.app = None; }
 }
 
 struct Window {
@@ -690,6 +709,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use vir::{
+        DescriptorBinding,
         VertexAttribute,
         VertexLayout,
         resource::{pipeline::push_constant_ranges, shader},
@@ -760,17 +780,49 @@ mod tests {
         );
     }
 
-    /// Only the vertex stage reads the block, so the range has to be vertex-only and exactly the
-    /// struct the pass pushes.
+    /// The vertex stage reads the screen size out of the block and the fragment stage the
+    /// texture index, so one range covers both and spans exactly the struct the pass pushes.
     #[test]
-    fn the_egui_push_constant_range_covers_only_the_vertex_stage() {
+    fn the_egui_push_constant_range_covers_both_stages() {
         let reflect = |spirv| shader::reflect(&read_spirv(spirv)).expect("shader should reflect");
 
         let ranges = push_constant_ranges(&[reflect(EGUI_VERT_SPV), reflect(EGUI_FRAG_SPV)]);
         assert_eq!(ranges.len(), 1);
-        assert_eq!(ranges[0].stage_flags, vk::ShaderStageFlags::VERTEX);
+        assert_eq!(
+            ranges[0].stage_flags,
+            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT
+        );
         assert_eq!(ranges[0].offset, 0);
         assert_eq!(ranges[0].size as usize, size_of::<egui_pass::PushConstants>());
+
+        // and the index has to be the tail of the block, since a draw pushes it alone
+        assert_eq!(
+            egui_pass::TEXTURE_INDEX_OFFSET as usize,
+            size_of::<egui_pass::PushConstants>() - size_of::<u32>()
+        );
+    }
+
+    /// The whole bindless path rests on this shape: a variable-count combined image sampler
+    /// array is what a pipeline layout recognises as the slot the graph's texture table is
+    /// written into, so a shader that reflects as anything else silently samples nothing.
+    #[test]
+    fn the_egui_fragment_shader_declares_the_bindless_texture_table() {
+        let reflection = shader::reflect(&read_spirv(EGUI_FRAG_SPV)).expect("shader should reflect");
+
+        assert_eq!(
+            reflection.bindings,
+            vec![DescriptorBinding {
+                set: 0,
+                binding: 0,
+                descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                count: 1,
+                variable_count: true,
+            }]
+        );
+
+        // and the vertex stage stays out of it, so the table is fragment-only
+        let vertex = shader::reflect(&read_spirv(EGUI_VERT_SPV)).expect("shader should reflect");
+        assert!(vertex.bindings.is_empty());
     }
 
     /// The SV_VertexID triangle must keep compiling to a pipeline with no vertex input at all.

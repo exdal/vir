@@ -1,10 +1,11 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use ash::vk;
 
 use crate::{
     Access,
     Buffer,
+    BufferImageCopy,
     ClearValue,
     ColorBlendAttachmentState,
     DomainFlag,
@@ -36,8 +37,10 @@ struct ResourceState {
 struct ImageType {
     format: vk::Format,
     samples: vk::SampleCountFlags,
-    extent: vk::Extent2D,
+    extent: vk::Extent3D,
 }
+
+fn name_of(name: &str) -> ir::Name { (!name.is_empty()).then(|| Arc::from(name)) }
 
 #[derive(Default)]
 pub struct Module {
@@ -88,7 +91,7 @@ impl Module {
 
     fn lower_array(&mut self, ty: ValueId, elements: Vec<ValueId>) -> ValueId { self.emit(IR::Array { ty, elements }) }
 
-    fn lower_image_attachment(&mut self, attachment: &ImageAttachment) -> (ValueId, ValueId) {
+    fn lower_image_attachment(&mut self, attachment: &ImageAttachment, name: ir::Name) -> (ValueId, ValueId) {
         let extent = self.lower_constant(ir::Constant::Extent3D(attachment.extent()));
         let base_level = self.lower_u32(attachment.base_level());
         let level_count = self.lower_u32(attachment.level_count());
@@ -117,6 +120,7 @@ impl Module {
             layer_count,
             usage: attachment.image().usage(),
             initial_layout: attachment.layout(),
+            name,
         });
 
         (ty_instr, construct_instr)
@@ -152,6 +156,7 @@ impl Module {
             layer_count,
             usage: info.usage,
             initial_layout: vk::ImageLayout::UNDEFINED,
+            name: name_of(&info.name),
         })
     }
 
@@ -160,20 +165,40 @@ impl Module {
     }
 
     pub fn import_attachment(&mut self, attachment: &ImageAttachment) -> ValueId {
-        self.lower_image_attachment(attachment).1
+        self.lower_image_attachment(attachment, None).1
     }
 
     pub fn import_buffer(&mut self, buffer: &Buffer) -> ValueId {
         self.lower_type(ir::Type::Buffer);
         let size = self.lower_u32(buffer.size() as u32);
-        self.emit(IR::ConstructBuffer { buffer: *buffer, size })
+        self.emit(IR::ConstructBuffer {
+            buffer: *buffer,
+            size,
+            name: None,
+        })
+    }
+
+    /// Attaches a debug name to a resource or a rendering region, which is what the dump
+    /// prints in place of the bare value id.
+    pub fn set_name(&mut self, id: ValueId, name: impl Into<Arc<str>>) -> ValueId {
+        match self.instructions.get_mut(id.0 as usize) {
+            Some(
+                IR::ConstructImage { name: slot, .. }
+                | IR::ConstructBuffer { name: slot, .. }
+                | IR::BeginRendering { name: slot, .. },
+            ) => *slot = Some(name.into()),
+            _ => tracing::warn!(%id, "value cannot carry a name; the name is dropped"),
+        }
+
+        id
     }
 
     pub fn acquire_next_image(&mut self, swapchain: &SwapChain) -> ValueId {
         let (ty_instr, attach_instr): (Vec<_>, Vec<_>) = swapchain
             .attachments
             .iter()
-            .map(|attach| self.lower_image_attachment(attach))
+            .enumerate()
+            .map(|(index, attach)| self.lower_image_attachment(attach, Some(format!("swapchain#{index}").into())))
             .unzip();
 
         let ty = ty_instr[0];
@@ -211,6 +236,25 @@ impl Module {
         self.emit(IR::Blit { src, dst, filter })
     }
 
+    /// Fills the whole of `image` from `buffer`, which has to hold the image tightly packed.
+    pub fn copy_buffer_to_image(&mut self, buffer: ValueId, image: ValueId) -> ValueId {
+        let Some(extent) = self.resolve_image(image).map(|image| image.extent) else {
+            tracing::warn!(%image, "cannot infer the extent to copy into; the copy is dropped");
+            return image;
+        };
+
+        self.copy_buffer_to_image_region(buffer, image, BufferImageCopy::whole(extent))
+    }
+
+    pub fn copy_buffer_to_image_region(&mut self, buffer: ValueId, image: ValueId, region: BufferImageCopy) -> ValueId {
+        if region.is_empty() {
+            tracing::warn!(%image, "copy region is empty; the copy is dropped");
+            return image;
+        }
+
+        self.emit(IR::CopyBufferToImage { buffer, image, region })
+    }
+
     pub fn clear(&mut self, attachment: ValueId, color: ClearValue) -> ValueId {
         let color = self.lower_constant(ir::Constant::ClearValue(color));
         self.emit(IR::Clear { attachment, color })
@@ -220,8 +264,13 @@ impl Module {
         let id = self.emit(IR::BeginRendering {
             color_attachments: color_attachments.to_vec(),
             render_area: None,
+            name: None,
         });
-        RenderPass { module: self, id }
+        RenderPass {
+            module: self,
+            id,
+            begin: id,
+        }
     }
 
     pub fn begin_rendering_area(&mut self, color_attachments: &[ValueId], render_area: vk::Extent2D) -> RenderPass<'_> {
@@ -229,8 +278,13 @@ impl Module {
         let id = self.emit(IR::BeginRendering {
             color_attachments: color_attachments.to_vec(),
             render_area: Some(render_area),
+            name: None,
         });
-        RenderPass { module: self, id }
+        RenderPass {
+            module: self,
+            id,
+            begin: id,
+        }
     }
 
     pub fn compile(&self, id: ValueId) -> Vec<ir::Instr> { self.compile_all(&[id]) }
@@ -307,9 +361,14 @@ impl Module {
                         stack.push(*dst);
                         stack.push(*src);
                     },
+                    IR::CopyBufferToImage { buffer, image, .. } => {
+                        stack.push(*image);
+                        stack.push(*buffer);
+                    },
                     IR::BeginRendering {
                         color_attachments,
                         render_area,
+                        ..
                     } => {
                         render_area.iter().for_each(|v| stack.push(*v));
                         color_attachments.iter().rev().for_each(|v| stack.push(*v));
@@ -324,6 +383,10 @@ impl Module {
                     IR::BindIndexBuffer { pass, buffer, .. } => {
                         stack.push(*buffer);
                         stack.push(*pass);
+                    },
+                    IR::SampleImage { pass, image } => {
+                        stack.push(*pass);
+                        stack.push(*image);
                     },
                     IR::Draw {
                         pass,
@@ -388,9 +451,11 @@ impl Module {
         let mut buffer_states: HashMap<ValueId, ValueId> = HashMap::new();
         let mut next_id = self.instructions.len() as u32;
 
-        // buffers a rendering region reads, paired with how it reads them, so the barrier that
-        // makes host writes visible can be emitted before the region opens
+        // what a rendering region reads, gathered up front: a layout transition cannot be
+        // recorded inside a region, and a host write only has to be made visible once, so both
+        // resolve to barriers emitted before the region opens
         let mut region_buffers: HashMap<ValueId, Vec<(ValueId, Access)>> = HashMap::new();
+        let mut region_images: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
         let mut open_region: Option<ValueId> = None;
         for (value_id, ir) in &nodes {
             let (buffers, access) = match ir {
@@ -400,6 +465,16 @@ impl Module {
                 },
                 IR::EndRendering { .. } => {
                     open_region = None;
+                    continue;
+                },
+                IR::SampleImage { image, .. } => {
+                    if let Some(region) = open_region {
+                        let sampled = region_images.entry(region).or_default();
+                        let root = self.resource_root(*image);
+                        if !sampled.contains(&root) {
+                            sampled.push(root);
+                        }
+                    }
                     continue;
                 },
                 IR::BindVertexBuffers { buffers, .. } => (buffers.as_slice(), Access::AttributeRead),
@@ -464,6 +539,48 @@ impl Module {
         let no_access_id = emit_access!(Access::None);
         let mut host_write_id: Option<ValueId> = None;
         let mut read_access_ids: HashMap<Access, ValueId> = HashMap::new();
+
+        // the constant for an access a resource is only ever read at is worth sharing, since
+        // every barrier that waits on the same read names it
+        macro_rules! read_access {
+            ($access:expr) => {{
+                let access: Access = $access;
+                match read_access_ids.get(&access).copied() {
+                    Some(id) => id,
+                    None => {
+                        let id = emit_access!(access);
+                        read_access_ids.insert(access, id);
+                        id
+                    },
+                }
+            }};
+        }
+
+        /// A buffer the host filled is visible to the GPU only after a barrier, and stays
+        /// visible until something writes it again, which nothing in a graph does today.
+        macro_rules! buffer_barrier {
+            ($buffer:expr, $access:expr) => {{
+                let buffer = $buffer;
+                let last = match buffer_states.get(&buffer).copied() {
+                    Some(id) => id,
+                    None => match host_write_id {
+                        Some(id) => id,
+                        None => {
+                            let id = emit_access!(Access::HostWrite);
+                            host_write_id = Some(id);
+                            id
+                        },
+                    },
+                };
+
+                let read_id = read_access!($access);
+                if last != read_id {
+                    emit_memory_barrier!(last, read_id);
+                    buffer_states.insert(buffer, read_id);
+                }
+            }};
+        }
+
         let undefined = ResourceState {
             layout: vk::ImageLayout::UNDEFINED,
             last_access: no_access_id,
@@ -532,39 +649,25 @@ impl Module {
                     transition!(*dst, write_id, Access::BlitWrite);
                 },
 
+                IR::CopyBufferToImage { buffer, image, .. } => {
+                    buffer_barrier!(self.resource_root(*buffer), Access::CopyRead);
+                    let write_id = emit_access!(Access::CopyWrite);
+                    transition!(*image, write_id, Access::CopyWrite);
+                },
+
                 IR::BeginRendering { color_attachments, .. } => {
+                    for image in region_images.get(&value_id).cloned().into_iter().flatten() {
+                        let sampled_id = read_access!(Access::FragmentSampled);
+                        transition!(image, sampled_id, Access::FragmentSampled);
+                    }
+
                     let access_id = emit_access!(Access::ColorRW);
                     for attachment in color_attachments {
                         transition!(*attachment, access_id, Access::ColorRW);
                     }
 
                     for (buffer, access) in region_buffers.get(&value_id).cloned().into_iter().flatten() {
-                        let last = match buffer_states.get(&buffer).copied() {
-                            Some(id) => id,
-                            None => match host_write_id {
-                                Some(id) => id,
-                                None => {
-                                    let id = emit_access!(Access::HostWrite);
-                                    host_write_id = Some(id);
-                                    id
-                                },
-                            },
-                        };
-
-                        let read_id = match read_access_ids.get(&access).copied() {
-                            Some(id) => id,
-                            None => {
-                                let id = emit_access!(access);
-                                read_access_ids.insert(access, id);
-                                id
-                            },
-                        };
-
-                        if last == read_id {
-                            continue;
-                        }
-                        emit_memory_barrier!(last, read_id);
-                        buffer_states.insert(buffer, read_id);
+                        buffer_barrier!(buffer, access);
                     }
                 },
 
@@ -592,6 +695,7 @@ impl Module {
             id = match ir {
                 IR::Clear { attachment, .. } => *attachment,
                 IR::Blit { dst, .. } => *dst,
+                IR::CopyBufferToImage { image, .. } => *image,
                 IR::BeginRendering { color_attachments, .. } => match color_attachments.first() {
                     Some(first) => *first,
                     None => return id,
@@ -600,6 +704,7 @@ impl Module {
                 | IR::SetState { pass, .. }
                 | IR::BindVertexBuffers { pass, .. }
                 | IR::BindIndexBuffer { pass, .. }
+                | IR::SampleImage { pass, .. }
                 | IR::Draw { pass, .. }
                 | IR::DrawIndexed { pass, .. }
                 | IR::EndRendering { pass } => *pass,
@@ -670,10 +775,7 @@ impl Module {
                     return Some(ImageType {
                         format: *format,
                         samples: *samples,
-                        extent: vk::Extent2D {
-                            width: extent.width,
-                            height: extent.height,
-                        },
+                        extent,
                     });
                 },
                 // every element of an attachment array describes the same image
@@ -681,11 +783,13 @@ impl Module {
                 IR::Index { array, .. } => id = *array,
                 IR::Clear { attachment, .. } => id = *attachment,
                 IR::Blit { dst, .. } => id = *dst,
+                IR::CopyBufferToImage { image, .. } => id = *image,
                 IR::BeginRendering { color_attachments, .. } => id = *color_attachments.first()?,
                 IR::BindPipeline { pass, .. }
                 | IR::SetState { pass, .. }
                 | IR::BindVertexBuffers { pass, .. }
                 | IR::BindIndexBuffer { pass, .. }
+                | IR::SampleImage { pass, .. }
                 | IR::Draw { pass, .. }
                 | IR::DrawIndexed { pass, .. }
                 | IR::EndRendering { pass } => id = *pass,
@@ -719,6 +823,7 @@ impl Module {
                 IR::BeginRendering {
                     color_attachments,
                     render_area,
+                    ..
                 } => {
                     let mut rendering = RenderingState::default();
                     let mut attachment_extent = None;
@@ -731,7 +836,10 @@ impl Module {
 
                         if index == 0 {
                             rendering.samples = image.samples;
-                            attachment_extent = Some(image.extent);
+                            attachment_extent = Some(vk::Extent2D {
+                                width: image.extent.width,
+                                height: image.extent.height,
+                            });
                         } else if image.samples != rendering.samples {
                             tracing::warn!(
                                 %attachment,
@@ -800,7 +908,10 @@ impl Module {
                     }
                 },
 
-                IR::BindVertexBuffers { pass, .. } | IR::BindIndexBuffer { pass, .. } | IR::EndRendering { pass } => {
+                IR::BindVertexBuffers { pass, .. }
+                | IR::BindIndexBuffer { pass, .. }
+                | IR::SampleImage { pass, .. }
+                | IR::EndRendering { pass } => {
                     if let Some(in_force) = regions.get(pass).cloned() {
                         regions.insert(*value_id, in_force);
                     }
@@ -817,10 +928,17 @@ impl Module {
 pub struct RenderPass<'a> {
     module: &'a mut Module,
     id: ValueId,
+    begin: ValueId,
 }
 
 impl RenderPass<'_> {
     pub fn id(&self) -> ValueId { self.id }
+
+    /// Names the region, which is what the dump groups this pass' instructions under.
+    pub fn with_name(self, name: impl Into<Arc<str>>) -> Self {
+        self.module.set_name(self.begin, name);
+        self
+    }
 
     pub fn bind_graphics_pipeline(mut self, pipeline: PipelineId) -> Self {
         self.id = self.module.emit(IR::BindPipeline {
@@ -867,6 +985,11 @@ impl RenderPass<'_> {
             offset,
             index_type,
         });
+        self
+    }
+
+    pub fn sample_image(mut self, image: ValueId) -> Self {
+        self.id = self.module.emit(IR::SampleImage { pass: self.id, image });
         self
     }
 
@@ -995,7 +1118,7 @@ mod tests {
             vk::SampleCountFlags::TYPE_1,
             vk::ImageLayout::UNDEFINED,
         );
-        let (_, construct) = module.lower_image_attachment(&attachment);
+        let (_, construct) = module.lower_image_attachment(&attachment, Some("target".into()));
         (module, construct)
     }
 
@@ -1055,14 +1178,23 @@ mod tests {
             .collect()
     }
 
-    fn transient_info() -> ImageInfo {
-        ImageInfo::color_target(
-            vk::Extent2D {
-                width: WIDTH,
-                height: HEIGHT,
-            },
-            FORMAT,
-        )
+    fn extent_2d() -> vk::Extent2D {
+        vk::Extent2D {
+            width: WIDTH,
+            height: HEIGHT,
+        }
+    }
+
+    fn transient_info() -> ImageInfo { ImageInfo::color_target(extent_2d(), FORMAT) }
+
+    /// An image that declares no usage at all, so what it ends up created with is entirely
+    /// what the graph inferred.
+    fn untyped_info() -> ImageInfo {
+        ImageInfo {
+            extent: vk::Extent3D::default().width(WIDTH).height(HEIGHT).depth(1),
+            format: FORMAT,
+            ..Default::default()
+        }
     }
 
     fn image_usage(instructions: &[ir::Instr], id: ValueId) -> vk::ImageUsageFlags {
@@ -1708,6 +1840,170 @@ mod tests {
 
         assert_eq!(dynamic.push_constants.data, 7u32.to_ne_bytes());
         assert_eq!(draws(&compiled)[0].0, Some(PipelineId(0)));
+    }
+
+    #[test]
+    fn a_copy_waits_for_the_host_write_and_puts_the_image_in_the_transfer_layout() {
+        let mut module = Module::default();
+        let staging = module.import_buffer(&Buffer::default());
+        let texture = module.transient_image(&untyped_info());
+        let end = module.copy_buffer_to_image(staging, texture);
+
+        let compiled = module.compile(end);
+        assert_eq!(
+            memory_barriers(&module, &compiled),
+            vec![(Access::HostWrite, Access::CopyRead)]
+        );
+
+        let barriers = image_barriers(&module, &compiled);
+        assert_eq!(barriers.len(), 1);
+        assert_eq!(barriers[0].resource, texture);
+        assert_eq!(barriers[0].dst, Access::CopyWrite);
+        assert_eq!(barriers[0].old_layout, vk::ImageLayout::UNDEFINED);
+        assert_eq!(barriers[0].new_layout, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+    }
+
+    /// The whole point of naming a sampled image: a layout transition cannot be recorded
+    /// inside a rendering region, so it has to be hoisted out the way an attachment's is.
+    #[test]
+    fn a_sampled_image_reaches_the_shader_read_layout_before_the_region_opens() {
+        let (mut module, attachment) = module_with_attachment();
+        let texture = module.transient_image(&untyped_info());
+
+        let end = module
+            .begin_rendering(&[attachment])
+            .bind_graphics_pipeline(PipelineId(0))
+            .sample_image(texture)
+            .draw(3, 1)
+            .end_rendering();
+
+        let compiled = module.compile(end);
+        let sampled = image_barriers(&module, &compiled)
+            .into_iter()
+            .find(|barrier| barrier.resource == texture)
+            .expect("the sampled image should have been transitioned");
+        assert_eq!(sampled.dst, Access::FragmentSampled);
+        assert_eq!(sampled.new_layout, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+
+        let last_barrier = compiled
+            .iter()
+            .rposition(|(_, ir)| matches!(ir, IR::ImageBarrier { .. }))
+            .expect("barriers should be present");
+        let begin = compiled
+            .iter()
+            .position(|(_, ir)| matches!(ir, IR::BeginRendering { .. }))
+            .expect("the region should be present");
+        assert!(last_barrier < begin);
+    }
+
+    #[test]
+    fn sampling_the_same_image_twice_in_a_region_does_not_repeat_the_barrier() {
+        let (mut module, attachment) = module_with_attachment();
+        let texture = module.transient_image(&untyped_info());
+
+        let end = module
+            .begin_rendering(&[attachment])
+            .bind_graphics_pipeline(PipelineId(0))
+            .sample_image(texture)
+            .draw(3, 1)
+            .sample_image(texture)
+            .draw(3, 1)
+            .end_rendering();
+
+        let barriers = image_barriers(&module, &module.compile(end));
+        assert_eq!(barriers.iter().filter(|b| b.resource == texture).count(), 1);
+    }
+
+    #[test]
+    fn an_image_uploaded_and_then_sampled_moves_through_both_layouts_in_order() {
+        let (mut module, attachment) = module_with_attachment();
+        let staging = module.import_buffer(&Buffer::default());
+        let texture = module.transient_image(&untyped_info());
+        let uploaded = module.copy_buffer_to_image(staging, texture);
+
+        let end = module
+            .begin_rendering(&[attachment])
+            .bind_graphics_pipeline(PipelineId(0))
+            .sample_image(uploaded)
+            .draw(3, 1)
+            .end_rendering();
+
+        let compiled = module.compile(end);
+        let layouts = image_barriers(&module, &compiled)
+            .iter()
+            .filter(|barrier| barrier.resource == texture)
+            .map(|barrier| (barrier.old_layout, barrier.new_layout))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            layouts,
+            vec![
+                (vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL),
+                (
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_uploaded_and_sampled_image_is_created_with_both_usages() {
+        let (mut module, attachment) = module_with_attachment();
+        let staging = module.import_buffer(&Buffer::default());
+        let texture = module.transient_image(&untyped_info());
+        let uploaded = module.copy_buffer_to_image(staging, texture);
+
+        let end = module
+            .begin_rendering(&[attachment])
+            .bind_graphics_pipeline(PipelineId(0))
+            .sample_image(uploaded)
+            .draw(3, 1)
+            .end_rendering();
+
+        assert_eq!(
+            image_usage(&module.compile(end), texture),
+            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED
+        );
+    }
+
+    /// A copy takes the extent off the image it is filling, so a region that names its own
+    /// has to be the one that survives.
+    #[test]
+    fn a_copy_region_overrides_the_extent_the_whole_image_would_have_used() {
+        let mut module = Module::default();
+        let staging = module.import_buffer(&Buffer::default());
+        let texture = module.transient_image(&untyped_info());
+
+        let whole = module.copy_buffer_to_image(staging, texture);
+        let patch = module.copy_buffer_to_image_region(
+            staging,
+            whole,
+            BufferImageCopy::region(vk::Offset2D { x: 4, y: 8 }, vk::Extent2D { width: 2, height: 3 }),
+        );
+
+        let regions = module
+            .compile(patch)
+            .iter()
+            .filter_map(|(_, ir)| match ir {
+                IR::CopyBufferToImage { region, .. } => Some((region.image_offset, region.image_extent)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            regions,
+            vec![
+                (
+                    vk::Offset3D::default(),
+                    vk::Extent3D::default().width(WIDTH).height(HEIGHT).depth(1)
+                ),
+                (
+                    vk::Offset3D { x: 4, y: 8, z: 0 },
+                    vk::Extent3D::default().width(2).height(3).depth(1)
+                ),
+            ]
+        );
     }
 
     #[test]
