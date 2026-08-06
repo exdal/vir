@@ -12,6 +12,7 @@ pub use image::{BufferImageCopy, Image, ImageInfo, aspect_mask};
 pub use pipeline::{
     BlendPreset,
     ColorBlendAttachmentState,
+    ComputePipelineInfo,
     DynamicStateFlags,
     DynamicValues,
     GraphicsPipelineInfo,

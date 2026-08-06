@@ -167,6 +167,14 @@ impl CommandBuffer {
         }
     }
 
+    pub fn dispatch(&self, groups_x: u32, groups_y: u32, groups_z: u32) {
+        unsafe {
+            self.device
+                .as_ref()
+                .cmd_dispatch(self.handle, groups_x, groups_y, groups_z)
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn blit_image(
         &self, src: vk::Image, src_layout: vk::ImageLayout, dst: vk::Image, dst_layout: vk::ImageLayout,

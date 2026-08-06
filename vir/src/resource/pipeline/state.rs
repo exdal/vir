@@ -16,15 +16,17 @@ impl Default for DynamicStateFlags {
     fn default() -> Self { Self::Viewport | Self::Scissor }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub enum Rect2D {
+    #[default]
     Framebuffer,
     Absolute(vk::Rect2D),
-    Relative { x: f32, y: f32, width: f32, height: f32 },
-}
-
-impl Default for Rect2D {
-    fn default() -> Self { Self::Framebuffer }
+    Relative {
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+    },
 }
 
 impl Rect2D {

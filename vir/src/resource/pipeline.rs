@@ -88,6 +88,15 @@ impl GraphicsPipelineInfo {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ComputePipelineInfo {
+    pub shader: Vec<u32>,
+}
+
+impl ComputePipelineInfo {
+    pub fn new(spirv: &[u32]) -> Self { Self { shader: spirv.to_vec() } }
+}
+
 pub fn push_constant_ranges(reflections: &[Reflection]) -> Vec<vk::PushConstantRange> {
     let mut merged: BTreeMap<(u32, u32), vk::ShaderStageFlags> = BTreeMap::new();
 
@@ -112,7 +121,6 @@ pub fn push_constant_ranges(reflections: &[Reflection]) -> Vec<vk::PushConstantR
         .collect()
 }
 
-/// One descriptor set of a [`PipelineLayout`], with what a pool needs to allocate it.
 #[derive(Debug, Default, Clone)]
 pub struct SetLayout {
     pub handle: vk::DescriptorSetLayout,
@@ -122,11 +130,6 @@ pub struct SetLayout {
     pub variable_count: u32,
 }
 
-/// The binding a graph writes its texture table into.
-///
-/// A variable-count combined image sampler array is the shape the table is written in, so
-/// that is what a layout advertises here; a pipeline whose shaders declare anything else
-/// simply gets no table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TextureBinding {
     pub set: u32,
@@ -497,6 +500,63 @@ pub(crate) fn create_pipelines(
         .collect::<Vec<_>>();
 
     let result = unsafe { device.create_graphics_pipelines(vk::PipelineCache::null(), &create_infos, None) };
+    destroy_modules(&modules);
+
+    result.map_err(|(created, err)| {
+        for pipeline in created.iter().filter(|p| !p.is_null()) {
+            unsafe { device.destroy_pipeline(*pipeline, None) };
+        }
+        err
+    })
+}
+
+pub(crate) struct ComputePipelineRequest<'a> {
+    pub info: &'a ComputePipelineInfo,
+    pub reflection: &'a Reflection,
+    pub layout: vk::PipelineLayout,
+}
+
+pub(crate) fn create_compute_pipelines(
+    device: &ash::Device, requests: &[ComputePipelineRequest<'_>],
+) -> Result<Vec<vk::Pipeline>, vk::Result> {
+    if requests.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut modules: Vec<vk::ShaderModule> = Vec::with_capacity(requests.len());
+    let destroy_modules = |modules: &[vk::ShaderModule]| {
+        for module in modules {
+            unsafe { device.destroy_shader_module(*module, None) };
+        }
+    };
+
+    for request in requests {
+        let create_info = vk::ShaderModuleCreateInfo::default().code(&request.info.shader);
+        match unsafe { device.create_shader_module(&create_info, None) } {
+            Ok(module) => modules.push(module),
+            Err(err) => {
+                destroy_modules(&modules);
+                return Err(err);
+            },
+        }
+    }
+
+    let create_infos = requests
+        .iter()
+        .zip(&modules)
+        .map(|(request, module)| {
+            let stage = vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::COMPUTE)
+                .module(*module)
+                .name(&request.reflection.entry_point);
+
+            vk::ComputePipelineCreateInfo::default()
+                .stage(stage)
+                .layout(request.layout)
+        })
+        .collect::<Vec<_>>();
+
+    let result = unsafe { device.create_compute_pipelines(vk::PipelineCache::null(), &create_infos, None) };
     destroy_modules(&modules);
 
     result.map_err(|(created, err)| {

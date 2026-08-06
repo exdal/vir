@@ -13,13 +13,14 @@ use std::{
 pub use allocator::{AllocatorKind, FrameAllocator, PersistentAllocator, SuperFrameAllocator};
 use ash::vk;
 pub use context::{Access, CommandBuffer, Context, DomainFlag};
-pub use graph::{IR, ImageAttachment, Module, PassCallback, RenderGraph, RenderPass, Value, ValueId};
+pub use graph::{ComputePass, IR, ImageAttachment, Module, PassCallback, RenderGraph, RenderPass, Value, ValueId};
 pub use resource::{
     BlendPreset,
     Buffer,
     BufferImageCopy,
     BufferInfo,
     ColorBlendAttachmentState,
+    ComputePipelineInfo,
     DescriptorBinding,
     DescriptorSets,
     DynamicStateFlags,

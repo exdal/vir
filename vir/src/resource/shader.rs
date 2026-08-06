@@ -60,7 +60,6 @@ pub struct DescriptorBinding {
     pub variable_count: bool,
 }
 
-/// One `Location`-decorated input of a vertex shader, in the order the pipeline packs it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct VertexInput {
     pub location: u32,

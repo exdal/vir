@@ -8,7 +8,7 @@ pub mod value;
 
 pub use attachment::ImageAttachment;
 pub use ir::IR; // dont export Constant, i think its ok to use it as ir::Constant
-pub use module::{Module, RenderPass};
+pub use module::{ComputePass, Module, RenderPass};
 pub use pass::PassCallback;
 pub use render_graph::RenderGraph;
 pub use value::{Value, ValueId};

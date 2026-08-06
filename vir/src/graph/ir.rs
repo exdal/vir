@@ -16,6 +16,7 @@ use crate::{
     Image,
     PipelineId,
     PipelineState,
+    PushConstants,
     RasterizationState,
     Rect2D,
     ResolvedViewport,
@@ -170,6 +171,21 @@ pub enum IR {
     EndRendering {
         pass: ValueId,
     },
+    BeginCompute {
+        resources: Vec<(ValueId, Access)>,
+        name: Name,
+    },
+    Dispatch {
+        pass: ValueId,
+        groups_x: ValueId,
+        groups_y: ValueId,
+        groups_z: ValueId,
+        pipeline: Option<PipelineId>,
+        push_constants: PushConstants,
+    },
+    EndCompute {
+        pass: ValueId,
+    },
     MemoryBarrier {
         src_access: ValueId,
         dst_access: ValueId,
@@ -229,6 +245,7 @@ impl<'a> Program<'a> {
                 IR::Blit { dst, .. } => *dst,
                 IR::CopyBufferToImage { image, .. } => *image,
                 IR::BeginRendering { color_attachments, .. } => *color_attachments.first()?,
+                IR::BeginCompute { resources, .. } => resources.first()?.0,
                 IR::BindPipeline { pass, .. }
                 | IR::SetState { pass, .. }
                 | IR::BindVertexBuffers { pass, .. }
@@ -236,7 +253,9 @@ impl<'a> Program<'a> {
                 | IR::SampleImage { pass, .. }
                 | IR::Draw { pass, .. }
                 | IR::DrawIndexed { pass, .. }
-                | IR::EndRendering { pass } => *pass,
+                | IR::EndRendering { pass }
+                | IR::Dispatch { pass, .. }
+                | IR::EndCompute { pass } => *pass,
                 IR::Acquire { resource, .. } | IR::Release { resource, .. } => *resource,
                 _ => return None,
             };
@@ -465,6 +484,10 @@ impl IR {
     pub fn draw_state(&self) -> Option<String> {
         let (state, dynamic) = match self {
             IR::Draw { state, dynamic, .. } | IR::DrawIndexed { state, dynamic, .. } => (state, dynamic),
+            IR::Dispatch { push_constants, .. } => {
+                return (!push_constants.is_empty())
+                    .then(|| format!("push_constants=[{}..{}]", push_constants.offset, push_constants.end()));
+            },
             _ => return None,
         };
 
@@ -746,6 +769,35 @@ impl IR {
                 write!(f, " {}", fmt_pipeline(pipeline))
             },
             IR::EndRendering { .. } => write!(f, "end_rendering"),
+            IR::BeginCompute { resources, name } => {
+                write!(
+                    f,
+                    "begin_compute{} resources=[{}]",
+                    fmt_name(name),
+                    fmt_list(resources, |(id, access)| format!(
+                        "{}:{}",
+                        p.operand(*id),
+                        fmt_flags(*access)
+                    ))
+                )
+            },
+            IR::Dispatch {
+                groups_x,
+                groups_y,
+                groups_z,
+                pipeline,
+                ..
+            } => {
+                write!(
+                    f,
+                    "dispatch groups_x={} groups_y={} groups_z={} {}",
+                    p.operand(*groups_x),
+                    p.operand(*groups_y),
+                    p.operand(*groups_z),
+                    fmt_pipeline(pipeline)
+                )
+            },
+            IR::EndCompute { .. } => write!(f, "end_compute"),
             IR::MemoryBarrier { src_access, dst_access } => write!(
                 f,
                 "barrier.memory {} -> {}",

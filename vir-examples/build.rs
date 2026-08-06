@@ -6,7 +6,16 @@ use slang::Downcast;
 /// Every Slang module, with the entry points to pull out of it and the file each one is
 /// written to. A module is linked on its own, so entry point names only have to be unique
 /// within their module.
-const MODULES: [(&str, &[(&str, &str)]); 4] = [
+const MODULES: [(&str, &[(&str, &str)]); 5] = [
+    (
+        "compute.slang",
+        &[
+            ("cs_place", "compute.place.spv"),
+            ("cs_expand", "compute.expand.spv"),
+            ("vs_main", "compute.vert.spv"),
+            ("fs_main", "compute.frag.spv"),
+        ],
+    ),
     (
         "triangle.slang",
         &[("vs_main", "triangle.vert.spv"), ("fs_main", "triangle.frag.spv")],

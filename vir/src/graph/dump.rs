@@ -11,7 +11,7 @@ pub fn dump(instructions: &[Instr]) -> String {
         .unwrap_or_default();
 
     let count = |predicate: fn(&IR) -> bool| instructions.iter().filter(|(_, ir)| predicate(ir)).count();
-    let passes = count(|ir| matches!(ir, IR::BeginRendering { .. }));
+    let passes = count(|ir| matches!(ir, IR::BeginRendering { .. } | IR::BeginCompute { .. }));
     let barriers = count(|ir| matches!(ir, IR::MemoryBarrier { .. } | IR::ImageBarrier { .. }));
     let folded = count(|ir| matches!(ir, IR::Type(_) | IR::Constant(_)));
 
@@ -22,32 +22,35 @@ pub fn dump(instructions: &[Instr]) -> String {
         instructions.len()
     );
 
-    let mut indent = "";
+    let mut depth = 0usize;
     for (id, ir) in instructions {
         match ir {
             IR::Type(_) | IR::Constant(_) => continue,
-            IR::BeginRendering { .. } => {
+            IR::BeginRendering { .. } | IR::BeginCompute { .. } => {
                 blank_line(&mut out);
-                let _ = writeln!(out, "; Pass {}", pass_header(&program, ir));
+                let _ = writeln!(out, "{}; Pass {}", indent(depth), pass_header(&program, ir));
             },
-            IR::EndRendering { .. } => indent = "",
+            IR::EndRendering { .. } | IR::EndCompute { .. } => depth = depth.saturating_sub(1),
             _ => {},
         }
 
+        let indent = indent(depth);
         let _ = writeln!(out, "{:>width$} = {indent}{}", id.to_string(), ir.display(&program));
         if let Some(state) = ir.draw_state() {
             let _ = writeln!(out, "{:width$}   {indent}  ; {state}", "");
         }
 
         match ir {
-            IR::BeginRendering { .. } => indent = "  ",
-            IR::EndRendering { .. } => blank_line(&mut out),
+            IR::BeginRendering { .. } | IR::BeginCompute { .. } => depth += 1,
+            IR::EndRendering { .. } | IR::EndCompute { .. } => blank_line(&mut out),
             _ => {},
         }
     }
 
     out
 }
+
+fn indent(depth: usize) -> String { "  ".repeat(depth) }
 
 fn blank_line(out: &mut String) {
     if !out.is_empty() && !out.ends_with("\n\n") {
@@ -56,23 +59,24 @@ fn blank_line(out: &mut String) {
 }
 
 fn pass_header(program: &Program, ir: &IR) -> String {
-    let IR::BeginRendering {
-        color_attachments,
-        name,
-        ..
-    } = ir
-    else {
-        return String::new();
+    let (resources, name) = match ir {
+        IR::BeginRendering {
+            color_attachments,
+            name,
+            ..
+        } => (color_attachments.clone(), name),
+        IR::BeginCompute { resources, name } => (resources.iter().map(|(id, _)| *id).collect(), name),
+        _ => return String::new(),
     };
 
-    let targets = color_attachments
+    let targets = resources
         .iter()
-        .map(|attachment| {
-            let mut target = match program.name(*attachment) {
+        .map(|resource| {
+            let mut target = match program.name(*resource) {
                 Some(name) => format!("\"{name}\""),
-                None => attachment.to_string(),
+                None => resource.to_string(),
             };
-            if let Some(extent) = program.extent(*attachment) {
+            if let Some(extent) = program.extent(*resource) {
                 let _ = write!(target, " {}x{}", extent.width, extent.height);
             }
             target
@@ -80,9 +84,11 @@ fn pass_header(program: &Program, ir: &IR) -> String {
         .collect::<Vec<_>>()
         .join(", ");
 
-    match name {
-        Some(name) => format!("\"{name}\" -> {targets}"),
-        None => format!("-> {targets}"),
+    match (name, targets.is_empty()) {
+        (Some(name), true) => format!("\"{name}\""),
+        (Some(name), false) => format!("\"{name}\" -> {targets}"),
+        (None, true) => String::new(),
+        (None, false) => format!("-> {targets}"),
     }
 }
 
@@ -133,6 +139,36 @@ mod tests {
         assert!(dump.contains("image \"target\" 64x32"), "{dump}");
         assert!(dump.contains("color=[%"), "{dump}");
         assert!(dump.contains("(target)"), "{dump}");
+    }
+
+    #[test]
+    fn a_compute_region_heads_and_indents_like_a_rendering_one() {
+        let extent = vk::Extent3D::default().width(64).height(32).depth(1);
+        let mut module = Module::default();
+        let target = module.transient_image(&crate::ImageInfo {
+            extent,
+            format: FORMAT,
+            ..Default::default()
+        });
+        module.set_name(target, "storage");
+
+        let end = module
+            .begin_compute()
+            .with_name("blur")
+            .bind_pipeline(PipelineId(0))
+            .write(target)
+            .push_constants(&1u32)
+            .dispatch(8, 4, 1)
+            .end_compute();
+
+        let dump = dump(&module.compile(end));
+        assert!(dump.contains("; Pass \"blur\" -> \"storage\" 64x32"), "{dump}");
+        assert!(
+            dump.contains("  dispatch groups_x=8 groups_y=4 groups_z=1 pipeline=#0"),
+            "{dump}"
+        );
+        assert!(dump.contains("; push_constants=[0..4]"), "{dump}");
+        assert!(dump.contains("end_compute"), "{dump}");
     }
 
     #[test]

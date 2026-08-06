@@ -185,7 +185,8 @@ impl Module {
             Some(
                 IR::ConstructImage { name: slot, .. }
                 | IR::ConstructBuffer { name: slot, .. }
-                | IR::BeginRendering { name: slot, .. },
+                | IR::BeginRendering { name: slot, .. }
+                | IR::BeginCompute { name: slot, .. },
             ) => *slot = Some(name.into()),
             _ => tracing::warn!(%id, "value cannot carry a name; the name is dropped"),
         }
@@ -287,6 +288,18 @@ impl Module {
         }
     }
 
+    pub fn begin_compute(&mut self) -> ComputePass<'_> {
+        let id = self.emit(IR::BeginCompute {
+            resources: Vec::new(),
+            name: None,
+        });
+        ComputePass {
+            module: self,
+            id,
+            begin: id,
+        }
+    }
+
     pub fn compile(&self, id: ValueId) -> Vec<ir::Instr> { self.compile_all(&[id]) }
 
     pub fn compile_all(&self, ids: &[ValueId]) -> Vec<ir::Instr> {
@@ -377,12 +390,12 @@ impl Module {
                         stack.push(*pass);
                     },
                     IR::BindVertexBuffers { pass, buffers, .. } => {
-                        buffers.iter().rev().for_each(|v| stack.push(*v));
                         stack.push(*pass);
+                        buffers.iter().rev().for_each(|v| stack.push(*v));
                     },
                     IR::BindIndexBuffer { pass, buffer, .. } => {
-                        stack.push(*buffer);
                         stack.push(*pass);
+                        stack.push(*buffer);
                     },
                     IR::SampleImage { pass, image } => {
                         stack.push(*pass);
@@ -419,6 +432,24 @@ impl Module {
                         stack.push(*pass);
                     },
                     IR::EndRendering { pass } => {
+                        stack.push(*pass);
+                    },
+                    IR::BeginCompute { resources, .. } => {
+                        resources.iter().rev().for_each(|(id, _)| stack.push(*id));
+                    },
+                    IR::Dispatch {
+                        pass,
+                        groups_x,
+                        groups_y,
+                        groups_z,
+                        ..
+                    } => {
+                        stack.push(*groups_z);
+                        stack.push(*groups_y);
+                        stack.push(*groups_x);
+                        stack.push(*pass);
+                    },
+                    IR::EndCompute { pass } => {
                         stack.push(*pass);
                     },
                     IR::MemoryBarrier { src_access, dst_access } => {
@@ -557,10 +588,11 @@ impl Module {
         }
 
         /// A buffer the host filled is visible to the GPU only after a barrier, and stays
-        /// visible until something writes it again, which nothing in a graph does today.
+        /// visible until something writes it again, which only a dispatch does today.
         macro_rules! buffer_barrier {
             ($buffer:expr, $access:expr) => {{
                 let buffer = $buffer;
+                let access: Access = $access;
                 let last = match buffer_states.get(&buffer).copied() {
                     Some(id) => id,
                     None => match host_write_id {
@@ -573,10 +605,14 @@ impl Module {
                     },
                 };
 
-                let read_id = read_access!($access);
-                if last != read_id {
-                    emit_memory_barrier!(last, read_id);
-                    buffer_states.insert(buffer, read_id);
+                // a write is never shared, so it always ends up with a barrier of its own
+                let next_id = match access.writes() {
+                    true => emit_access!(access),
+                    false => read_access!(access),
+                };
+                if last != next_id {
+                    emit_memory_barrier!(last, next_id);
+                    buffer_states.insert(buffer, next_id);
                 }
             }};
         }
@@ -671,6 +707,21 @@ impl Module {
                     }
                 },
 
+                IR::BeginCompute { resources, .. } => {
+                    for (resource, access) in resources {
+                        if self.is_buffer(*resource) {
+                            buffer_barrier!(self.resource_root(*resource), *access);
+                            continue;
+                        }
+
+                        let access_id = match access.writes() {
+                            true => emit_access!(*access),
+                            false => read_access!(*access),
+                        };
+                        transition!(*resource, access_id, *access);
+                    }
+                },
+
                 IR::Release { resource, access, .. } => {
                     transition!(*resource, *access, self.resolve_access(*access));
                 },
@@ -682,6 +733,13 @@ impl Module {
         }
 
         result
+    }
+
+    fn is_buffer(&self, id: ValueId) -> bool {
+        matches!(
+            self.instructions.get(self.resource_root(id).0 as usize),
+            Some(IR::ConstructBuffer { .. })
+        )
     }
 
     fn resource_root(&self, id: ValueId) -> ValueId {
@@ -700,6 +758,10 @@ impl Module {
                     Some(first) => *first,
                     None => return id,
                 },
+                IR::BeginCompute { resources, .. } => match resources.first() {
+                    Some((first, _)) => *first,
+                    None => return id,
+                },
                 IR::BindPipeline { pass, .. }
                 | IR::SetState { pass, .. }
                 | IR::BindVertexBuffers { pass, .. }
@@ -707,7 +769,9 @@ impl Module {
                 | IR::SampleImage { pass, .. }
                 | IR::Draw { pass, .. }
                 | IR::DrawIndexed { pass, .. }
-                | IR::EndRendering { pass } => *pass,
+                | IR::EndRendering { pass }
+                | IR::Dispatch { pass, .. }
+                | IR::EndCompute { pass } => *pass,
                 IR::Acquire { resource, .. } | IR::Release { resource, .. } => *resource,
                 _ => return id,
             };
@@ -785,6 +849,7 @@ impl Module {
                 IR::Blit { dst, .. } => id = *dst,
                 IR::CopyBufferToImage { image, .. } => id = *image,
                 IR::BeginRendering { color_attachments, .. } => id = *color_attachments.first()?,
+                IR::BeginCompute { resources, .. } => id = resources.first()?.0,
                 IR::BindPipeline { pass, .. }
                 | IR::SetState { pass, .. }
                 | IR::BindVertexBuffers { pass, .. }
@@ -792,7 +857,9 @@ impl Module {
                 | IR::SampleImage { pass, .. }
                 | IR::Draw { pass, .. }
                 | IR::DrawIndexed { pass, .. }
-                | IR::EndRendering { pass } => id = *pass,
+                | IR::EndRendering { pass }
+                | IR::Dispatch { pass, .. }
+                | IR::EndCompute { pass } => id = *pass,
                 IR::Acquire { resource, .. } | IR::Release { resource, .. } => id = *resource,
                 _ => return None,
             }
@@ -870,6 +937,17 @@ impl Module {
                     );
                 },
 
+                IR::BeginCompute { .. } => {
+                    regions.insert(
+                        *value_id,
+                        InForce {
+                            state: PassState::default(),
+                            area: vk::Rect2D::default(),
+                            pipeline: None,
+                        },
+                    );
+                },
+
                 IR::BindPipeline { pass, pipeline, .. } => {
                     if let Some(mut in_force) = regions.get(pass).cloned() {
                         in_force.pipeline = Some(*pipeline);
@@ -908,10 +986,27 @@ impl Module {
                     }
                 },
 
+                IR::Dispatch {
+                    pass,
+                    pipeline,
+                    push_constants,
+                    ..
+                } => {
+                    if let Some(in_force) = regions.get(pass).cloned() {
+                        if in_force.pipeline.is_none() {
+                            tracing::warn!(%value_id, "dispatch with no pipeline bound");
+                        }
+                        *pipeline = in_force.pipeline;
+                        *push_constants = in_force.state.push_constants.clone();
+                        regions.insert(*value_id, in_force);
+                    }
+                },
+
                 IR::BindVertexBuffers { pass, .. }
                 | IR::BindIndexBuffer { pass, .. }
                 | IR::SampleImage { pass, .. }
-                | IR::EndRendering { pass } => {
+                | IR::EndRendering { pass }
+                | IR::EndCompute { pass } => {
                     if let Some(in_force) = regions.get(pass).cloned() {
                         regions.insert(*value_id, in_force);
                     }
@@ -1093,6 +1188,88 @@ impl RenderPass<'_> {
     }
 
     pub fn end_rendering(self) -> ValueId { self.module.emit(IR::EndRendering { pass: self.id }) }
+}
+
+pub struct ComputePass<'a> {
+    module: &'a mut Module,
+    id: ValueId,
+    begin: ValueId,
+}
+
+impl ComputePass<'_> {
+    pub fn id(&self) -> ValueId { self.id }
+
+    pub fn with_name(self, name: impl Into<Arc<str>>) -> Self {
+        self.module.set_name(self.begin, name);
+        self
+    }
+
+    pub fn bind_pipeline(mut self, pipeline: PipelineId) -> Self {
+        self.id = self.module.emit(IR::BindPipeline {
+            pass: self.id,
+            pipeline,
+            bind_point: vk::PipelineBindPoint::COMPUTE,
+        });
+        self
+    }
+
+    pub fn access(self, resource: ValueId, access: Access) -> Self {
+        let Some(IR::BeginCompute { resources, .. }) = self.module.instructions.get_mut(self.begin.0 as usize) else {
+            return self;
+        };
+
+        match resources.iter_mut().find(|(id, _)| *id == resource) {
+            Some((_, merged)) => *merged |= access,
+            None => resources.push((resource, access)),
+        }
+
+        self
+    }
+
+    pub fn read(self, resource: ValueId) -> Self { self.access(resource, Access::ComputeRead) }
+
+    pub fn write(self, resource: ValueId) -> Self { self.access(resource, Access::ComputeWrite) }
+
+    pub fn read_write(self, resource: ValueId) -> Self { self.access(resource, Access::ComputeRW) }
+
+    pub fn sample_image(self, image: ValueId) -> Self { self.access(image, Access::ComputeSampled) }
+
+    pub fn read_uniform(self, buffer: ValueId) -> Self { self.access(buffer, Access::ComputeUniformRead) }
+
+    pub fn push_constants<T: Copy>(self, value: &T) -> Self { self.push_constants_at(0, value) }
+
+    pub fn push_constants_at<T: Copy>(self, offset: u32, value: &T) -> Self {
+        let bytes = unsafe { std::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) };
+        self.push_constant_bytes(offset, bytes)
+    }
+
+    pub fn push_constant_bytes(mut self, offset: u32, data: &[u8]) -> Self {
+        self.id = self.module.emit(IR::SetState {
+            pass: self.id,
+            change: StateChange::PushConstants {
+                offset,
+                data: data.to_vec(),
+            },
+        });
+        self
+    }
+
+    pub fn dispatch(mut self, groups_x: u32, groups_y: u32, groups_z: u32) -> Self {
+        let groups_x = self.module.lower_u32(groups_x);
+        let groups_y = self.module.lower_u32(groups_y);
+        let groups_z = self.module.lower_u32(groups_z);
+        self.id = self.module.emit(IR::Dispatch {
+            pass: self.id,
+            groups_x,
+            groups_y,
+            groups_z,
+            pipeline: None,
+            push_constants: Default::default(),
+        });
+        self
+    }
+
+    pub fn end_compute(self) -> ValueId { self.module.emit(IR::EndCompute { pass: self.id }) }
 }
 
 #[cfg(test)]
@@ -1840,6 +2017,197 @@ mod tests {
 
         assert_eq!(dynamic.push_constants.data, 7u32.to_ne_bytes());
         assert_eq!(draws(&compiled)[0].0, Some(PipelineId(0)));
+    }
+
+    #[test]
+    fn a_dispatch_picks_up_the_compute_pipeline_and_the_pushes_in_force() {
+        let (mut module, attachment) = module_with_attachment();
+
+        let end = module
+            .begin_compute()
+            .bind_pipeline(PipelineId(1))
+            .write(attachment)
+            .push_constants(&7u32)
+            .dispatch(8, 4, 1)
+            .end_compute();
+
+        let compiled = module.compile(end);
+        let (
+            _,
+            IR::Dispatch {
+                pipeline,
+                push_constants,
+                groups_x,
+                groups_y,
+                groups_z,
+                ..
+            },
+        ) = compiled
+            .iter()
+            .find(|(_, ir)| matches!(ir, IR::Dispatch { .. }))
+            .expect("dispatch should be present")
+        else {
+            unreachable!()
+        };
+
+        assert_eq!(*pipeline, Some(PipelineId(1)));
+        assert_eq!(push_constants.data, 7u32.to_ne_bytes());
+        assert_eq!(
+            [
+                u32_constant(&module, groups_x),
+                u32_constant(&module, groups_y),
+                u32_constant(&module, groups_z)
+            ],
+            [8, 4, 1]
+        );
+    }
+
+    #[test]
+    fn a_dispatch_that_writes_an_image_puts_it_in_general_with_storage_usage() {
+        let (mut module, swapchain) = module_with_attachment();
+        let target = module.transient_image(&untyped_info());
+
+        let computed = module
+            .begin_compute()
+            .bind_pipeline(PipelineId(0))
+            .write(target)
+            .dispatch(8, 8, 1)
+            .end_compute();
+        // the region's value stands in for what it wrote, so the blit reads the dispatch
+        let swapchain = module.blit(computed, swapchain);
+        let end = module.present(swapchain);
+
+        let compiled = module.compile(end);
+        let written = image_barriers(&module, &compiled)
+            .into_iter()
+            .find(|barrier| barrier.resource == target)
+            .expect("the written image should have been transitioned");
+
+        assert_eq!(written.dst, Access::ComputeWrite);
+        assert_eq!(written.old_layout, vk::ImageLayout::UNDEFINED);
+        assert_eq!(written.new_layout, vk::ImageLayout::GENERAL);
+        assert_eq!(
+            image_usage(&compiled, target),
+            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC
+        );
+    }
+
+    #[test]
+    fn a_dispatch_that_reads_what_an_earlier_one_wrote_waits_for_it() {
+        let mut module = Module::default();
+        let image = module.transient_image(&untyped_info());
+
+        let written = module
+            .begin_compute()
+            .bind_pipeline(PipelineId(0))
+            .write(image)
+            .dispatch(1, 1, 1)
+            .end_compute();
+        let end = module
+            .begin_compute()
+            .bind_pipeline(PipelineId(1))
+            .read(written)
+            .dispatch(1, 1, 1)
+            .end_compute();
+
+        let barriers = image_barriers(&module, &module.compile(end));
+        assert_eq!(barriers.len(), 2);
+        assert_eq!(barriers[1].src, Access::ComputeWrite);
+        assert_eq!(barriers[1].dst, Access::ComputeRead);
+        assert_eq!(barriers[1].old_layout, vk::ImageLayout::GENERAL);
+        assert_eq!(barriers[1].new_layout, vk::ImageLayout::GENERAL);
+    }
+
+    #[test]
+    fn a_resource_declared_twice_carries_both_accesses() {
+        let mut module = Module::default();
+        let image = module.transient_image(&untyped_info());
+
+        let end = module
+            .begin_compute()
+            .bind_pipeline(PipelineId(0))
+            .read(image)
+            .write(image)
+            .dispatch(1, 1, 1)
+            .end_compute();
+
+        let barriers = image_barriers(&module, &module.compile(end));
+        assert_eq!(barriers.len(), 1);
+        assert_eq!(barriers[0].dst, Access::ComputeRW);
+    }
+
+    #[test]
+    fn a_buffer_a_dispatch_wrote_is_made_visible_to_the_draw_that_reads_it() {
+        let (mut module, attachment) = module_with_attachment();
+        let buffer = module.import_buffer(&Buffer::default());
+
+        let computed = module
+            .begin_compute()
+            .bind_pipeline(PipelineId(1))
+            .write(buffer)
+            .dispatch(1, 1, 1)
+            .end_compute();
+        let rendered = module
+            .begin_rendering(&[attachment])
+            .bind_graphics_pipeline(PipelineId(0))
+            .bind_vertex_buffer(0, buffer)
+            .draw(3, 1)
+            .end_rendering();
+
+        let compiled = module.compile_all(&[computed, rendered]);
+        assert_eq!(
+            memory_barriers(&module, &compiled),
+            vec![
+                (Access::HostWrite, Access::ComputeWrite),
+                (Access::ComputeWrite, Access::AttributeRead)
+            ]
+        );
+    }
+
+    /// A dispatch cannot be recorded inside a rendering region, so a buffer the draw binds has
+    /// to bring its producer out ahead of the region rather than into it, even when the draw is
+    /// the only root and the dispatch is reachable through the bound buffer alone.
+    #[test]
+    fn a_dispatch_the_draw_binds_the_result_of_stays_outside_the_region() {
+        let (mut module, attachment) = module_with_attachment();
+        let buffer = module.import_buffer(&Buffer::default());
+
+        let computed = module
+            .begin_compute()
+            .bind_pipeline(PipelineId(1))
+            .write(buffer)
+            .dispatch(1, 1, 1)
+            .end_compute();
+        let rendered = module
+            .begin_rendering(&[attachment])
+            .bind_graphics_pipeline(PipelineId(0))
+            .bind_vertex_buffer(0, computed)
+            .draw(3, 1)
+            .end_rendering();
+
+        let compiled = module.compile(rendered);
+        let position = |predicate: fn(&IR) -> bool| {
+            compiled
+                .iter()
+                .position(|(_, ir)| predicate(ir))
+                .expect("instruction should be present")
+        };
+
+        let end_compute = position(|ir| matches!(ir, IR::EndCompute { .. }));
+        let begin_rendering = position(|ir| matches!(ir, IR::BeginRendering { .. }));
+        assert!(
+            end_compute < begin_rendering,
+            "the compute region closed at {end_compute} but the rendering region opened at {begin_rendering}"
+        );
+
+        // and the barrier that hands the buffer over is hoisted out with it
+        assert_eq!(
+            memory_barriers(&module, &compiled),
+            vec![
+                (Access::HostWrite, Access::ComputeWrite),
+                (Access::ComputeWrite, Access::AttributeRead)
+            ]
+        );
     }
 
     #[test]

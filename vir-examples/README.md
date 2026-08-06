@@ -8,6 +8,7 @@ cargo run --example triangle
 cargo run --example vertex_buffer
 cargo run --example offscreen
 cargo run --example texture
+cargo run --example compute
 cargo run --example egui
 ```
 
@@ -17,6 +18,7 @@ cargo run --example egui
 | `vertex_buffer` | A quad uploaded once into a persistent buffer and drawn indexed, next to a triangle rebuilt every frame out of the frame allocator. |
 | `offscreen` | A frame as a chain: a persistent offscreen target, a transient image the graph owns for the length of the frame, two blits, and a second root that hands the target back in a known layout. |
 | `texture` | A PNG staged and copied onto the GPU once at startup, then sampled through the graph's bindless table by pushing a slot index. |
+| `compute` | Geometry that never exists on the CPU: two dispatches reaching their buffers through device addresses, chained so that the second reads what the first wrote and the draw's vertex input waits on both. |
 | `egui` | The overlay with nothing under it. |
 
 Every example draws its controls through the same egui overlay, so the backend in

@@ -11,6 +11,7 @@ use crate::{
     Buffer,
     ClearValue,
     CommandBuffer,
+    ComputePipelineInfo,
     Context,
     DescriptorSets,
     DomainFlag,
@@ -33,7 +34,7 @@ use crate::{
     graph::{dump, ir, value::FromValue},
     resource::{
         self,
-        pipeline::{PipelineRequest, create_pipelines},
+        pipeline::{ComputePipelineRequest, PipelineRequest, create_compute_pipelines, create_pipelines},
         shader::{self, Reflection},
     },
 };
@@ -140,14 +141,30 @@ fn blit_offsets(extent: vk::Extent3D) -> [vk::Offset3D; 2] {
     ]
 }
 
+enum PipelineKind {
+    Graphics {
+        info: GraphicsPipelineInfo,
+        vertex: VertexLayout,
+        variants: HashMap<PipelineState, vk::Pipeline>,
+    },
+    Compute {
+        info: ComputePipelineInfo,
+        handle: Option<vk::Pipeline>,
+    },
+}
+
 struct DeclaredPipeline {
-    info: GraphicsPipelineInfo,
     reflections: Vec<Reflection>,
-    vertex: VertexLayout,
     layout: Option<PipelineLayout>,
     descriptors: Option<DescriptorSets>,
     written_textures: u64,
-    variants: HashMap<PipelineState, vk::Pipeline>,
+    kind: PipelineKind,
+}
+
+impl DeclaredPipeline {
+    fn layout_handle(&self) -> vk::PipelineLayout {
+        self.layout.as_ref().map_or(vk::PipelineLayout::null(), |l| l.handle)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -168,7 +185,7 @@ pub struct RenderGraph {
     texture_revision: u64,
     values: Vec<Value>,
     bound_pipeline: Option<vk::Pipeline>,
-    bound_layout: Option<vk::PipelineLayout>,
+    bound_layout: Option<(vk::PipelineBindPoint, vk::PipelineLayout)>,
     render_area: vk::Rect2D,
     recorded_viewports: Vec<ResolvedViewport>,
     recorded_scissors: Vec<vk::Rect2D>,
@@ -228,13 +245,39 @@ impl RenderGraph {
 
         let id = PipelineId(self.pipelines.len() as u32);
         self.pipelines.push(DeclaredPipeline {
-            info,
             reflections,
-            vertex,
             layout: None,
             descriptors: None,
             written_textures: 0,
-            variants: HashMap::new(),
+            kind: PipelineKind::Graphics {
+                info,
+                vertex,
+                variants: HashMap::new(),
+            },
+        });
+
+        Ok(id)
+    }
+
+    pub fn declare_compute_pipeline(&mut self, info: ComputePipelineInfo) -> Result<PipelineId, vk::Result> {
+        if info.shader.is_empty() {
+            tracing::error!("compute pipeline declared without a shader");
+            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+        }
+
+        let reflection = shader::reflect(&info.shader)?;
+        if reflection.stage != vk::ShaderStageFlags::COMPUTE {
+            tracing::error!(stage = ?reflection.stage, "compute pipeline declared with a shader that is not compute");
+            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+        }
+
+        let id = PipelineId(self.pipelines.len() as u32);
+        self.pipelines.push(DeclaredPipeline {
+            reflections: vec![reflection],
+            layout: None,
+            descriptors: None,
+            written_textures: 0,
+            kind: PipelineKind::Compute { info, handle: None },
         });
 
         Ok(id)
@@ -326,41 +369,64 @@ impl RenderGraph {
     }
 
     fn construct_pipelines(&mut self, instructions: &[ir::Instr]) -> Result<(), vk::Result> {
-        let mut pending: Vec<(PipelineId, PipelineState)> = Vec::new();
+        let mut graphics: Vec<(PipelineId, PipelineState)> = Vec::new();
+        let mut compute: Vec<PipelineId> = Vec::new();
 
         for (value_id, ir) in instructions {
-            let (IR::Draw { pipeline, state, .. } | IR::DrawIndexed { pipeline, state, .. }) = ir else {
-                continue;
+            let pipeline = match ir {
+                IR::Draw { pipeline, .. } | IR::DrawIndexed { pipeline, .. } | IR::Dispatch { pipeline, .. } => {
+                    pipeline
+                },
+                _ => continue,
             };
 
             let Some(pipeline) = pipeline else {
-                tracing::error!(%value_id, "draw with no pipeline bound");
+                tracing::error!(%value_id, "draw or dispatch with no pipeline bound");
                 return Err(vk::Result::ERROR_UNKNOWN);
             };
 
             let Some(declared) = self.pipelines.get(pipeline.0 as usize) else {
-                tracing::error!(%pipeline, "draw with a pipeline that was never declared");
+                tracing::error!(%pipeline, "draw or dispatch with a pipeline that was never declared");
                 return Err(vk::Result::ERROR_UNKNOWN);
             };
 
-            if declared.variants.contains_key(state) {
-                continue;
-            }
-            if pending.iter().any(|(id, pending)| id == pipeline && pending == state) {
-                continue;
-            }
+            match (ir, &declared.kind) {
+                (IR::Draw { state, .. } | IR::DrawIndexed { state, .. }, PipelineKind::Graphics { variants, .. }) => {
+                    if variants.contains_key(state) {
+                        continue;
+                    }
+                    if graphics.iter().any(|(id, pending)| id == pipeline && pending == state) {
+                        continue;
+                    }
 
-            pending.push((*pipeline, state.clone()));
+                    graphics.push((*pipeline, state.clone()));
+                },
+                (IR::Dispatch { .. }, PipelineKind::Compute { handle, .. }) => {
+                    if handle.is_some() || compute.contains(pipeline) {
+                        continue;
+                    }
+
+                    compute.push(*pipeline);
+                },
+                (IR::Dispatch { .. }, _) => {
+                    tracing::error!(%pipeline, "dispatch with a graphics pipeline bound");
+                    return Err(vk::Result::ERROR_UNKNOWN);
+                },
+                _ => {
+                    tracing::error!(%pipeline, "draw with a compute pipeline bound");
+                    return Err(vk::Result::ERROR_UNKNOWN);
+                },
+            }
         }
 
-        if pending.is_empty() {
+        if graphics.is_empty() && compute.is_empty() {
             return Ok(());
         }
 
         let device_ptr = self.device;
         let device = unsafe { device_ptr.as_ref() };
 
-        for (id, _) in &pending {
+        for id in graphics.iter().map(|(id, _)| *id).chain(compute.iter().copied()) {
             let index = id.0 as usize;
             if self.pipelines[index].layout.is_some() {
                 continue;
@@ -376,29 +442,55 @@ impl RenderGraph {
             self.pipelines[index].layout = Some(layout);
         }
 
-        let requests = pending
-            .iter()
-            .map(|(id, state)| {
-                let declared = &self.pipelines[id.0 as usize];
-                PipelineRequest {
-                    info: &declared.info,
-                    reflections: &declared.reflections,
-                    vertex: &declared.vertex,
-                    state,
-                    layout: declared
-                        .layout
-                        .as_ref()
-                        .map_or(vk::PipelineLayout::null(), |l| l.handle),
-                }
-            })
-            .collect::<Vec<_>>();
+        let mut requests = Vec::with_capacity(graphics.len());
+        for (id, state) in &graphics {
+            let declared = &self.pipelines[id.0 as usize];
+            let PipelineKind::Graphics { info, vertex, .. } = &declared.kind else {
+                continue;
+            };
+
+            requests.push(PipelineRequest {
+                info,
+                reflections: &declared.reflections,
+                vertex,
+                state,
+                layout: declared.layout_handle(),
+            });
+        }
 
         tracing::debug!(count = requests.len(), "compiling pipeline permutations");
         let handles = create_pipelines(device, &requests)?;
         drop(requests);
 
-        for ((id, state), handle) in pending.into_iter().zip(handles) {
-            self.pipelines[id.0 as usize].variants.insert(state, handle);
+        for ((id, state), handle) in graphics.into_iter().zip(handles) {
+            if let PipelineKind::Graphics { variants, .. } = &mut self.pipelines[id.0 as usize].kind {
+                variants.insert(state, handle);
+            }
+        }
+
+        let mut requests = Vec::with_capacity(compute.len());
+        for id in &compute {
+            let declared = &self.pipelines[id.0 as usize];
+            let (PipelineKind::Compute { info, .. }, Some(reflection)) = (&declared.kind, declared.reflections.first())
+            else {
+                continue;
+            };
+
+            requests.push(ComputePipelineRequest {
+                info,
+                reflection,
+                layout: declared.layout_handle(),
+            });
+        }
+
+        tracing::debug!(count = requests.len(), "compiling compute pipelines");
+        let handles = create_compute_pipelines(device, &requests)?;
+        drop(requests);
+
+        for (id, compiled) in compute.into_iter().zip(handles) {
+            if let PipelineKind::Compute { handle, .. } = &mut self.pipelines[id.0 as usize].kind {
+                *handle = Some(compiled);
+            }
         }
 
         Ok(())
@@ -619,7 +711,9 @@ impl RenderGraph {
         Ok(())
     }
 
-    fn bind_descriptor_sets(&mut self, pipeline: PipelineId) -> Result<(), vk::Result> {
+    fn bind_descriptor_sets(
+        &mut self, pipeline: PipelineId, bind_point: vk::PipelineBindPoint,
+    ) -> Result<(), vk::Result> {
         let bound = self.pipelines.get(pipeline.0 as usize).and_then(|declared| {
             let layout = declared.layout.as_ref()?;
             Some((layout.handle, declared.descriptors.as_ref().map(|d| d.sets().to_vec())))
@@ -628,14 +722,13 @@ impl RenderGraph {
         let Some((handle, sets)) = bound else {
             return Ok(());
         };
-        if self.bound_layout == Some(handle) {
+        if self.bound_layout == Some((bind_point, handle)) {
             return Ok(());
         }
-        self.bound_layout = Some(handle);
+        self.bound_layout = Some((bind_point, handle));
 
         if let Some(sets) = sets {
-            self.batch()?
-                .bind_descriptor_sets(vk::PipelineBindPoint::GRAPHICS, handle, 0, &sets);
+            self.batch()?.bind_descriptor_sets(bind_point, handle, 0, &sets);
         }
 
         Ok(())
@@ -648,8 +741,10 @@ impl RenderGraph {
         let handle = self
             .pipelines
             .get(pipeline.0 as usize)
-            .and_then(|declared| declared.variants.get(state))
-            .copied()
+            .and_then(|declared| match &declared.kind {
+                PipelineKind::Graphics { variants, .. } => variants.get(state).copied(),
+                PipelineKind::Compute { .. } => None,
+            })
             .ok_or(vk::Result::ERROR_UNKNOWN)?;
 
         if self.bound_pipeline != Some(handle) {
@@ -657,7 +752,7 @@ impl RenderGraph {
             self.bound_pipeline = Some(handle);
         }
 
-        self.bind_descriptor_sets(pipeline)?;
+        self.bind_descriptor_sets(pipeline, vk::PipelineBindPoint::GRAPHICS)?;
 
         let viewports = dynamic.viewports(self.render_area);
         if !viewports.is_empty() && viewports != self.recorded_viewports {
@@ -673,6 +768,29 @@ impl RenderGraph {
         }
 
         self.record_push_constants(pipeline, &dynamic.push_constants)
+    }
+
+    fn prepare_dispatch(
+        &mut self, pipeline: Option<PipelineId>, push_constants: &PushConstants,
+    ) -> Result<(), vk::Result> {
+        let pipeline = pipeline.ok_or(vk::Result::ERROR_UNKNOWN)?;
+        let handle = self
+            .pipelines
+            .get(pipeline.0 as usize)
+            .and_then(|declared| match &declared.kind {
+                PipelineKind::Compute { handle, .. } => *handle,
+                PipelineKind::Graphics { .. } => None,
+            })
+            .ok_or(vk::Result::ERROR_UNKNOWN)?;
+
+        if self.bound_pipeline != Some(handle) {
+            self.batch()?.bind_pipeline(vk::PipelineBindPoint::COMPUTE, handle);
+            self.bound_pipeline = Some(handle);
+        }
+
+        self.bind_descriptor_sets(pipeline, vk::PipelineBindPoint::COMPUTE)?;
+
+        self.record_push_constants(pipeline, push_constants)
     }
 
     pub fn dump(instructions: &[ir::Instr]) {
@@ -987,6 +1105,31 @@ impl RenderGraph {
                 self.set_value(value_id, Value::Reference(*pass));
                 self.batch()?.end_rendering();
             },
+            IR::BeginCompute { resources, .. } => {
+                self.ensure_batch(ctx, allocator)?;
+                match resources.first() {
+                    Some((first, _)) => self.set_value(value_id, Value::Reference(*first)),
+                    None => self.set_value(value_id, Value::None),
+                }
+            },
+            IR::EndCompute { pass } => self.set_value(value_id, Value::Reference(*pass)),
+            IR::Dispatch {
+                pass,
+                groups_x,
+                groups_y,
+                groups_z,
+                pipeline,
+                push_constants,
+            } => {
+                self.set_value(value_id, Value::Reference(*pass));
+                self.ensure_batch(ctx, allocator)?;
+                self.prepare_dispatch(*pipeline, push_constants)?;
+
+                let groups_x = self.get::<u32>(groups_x);
+                let groups_y = self.get::<u32>(groups_y);
+                let groups_z = self.get::<u32>(groups_z);
+                self.batch()?.dispatch(groups_x, groups_y, groups_z);
+            },
             IR::MemoryBarrier { src_access, dst_access } => {
                 self.ensure_batch(ctx, allocator)?;
                 let src_access_flags = self.get::<Access>(src_access);
@@ -1029,8 +1172,18 @@ impl Drop for RenderGraph {
         }
 
         for declared in &self.pipelines {
-            for handle in declared.variants.values() {
-                unsafe { device.destroy_pipeline(*handle, None) };
+            match &declared.kind {
+                PipelineKind::Graphics { variants, .. } => {
+                    for handle in variants.values() {
+                        unsafe { device.destroy_pipeline(*handle, None) };
+                    }
+                },
+                PipelineKind::Compute {
+                    handle: Some(handle), ..
+                } => {
+                    unsafe { device.destroy_pipeline(*handle, None) };
+                },
+                PipelineKind::Compute { .. } => {},
             }
 
             if let Some(descriptors) = &declared.descriptors {
