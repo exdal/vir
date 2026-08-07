@@ -32,6 +32,7 @@ pub use resource::{
     BufferInfo,
     ColorBlendAttachmentState,
     ComputePipelineInfo,
+    DepthState,
     DescriptorBinding,
     DescriptorSets,
     DynamicStateFlags,
@@ -70,6 +71,16 @@ impl ClearValue {
     pub const fn rgba_f32(r: f32, g: f32, b: f32, a: f32) -> Self {
         Self(vk::ClearValue {
             color: vk::ClearColorValue { float32: [r, g, b, a] },
+        })
+    }
+
+    #[inline]
+    pub const fn depth(depth: f32) -> Self { Self::depth_stencil(depth, 0) }
+
+    #[inline]
+    pub const fn depth_stencil(depth: f32, stencil: u32) -> Self {
+        Self(vk::ClearValue {
+            depth_stencil: vk::ClearDepthStencilValue { depth, stencil },
         })
     }
 

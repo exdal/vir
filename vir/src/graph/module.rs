@@ -8,6 +8,7 @@ use crate::{
     BufferImageCopy,
     ClearValue,
     ColorBlendAttachmentState,
+    DepthState,
     DomainFlag,
     DynamicStateFlags,
     IR,
@@ -277,23 +278,32 @@ impl Module {
     }
 
     pub fn begin_rendering(&mut self, color_attachments: &[ValueId]) -> RenderPass<'_> {
-        let id = self.emit(IR::BeginRendering {
-            color_attachments: color_attachments.to_vec(),
-            render_area: None,
-            name: None,
-        });
-        RenderPass {
-            module: self,
-            id,
-            begin: id,
-        }
+        self.begin_rendering_with(color_attachments, None, None)
+    }
+
+    pub fn begin_rendering_depth(&mut self, color_attachments: &[ValueId], depth: ValueId) -> RenderPass<'_> {
+        self.begin_rendering_with(color_attachments, Some(depth), None)
     }
 
     pub fn begin_rendering_area(&mut self, color_attachments: &[ValueId], render_area: vk::Extent2D) -> RenderPass<'_> {
         let render_area = self.lower_constant(ir::Constant::Extent2D(render_area));
+        self.begin_rendering_with(color_attachments, None, Some(render_area))
+    }
+
+    pub fn begin_rendering_depth_area(
+        &mut self, color_attachments: &[ValueId], depth: ValueId, render_area: vk::Extent2D,
+    ) -> RenderPass<'_> {
+        let render_area = self.lower_constant(ir::Constant::Extent2D(render_area));
+        self.begin_rendering_with(color_attachments, Some(depth), Some(render_area))
+    }
+
+    fn begin_rendering_with(
+        &mut self, color_attachments: &[ValueId], depth_attachment: Option<ValueId>, render_area: Option<ValueId>,
+    ) -> RenderPass<'_> {
         let id = self.emit(IR::BeginRendering {
             color_attachments: color_attachments.to_vec(),
-            render_area: Some(render_area),
+            depth_attachment,
+            render_area,
             name: None,
         });
         RenderPass {
@@ -395,10 +405,12 @@ impl Module {
                     },
                     IR::BeginRendering {
                         color_attachments,
+                        depth_attachment,
                         render_area,
                         ..
                     } => {
                         render_area.iter().for_each(|v| stack.push(*v));
+                        depth_attachment.iter().for_each(|v| stack.push(*v));
                         color_attachments.iter().rev().for_each(|v| stack.push(*v));
                     },
                     IR::BindPipeline { pass, .. } | IR::SetState { pass, .. } => {
@@ -705,7 +717,11 @@ impl Module {
                     transition!(*image, write_id, Access::CopyWrite);
                 },
 
-                IR::BeginRendering { color_attachments, .. } => {
+                IR::BeginRendering {
+                    color_attachments,
+                    depth_attachment,
+                    ..
+                } => {
                     for image in region_images.get(&value_id).cloned().into_iter().flatten() {
                         let sampled_id = read_access!(Access::FragmentSampled);
                         transition!(image, sampled_id, Access::FragmentSampled);
@@ -714,6 +730,11 @@ impl Module {
                     let access_id = emit_access!(Access::ColorRW);
                     for attachment in color_attachments {
                         transition!(*attachment, access_id, Access::ColorRW);
+                    }
+
+                    if let Some(depth) = depth_attachment {
+                        let depth_id = emit_access!(Access::DepthStencilRW);
+                        transition!(*depth, depth_id, Access::DepthStencilRW);
                     }
 
                     for (buffer, access) in region_buffers.get(&value_id).cloned().into_iter().flatten() {
@@ -775,7 +796,11 @@ impl Module {
                 IR::Clear { attachment, .. } => *attachment,
                 IR::Blit { dst, .. } => *dst,
                 IR::CopyBufferToImage { image, .. } => *image,
-                IR::BeginRendering { color_attachments, .. } => match color_attachments.first() {
+                IR::BeginRendering {
+                    color_attachments,
+                    depth_attachment,
+                    ..
+                } => match color_attachments.first().or(depth_attachment.as_ref()) {
                     Some(first) => *first,
                     None => return id,
                 },
@@ -854,7 +879,14 @@ impl Module {
                 IR::Clear { attachment, .. } => *attachment,
                 IR::Blit { dst, .. } => *dst,
                 IR::CopyBufferToImage { image, .. } => *image,
-                IR::BeginRendering { color_attachments, .. } => *color_attachments.first()?,
+                IR::BeginRendering {
+                    color_attachments,
+                    depth_attachment,
+                    ..
+                } => match color_attachments.first() {
+                    Some(first) => *first,
+                    None => (*depth_attachment)?,
+                },
                 IR::BeginCompute { resources, .. } => resources.first()?.0,
                 IR::BindPipeline { pass, .. }
                 | IR::SetState { pass, .. }
@@ -923,11 +955,13 @@ impl Module {
             match ir {
                 IR::BeginRendering {
                     color_attachments,
+                    depth_attachment,
                     render_area,
                     ..
                 } => {
                     let mut rendering = RenderingState::default();
                     let mut attachment_extent = None;
+                    let mut samples_from_color = false;
 
                     for (index, attachment) in color_attachments.iter().enumerate() {
                         let Some(image) = self.resolve_image(*attachment) else {
@@ -937,6 +971,7 @@ impl Module {
 
                         if index == 0 {
                             rendering.samples = image.samples;
+                            samples_from_color = true;
                             attachment_extent = Some(vk::Extent2D {
                                 width: image.extent.width,
                                 height: image.extent.height,
@@ -949,6 +984,31 @@ impl Module {
                         }
 
                         rendering.color_formats.push(image.format);
+                    }
+
+                    if let Some(attachment) = depth_attachment {
+                        match self.resolve_image(*attachment) {
+                            Some(image) => {
+                                rendering.depth_format = Some(image.format);
+
+                                // a depth-only region has nothing else to take these from
+                                if !samples_from_color {
+                                    rendering.samples = image.samples;
+                                    attachment_extent = Some(vk::Extent2D {
+                                        width: image.extent.width,
+                                        height: image.extent.height,
+                                    });
+                                } else if image.samples != rendering.samples {
+                                    tracing::warn!(
+                                        %attachment,
+                                        "depth attachment sample count differs from the color attachments"
+                                    );
+                                }
+                            },
+                            None => {
+                                tracing::warn!(%attachment, "cannot infer depth attachment type; pipelines may not match")
+                            },
+                        }
                     }
 
                     // framebuffer-relative state resolves against this, so it has to match the
@@ -1063,7 +1123,6 @@ pub struct RenderPass<'a> {
 impl RenderPass<'_> {
     pub fn id(&self) -> ValueId { self.id }
 
-    /// Names the region, which is what the dump groups this pass' instructions under.
     pub fn with_name(self, name: impl Into<Arc<str>>) -> Self {
         self.module.set_name(self.begin, name);
         self
@@ -1139,6 +1198,8 @@ impl RenderPass<'_> {
     pub fn set_primitive_topology(self, topology: vk::PrimitiveTopology) -> Self {
         self.set_state(StateChange::PrimitiveTopology(topology))
     }
+
+    pub fn set_depth(self, depth: DepthState) -> Self { self.set_state(StateChange::Depth(depth)) }
 
     pub fn set_rasterization(self, rasterization: RasterizationState) -> Self {
         self.set_state(StateChange::Rasterization(rasterization))
@@ -1373,6 +1434,7 @@ mod tests {
     use crate::{BlendPreset, Image, PipelineState, ResolvedViewport};
 
     const FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
+    const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
     const WIDTH: u32 = 64;
     const HEIGHT: u32 = 32;
 
@@ -1393,6 +1455,8 @@ mod tests {
         let (_, construct) = module.lower_image_attachment(&attachment, Some("target".into()));
         (module, construct)
     }
+
+    fn depth_info() -> ImageInfo { ImageInfo::depth_target(extent_2d(), DEPTH_FORMAT) }
 
     fn access_constant(module: &Module, instructions: &[ir::Instr], id: &ValueId) -> Access {
         instructions
@@ -1662,6 +1726,97 @@ mod tests {
         assert_eq!(draws.len(), 1);
         assert_eq!(draws[0].0, Some(PipelineId(0)));
         assert_eq!(draws[0].1.rendering.color_formats, vec![FORMAT]);
+    }
+
+    /// A depth attachment reaches the pipeline through the region's rendering state, which is
+    /// what makes the created pipeline agree with the attachment it renders into.
+    #[test]
+    fn a_region_opened_with_depth_infers_the_depth_format() {
+        let (mut module, attachment) = module_with_attachment();
+        let depth = module.transient_image(&depth_info());
+
+        let end = module
+            .begin_rendering_depth(&[attachment], depth)
+            .bind_graphics_pipeline(PipelineId(0))
+            .set_depth(DepthState::less())
+            .draw(3, 1)
+            .end_rendering();
+        let instructions = module.compile(end);
+
+        let draws = draws(&instructions);
+        assert_eq!(draws.len(), 1);
+        assert_eq!(draws[0].1.rendering.color_formats, vec![FORMAT]);
+        assert_eq!(draws[0].1.rendering.depth_format, Some(DEPTH_FORMAT));
+        assert_eq!(draws[0].1.depth, DepthState::less());
+    }
+
+    /// Depth state a region without a depth attachment cannot honour is dropped, so the draw
+    /// does not ask for a pipeline that would fail validation.
+    #[test]
+    fn depth_state_without_a_depth_attachment_is_dropped() {
+        let (mut module, attachment) = module_with_attachment();
+
+        let end = module
+            .begin_rendering(&[attachment])
+            .bind_graphics_pipeline(PipelineId(0))
+            .set_depth(DepthState::less())
+            .draw(3, 1)
+            .end_rendering();
+        let instructions = module.compile(end);
+
+        let draws = draws(&instructions);
+        assert_eq!(draws.len(), 1);
+        assert_eq!(draws[0].1.rendering.depth_format, None);
+        assert_eq!(draws[0].1.depth, DepthState::default());
+    }
+
+    /// The region writes the depth attachment, so the graph has to move it into the layout an
+    /// attachment write wants before the region opens.
+    #[test]
+    fn the_depth_attachment_is_transitioned_for_the_region() {
+        let (mut module, attachment) = module_with_attachment();
+        let depth = module.transient_image(&depth_info());
+
+        let end = module
+            .begin_rendering_depth(&[attachment], depth)
+            .bind_graphics_pipeline(PipelineId(0))
+            .set_depth(DepthState::less())
+            .draw(3, 1)
+            .end_rendering();
+        let instructions = module.compile(end);
+
+        let barrier = image_barriers(&module, &instructions)
+            .into_iter()
+            .find(|barrier| barrier.resource == module.resource_root(depth))
+            .expect("the depth attachment should be transitioned");
+
+        assert_eq!(barrier.dst, Access::DepthStencilRW);
+        assert_eq!(barrier.old_layout, vk::ImageLayout::UNDEFINED);
+        assert_eq!(barrier.new_layout, vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+    }
+
+    /// Nothing declares the usage of a transient depth target, so rendering into it is what has
+    /// to put the attachment bit on.
+    #[test]
+    fn rendering_into_a_transient_depth_target_infers_its_usage() {
+        let (mut module, attachment) = module_with_attachment();
+        let depth = module.transient_image(&ImageInfo {
+            extent: vk::Extent3D::default().width(WIDTH).height(HEIGHT).depth(1),
+            format: DEPTH_FORMAT,
+            ..Default::default()
+        });
+
+        let end = module
+            .begin_rendering_depth(&[attachment], depth)
+            .bind_graphics_pipeline(PipelineId(0))
+            .draw(3, 1)
+            .end_rendering();
+        let instructions = module.compile(end);
+
+        assert!(
+            image_usage(&instructions, depth).contains(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT),
+            "the depth attachment should be created as one"
+        );
     }
 
     #[test]

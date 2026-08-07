@@ -124,7 +124,7 @@ impl Example for Offscreen {
 
         self.target = Some(attachment.with_layout(RESTING_ACCESS.into()));
 
-        Ok(())
+        Ok(()) 
     }
 
     fn ui(&mut self, ctx: &egui::Context) {

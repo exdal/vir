@@ -6,6 +6,7 @@ use ash::vk::{self, Handle};
 pub use state::{
     BlendPreset,
     ColorBlendAttachmentState,
+    DepthState,
     DynamicStateFlags,
     DynamicValues,
     PassState,
@@ -124,9 +125,7 @@ pub fn push_constant_ranges(reflections: &[Reflection]) -> Vec<vk::PushConstantR
 #[derive(Debug, Default, Clone)]
 pub struct SetLayout {
     pub handle: vk::DescriptorSetLayout,
-    /// How many descriptors of each type the set holds.
     pub sizes: Vec<(vk::DescriptorType, u32)>,
-    /// The count the set's variable-count binding is allocated with, or zero when it has none.
     pub variable_count: u32,
 }
 
@@ -427,7 +426,10 @@ pub(crate) fn create_pipelines(
         })
         .collect::<Vec<_>>();
 
-    let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default();
+    let depth_stencil = requests
+        .iter()
+        .map(|request| vk::PipelineDepthStencilStateCreateInfo::from(request.state.depth))
+        .collect::<Vec<_>>();
 
     let viewport = requests
         .iter()
@@ -476,7 +478,12 @@ pub(crate) fn create_pipelines(
     let mut rendering = requests
         .iter()
         .map(|request| {
-            vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&request.state.rendering.color_formats)
+            let info = vk::PipelineRenderingCreateInfo::default()
+                .color_attachment_formats(&request.state.rendering.color_formats);
+            match request.state.rendering.depth_format {
+                Some(format) => info.depth_attachment_format(format),
+                None => info,
+            }
         })
         .collect::<Vec<_>>();
 
@@ -491,7 +498,7 @@ pub(crate) fn create_pipelines(
                 .viewport_state(&viewport[index])
                 .rasterization_state(&rasterization[index])
                 .multisample_state(&multisample[index])
-                .depth_stencil_state(&depth_stencil)
+                .depth_stencil_state(&depth_stencil[index])
                 .color_blend_state(&color_blend[index])
                 .dynamic_state(&dynamic_state[index])
                 .layout(requests[index].layout)
@@ -604,35 +611,41 @@ mod tests {
     #[test]
     fn packs_vertex_inputs_into_one_tightly_interleaved_binding() {
         let reflections = [
-            reflection(vk::ShaderStageFlags::VERTEX, vec![
-                VertexInput {
-                    location: 0,
-                    format: vk::Format::R32G32_SFLOAT,
-                    size: 8,
-                },
-                VertexInput {
-                    location: 1,
-                    format: vk::Format::R32G32B32_SFLOAT,
-                    size: 12,
-                },
-            ]),
+            reflection(
+                vk::ShaderStageFlags::VERTEX,
+                vec![
+                    VertexInput {
+                        location: 0,
+                        format: vk::Format::R32G32_SFLOAT,
+                        size: 8,
+                    },
+                    VertexInput {
+                        location: 1,
+                        format: vk::Format::R32G32B32_SFLOAT,
+                        size: 12,
+                    },
+                ],
+            ),
             reflection(vk::ShaderStageFlags::FRAGMENT, Vec::new()),
         ];
 
         let layout = VertexLayout::interleaved(&reflections);
         assert_eq!(layout.stride, 20);
-        assert_eq!(layout.attributes, vec![
-            VertexAttribute {
-                location: 0,
-                format: vk::Format::R32G32_SFLOAT,
-                offset: 0,
-            },
-            VertexAttribute {
-                location: 1,
-                format: vk::Format::R32G32B32_SFLOAT,
-                offset: 8,
-            },
-        ]);
+        assert_eq!(
+            layout.attributes,
+            vec![
+                VertexAttribute {
+                    location: 0,
+                    format: vk::Format::R32G32_SFLOAT,
+                    offset: 0,
+                },
+                VertexAttribute {
+                    location: 1,
+                    format: vk::Format::R32G32B32_SFLOAT,
+                    offset: 8,
+                },
+            ]
+        );
     }
 
     #[test]
@@ -693,17 +706,19 @@ mod tests {
         ]));
 
         // a push spanning both ranges is split at the boundary
-        assert_eq!(layout.cover(0, 32).collect::<Vec<_>>(), vec![
-            (vk::ShaderStageFlags::VERTEX, 0, 16),
-            (vk::ShaderStageFlags::FRAGMENT, 16, 16),
-        ]);
+        assert_eq!(
+            layout.cover(0, 32).collect::<Vec<_>>(),
+            vec![
+                (vk::ShaderStageFlags::VERTEX, 0, 16),
+                (vk::ShaderStageFlags::FRAGMENT, 16, 16),
+            ]
+        );
 
         // one that lands inside a single range keeps its own bounds
-        assert_eq!(layout.cover(20, 4).collect::<Vec<_>>(), vec![(
-            vk::ShaderStageFlags::FRAGMENT,
-            20,
-            4
-        )]);
+        assert_eq!(
+            layout.cover(20, 4).collect::<Vec<_>>(),
+            vec![(vk::ShaderStageFlags::FRAGMENT, 20, 4)]
+        );
 
         // and one that lands past every range covers nothing
         assert_eq!(layout.cover(64, 4).count(), 0);

@@ -937,12 +937,15 @@ impl RenderGraph {
                 let attachment = self.get::<ImageAttachment>(attachment);
                 let color = self.get::<ClearValue>(color);
                 let subresource_range = attachment.subresource_range();
-                self.batch()?.clear_color(
-                    attachment.image().into(),
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &color,
-                    &[subresource_range],
-                );
+                let image = attachment.image().into();
+                let layout = vk::ImageLayout::TRANSFER_DST_OPTIMAL;
+                let batch = self.batch()?;
+
+                if subresource_range.aspect_mask.contains(vk::ImageAspectFlags::DEPTH) {
+                    batch.clear_depth_stencil(image, layout, &color, &[subresource_range]);
+                } else {
+                    batch.clear_color(image, layout, &color, &[subresource_range]);
+                }
             },
             IR::Blit { src, dst, filter } => {
                 self.ensure_batch(ctx, allocator)?;
@@ -994,6 +997,7 @@ impl RenderGraph {
             },
             IR::BeginRendering {
                 color_attachments,
+                depth_attachment,
                 render_area,
                 ..
             } => {
@@ -1003,11 +1007,14 @@ impl RenderGraph {
                     .iter()
                     .map(|id| self.get::<ImageAttachment>(id))
                     .collect::<Vec<_>>();
+                let depth = depth_attachment.map(|id| self.get::<ImageAttachment>(&id));
 
                 let extent = match render_area {
                     Some(id) => self.get::<vk::Extent2D>(id),
+                    // a depth-only region sizes itself off the depth attachment instead
                     None => attachments
                         .first()
+                        .or(depth.as_ref())
                         .map(|attachment| vk::Extent2D {
                             width: attachment.extent().width,
                             height: attachment.extent().height,
@@ -1029,9 +1036,18 @@ impl RenderGraph {
                     })
                     .collect::<Vec<_>>();
 
-                self.batch()?.begin_rendering(render_area, &attachment_infos);
+                let depth_info = depth.as_ref().map(|attachment| {
+                    vk::RenderingAttachmentInfo::default()
+                        .image_view(attachment.image_view())
+                        .image_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                        .load_op(vk::AttachmentLoadOp::LOAD)
+                        .store_op(vk::AttachmentStoreOp::STORE)
+                });
 
-                match color_attachments.first() {
+                self.batch()?
+                    .begin_rendering(render_area, &attachment_infos, depth_info.as_ref());
+
+                match color_attachments.first().or(depth_attachment.as_ref()) {
                     Some(first) => self.set_value(value_id, Value::Reference(*first)),
                     None => self.set_value(value_id, Value::None),
                 }

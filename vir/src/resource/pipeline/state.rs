@@ -200,6 +200,7 @@ impl From<ResolvedViewport> for vk::Viewport {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RenderingState {
     pub color_formats: Vec<vk::Format>,
+    pub depth_format: Option<vk::Format>,
     pub samples: vk::SampleCountFlags,
 }
 
@@ -207,8 +208,59 @@ impl Default for RenderingState {
     fn default() -> Self {
         Self {
             color_formats: Vec::new(),
+            depth_format: None,
             samples: vk::SampleCountFlags::TYPE_1,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DepthState {
+    pub test_enable: bool,
+    pub write_enable: bool,
+    pub compare_op: vk::CompareOp,
+}
+
+impl Default for DepthState {
+    fn default() -> Self {
+        Self {
+            test_enable: false,
+            write_enable: false,
+            compare_op: vk::CompareOp::ALWAYS,
+        }
+    }
+}
+
+impl DepthState {
+    pub const fn testing(compare_op: vk::CompareOp) -> Self {
+        Self {
+            test_enable: true,
+            write_enable: true,
+            compare_op,
+        }
+    }
+
+    pub const fn less() -> Self { Self::testing(vk::CompareOp::LESS) }
+
+    pub const fn greater() -> Self { Self::testing(vk::CompareOp::GREATER) }
+
+    pub const fn read_only(compare_op: vk::CompareOp) -> Self {
+        Self {
+            test_enable: true,
+            write_enable: false,
+            compare_op,
+        }
+    }
+}
+
+impl<'a> From<DepthState> for vk::PipelineDepthStencilStateCreateInfo<'a> {
+    fn from(state: DepthState) -> Self {
+        Self::default()
+            .depth_test_enable(state.test_enable)
+            .depth_write_enable(state.write_enable)
+            .depth_compare_op(state.compare_op)
+            .min_depth_bounds(0.0)
+            .max_depth_bounds(1.0)
     }
 }
 
@@ -399,6 +451,7 @@ pub enum StateChange {
         index: Option<u32>,
         blend: ColorBlendAttachmentState,
     },
+    Depth(DepthState),
     PushConstants {
         offset: u32,
         data: Vec<u8>,
@@ -411,6 +464,7 @@ pub struct PassState {
     pub topology: vk::PrimitiveTopology,
     pub rasterization: RasterizationState,
     pub blend: Vec<ColorBlendAttachmentState>,
+    pub depth: DepthState,
     pub viewports: Vec<Viewport>,
     pub scissors: Vec<Rect2D>,
     pub dynamic: DynamicStateFlags,
@@ -424,6 +478,7 @@ impl Default for PassState {
             topology: vk::PrimitiveTopology::TRIANGLE_LIST,
             rasterization: RasterizationState::default(),
             blend: Vec::new(),
+            depth: DepthState::default(),
             viewports: vec![Viewport::default()],
             scissors: vec![Rect2D::default()],
             dynamic: DynamicStateFlags::default(),
@@ -468,6 +523,7 @@ impl PassState {
                     self.blend.iter_mut().for_each(|attachment| *attachment = blend);
                 }
             },
+            StateChange::Depth(depth) => self.depth = depth,
             StateChange::PushConstants { offset, data } => self.push_constants.write(offset, &data),
         }
     }
@@ -481,11 +537,19 @@ impl PassState {
             .map(|index| self.blend.get(index).copied().unwrap_or_default())
             .collect();
 
+        // a region without a depth attachment cannot test against one, so the state is dropped
+        // rather than handed to a pipeline that would fail validation
+        let depth = match self.rendering.depth_format {
+            Some(_) => self.depth,
+            None => DepthState::default(),
+        };
+
         let mut state = PipelineState {
             rendering: self.rendering.clone(),
             topology: self.topology,
             rasterization: self.rasterization,
             blend,
+            depth,
             viewport_count: count as u32,
             viewports: Vec::new(),
             scissors: Vec::new(),
@@ -518,6 +582,7 @@ pub struct PipelineState {
     pub topology: vk::PrimitiveTopology,
     pub rasterization: RasterizationState,
     pub blend: Vec<ColorBlendAttachmentState>,
+    pub depth: DepthState,
     pub viewport_count: u32,
     pub viewports: Vec<ResolvedViewport>,
     pub scissors: Vec<vk::Rect2D>,

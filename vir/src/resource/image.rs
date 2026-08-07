@@ -46,7 +46,18 @@ impl ImageInfo {
         }
     }
 
-    /// A texture a shader samples and the host fills through a copy.
+    pub fn depth_target(extent: vk::Extent2D, format: vk::Format) -> Self {
+        Self {
+            extent: vk::Extent3D::default()
+                .width(extent.width)
+                .height(extent.height)
+                .depth(1),
+            format,
+            usage: vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+            ..Default::default()
+        }
+    }
+
     pub fn texture(extent: vk::Extent2D, format: vk::Format) -> Self {
         Self {
             extent: vk::Extent3D::default()
@@ -92,10 +103,6 @@ impl ImageInfo {
     }
 }
 
-/// Which part of an image a buffer copy fills, and where in the buffer it reads from.
-///
-/// The buffer side is always tightly packed to `image_extent`, which is what an upload that
-/// staged exactly the region it is writing looks like.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BufferImageCopy {
     pub buffer_offset: u64,
@@ -116,7 +123,6 @@ impl Default for BufferImageCopy {
 }
 
 impl BufferImageCopy {
-    /// The whole of a 2D image.
     pub fn whole(extent: vk::Extent3D) -> Self {
         Self {
             image_extent: extent,
@@ -124,7 +130,6 @@ impl BufferImageCopy {
         }
     }
 
-    /// A rectangle of a 2D image, offset in texels.
     pub fn region(offset: vk::Offset2D, extent: vk::Extent2D) -> Self {
         Self {
             image_offset: vk::Offset3D {

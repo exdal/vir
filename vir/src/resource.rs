@@ -13,6 +13,7 @@ pub use pipeline::{
     BlendPreset,
     ColorBlendAttachmentState,
     ComputePipelineInfo,
+    DepthState,
     DynamicStateFlags,
     DynamicValues,
     GraphicsPipelineInfo,

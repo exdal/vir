@@ -126,6 +126,7 @@ pub enum IR {
 
     BeginRendering {
         color_attachments: Vec<ValueId>,
+        depth_attachment: Option<ValueId>,
         render_area: Option<ValueId>,
         name: Name,
     },
@@ -249,7 +250,14 @@ impl<'a> Program<'a> {
                 IR::Clear { attachment, .. } => *attachment,
                 IR::Blit { dst, .. } => *dst,
                 IR::CopyBufferToImage { image, .. } => *image,
-                IR::BeginRendering { color_attachments, .. } => *color_attachments.first()?,
+                IR::BeginRendering {
+                    color_attachments,
+                    depth_attachment,
+                    ..
+                } => match color_attachments.first() {
+                    Some(first) => *first,
+                    None => (*depth_attachment)?,
+                },
                 IR::BeginCompute { resources, .. } => resources.first()?.0,
                 IR::BindPipeline { pass, .. }
                 | IR::SetState { pass, .. }
@@ -654,6 +662,7 @@ impl IR {
             },
             IR::BeginRendering {
                 color_attachments,
+                depth_attachment,
                 render_area,
                 name,
             } => {
@@ -663,6 +672,9 @@ impl IR {
                     fmt_name(name),
                     fmt_list(color_attachments, |id| p.operand(*id).to_string())
                 )?;
+                if let Some(depth) = depth_attachment {
+                    write!(f, " depth={}", p.operand(*depth))?;
+                }
                 match render_area {
                     Some(area) => write!(f, " area={}", p.operand(*area)),
                     None => Ok(()),
@@ -717,6 +729,10 @@ impl IR {
                     StateChange::ColorBlend { index, blend } => match index {
                         Some(index) => write!(f, "color_blend[{index}]={}", fmt_blend(blend)),
                         None => write!(f, "color_blend[*]={}", fmt_blend(blend)),
+                    },
+                    StateChange::Depth(depth) => match depth.test_enable {
+                        true => write!(f, "depth={{test={:?} write={}}}", depth.compare_op, depth.write_enable),
+                        false => write!(f, "depth=off"),
                     },
                     StateChange::PushConstants { offset, data } => write!(
                         f,

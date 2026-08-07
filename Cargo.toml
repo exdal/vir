@@ -16,3 +16,5 @@ shader-slang = "0.1.0"
 egui = "0.36.0"
 egui-winit = "0.36.0"
 image = { version = "0.25.8", default-features = false, features = ["png"] }
+gltf = "1.4.1"
+glam = "0.33.3"
