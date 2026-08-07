@@ -6,7 +6,6 @@ use std::{
 use ash::vk::{self, Handle};
 pub use gpu_allocator::MemoryLocation;
 
-/// What an allocator needs to hand back a [`Buffer`].
 #[derive(Debug, Clone)]
 pub struct BufferInfo {
     pub size: u64,
@@ -25,9 +24,7 @@ impl BufferInfo {
         }
     }
 
-    pub fn vertex(size: u64) -> Self {
-        Self::new(size, vk::BufferUsageFlags::VERTEX_BUFFER, MemoryLocation::CpuToGpu)
-    }
+    pub fn vertex(size: u64) -> Self { Self::new(size, vk::BufferUsageFlags::VERTEX_BUFFER, MemoryLocation::CpuToGpu) }
 
     /// A host-visible buffer to stage a copy into device-local memory out of.
     pub fn staging(size: u64) -> Self { Self::new(size, vk::BufferUsageFlags::TRANSFER_SRC, MemoryLocation::CpuToGpu) }

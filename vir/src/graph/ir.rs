@@ -23,11 +23,14 @@ use crate::{
     StateChange,
     ValueId,
     Viewport,
+    graph::value::LabelId,
 };
 
 pub type Instr = (ValueId, IR);
 
 pub type Name = Option<Arc<str>>;
+
+pub const MAX_RESOLVE_DEPTH: usize = 256;
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub enum Type {
@@ -49,16 +52,59 @@ pub enum Constant {
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+pub enum VariableKind {
+    Bool,
+    I32,
+    U32,
+    Extent2D,
+    Extent3D,
+    ClearValue,
+    Bytes(u32),
+    Swapchain,
+}
+
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub enum DispatchSize {
     Groups { x: ValueId, y: ValueId, z: ValueId },
     Invocations { x: ValueId, y: ValueId, z: ValueId },
+    InvocationsPerPixel { image: ValueId, scale: [u32; 3] },
     Indirect { buffer: ValueId, offset: u64 },
+}
+
+pub fn scaled(count: u64, scale: f32) -> u32 {
+    let scaled = (count as f64 * scale as f64).ceil();
+    if !scaled.is_finite() {
+        tracing::warn!(
+            count,
+            scale,
+            "invocation count does not scale to a number; it is taken to be none"
+        );
+        return 0;
+    }
+
+    scaled.clamp(0.0, u32::MAX as f64) as u32
+}
+
+impl DispatchSize {
+    pub fn per_pixel(image: ValueId, scale: [f32; 3]) -> Self {
+        Self::InvocationsPerPixel {
+            image,
+            scale: scale.map(f32::to_bits),
+        }
+    }
+
+    pub fn scale(scale: [u32; 3]) -> [f32; 3] { scale.map(f32::from_bits) }
 }
 
 #[derive(Clone, Hash, PartialEq, Eq)]
 pub enum IR {
     Type(Type),
     Constant(Constant),
+    Variable {
+        slot: u32,
+        kind: VariableKind,
+        name: Name,
+    },
     Array {
         ty: ValueId,
         elements: Vec<ValueId>,
@@ -90,9 +136,13 @@ pub enum IR {
     },
 
     AcquireNextImage {
-        swapchain: vk::SwapchainKHR,
-        attachments: ValueId,
-        present_semaphores: Vec<vk::Semaphore>,
+        swapchain: ValueId,
+    },
+    SwapchainImage {
+        swapchain: ValueId,
+        acquire: ValueId,
+        format: vk::Format,
+        samples: vk::SampleCountFlags,
     },
     Acquire {
         resource: ValueId,
@@ -192,6 +242,26 @@ pub enum IR {
     EndCompute {
         pass: ValueId,
     },
+    Label {
+        label: LabelId,
+    },
+    SelectionMerge {
+        merge: LabelId,
+    },
+    Branch {
+        target: LabelId,
+    },
+    BranchConditional {
+        condition: ValueId,
+        true_label: LabelId,
+        false_label: LabelId,
+    },
+    /// Ends a block that control does not leave, and with it the program.
+    Return,
+    Phi {
+        incoming: Vec<(ValueId, LabelId)>,
+    },
+
     MemoryBarrier {
         src_access: ValueId,
         dst_access: ValueId,
@@ -205,12 +275,83 @@ pub enum IR {
     },
 }
 
+pub enum UnderlyingObject {
+    Base,
+    /// The instruction passes the same resource on through this operand.
+    Forwards(ValueId),
+    /// The instruction names several resources that share a description, and this is a
+    /// representative one. Good for reading a shared name or format off an attachment
+    /// array, never for identity: which element it is is only known at execute time.
+    Element(ValueId),
+    /// Not a resource.
+    None,
+}
+
+pub fn underlying_object(ir: &IR) -> UnderlyingObject {
+    match ir {
+        IR::ConstructImage { .. } | IR::ConstructBuffer { .. } | IR::SwapchainImage { .. } => UnderlyingObject::Base,
+
+        IR::Array { elements, .. } => match elements.first() {
+            Some(first) => UnderlyingObject::Element(*first),
+            None => UnderlyingObject::None,
+        },
+        IR::Index { array, .. } => UnderlyingObject::Element(*array),
+
+        IR::Clear { attachment, .. } => UnderlyingObject::Forwards(*attachment),
+        IR::Blit { dst, .. } => UnderlyingObject::Forwards(*dst),
+        IR::CopyBufferToImage { image, .. } => UnderlyingObject::Forwards(*image),
+        IR::Acquire { resource, .. } | IR::Release { resource, .. } => UnderlyingObject::Forwards(*resource),
+
+        IR::BeginRendering {
+            color_attachments,
+            depth_attachment,
+            ..
+        } => match color_attachments.first().or(depth_attachment.as_ref()) {
+            Some(first) => UnderlyingObject::Forwards(*first),
+            None => UnderlyingObject::None,
+        },
+        IR::BeginCompute { resources, .. } => match resources.first() {
+            Some((first, _)) => UnderlyingObject::Forwards(*first),
+            None => UnderlyingObject::None,
+        },
+
+        IR::BindPipeline { pass, .. }
+        | IR::SetState { pass, .. }
+        | IR::BindVertexBuffers { pass, .. }
+        | IR::BindIndexBuffer { pass, .. }
+        | IR::SampleImage { pass, .. }
+        | IR::Draw { pass, .. }
+        | IR::DrawIndexed { pass, .. }
+        | IR::EndRendering { pass }
+        | IR::Dispatch { pass, .. }
+        | IR::EndCompute { pass } => UnderlyingObject::Forwards(*pass),
+
+        IR::Phi { incoming, .. } => match incoming.first() {
+            Some((first, _)) => UnderlyingObject::Forwards(*first),
+            None => UnderlyingObject::None,
+        },
+
+        IR::Type(_)
+        | IR::Constant(_)
+        | IR::Variable { .. }
+        | IR::AcquireNextImage { .. }
+        | IR::CallOpaque { .. }
+        | IR::Label { .. }
+        | IR::SelectionMerge { .. }
+        | IR::Branch { .. }
+        | IR::BranchConditional { .. }
+        | IR::Return
+        | IR::MemoryBarrier { .. }
+        | IR::ImageBarrier { .. } => UnderlyingObject::None,
+    }
+}
+
 #[derive(Default)]
-pub struct Program<'a> {
+pub struct Symbols<'a> {
     values: HashMap<ValueId, &'a IR>,
 }
 
-impl<'a> Program<'a> {
+impl<'a> Symbols<'a> {
     pub fn new(instructions: &'a [Instr]) -> Self {
         Self {
             values: instructions.iter().map(|(id, ir)| (*id, ir)).collect(),
@@ -236,41 +377,16 @@ impl<'a> Program<'a> {
         let mut id = id;
         let mut through_array = false;
 
-        const MAX_RESOLVE_DEPTH: usize = 256;
-
         for _ in 0..MAX_RESOLVE_DEPTH {
             let ir = self.get(id)?;
-            id = match ir {
-                IR::ConstructImage { .. } | IR::ConstructBuffer { .. } => return Some((ir, through_array)),
-                IR::Array { elements, .. } => {
+            id = match underlying_object(ir) {
+                UnderlyingObject::Base => return Some((ir, through_array)),
+                UnderlyingObject::Forwards(next) => next,
+                UnderlyingObject::Element(next) => {
                     through_array = true;
-                    *elements.first()?
+                    next
                 },
-                IR::Index { array, .. } => *array,
-                IR::Clear { attachment, .. } => *attachment,
-                IR::Blit { dst, .. } => *dst,
-                IR::CopyBufferToImage { image, .. } => *image,
-                IR::BeginRendering {
-                    color_attachments,
-                    depth_attachment,
-                    ..
-                } => match color_attachments.first() {
-                    Some(first) => *first,
-                    None => (*depth_attachment)?,
-                },
-                IR::BeginCompute { resources, .. } => resources.first()?.0,
-                IR::BindPipeline { pass, .. }
-                | IR::SetState { pass, .. }
-                | IR::BindVertexBuffers { pass, .. }
-                | IR::BindIndexBuffer { pass, .. }
-                | IR::SampleImage { pass, .. }
-                | IR::Draw { pass, .. }
-                | IR::DrawIndexed { pass, .. }
-                | IR::EndRendering { pass }
-                | IR::Dispatch { pass, .. }
-                | IR::EndCompute { pass } => *pass,
-                IR::Acquire { resource, .. } | IR::Release { resource, .. } => *resource,
-                _ => return None,
+                UnderlyingObject::None => return None,
             };
         }
 
@@ -281,6 +397,7 @@ impl<'a> Program<'a> {
         let (resource, through_array) = self.resolve(id)?;
         let name = match resource {
             IR::ConstructImage { name, .. } | IR::ConstructBuffer { name, .. } => name.as_deref()?,
+            IR::SwapchainImage { .. } => return Some("swapchain"),
             _ => return None,
         };
 
@@ -305,7 +422,7 @@ impl<'a> Program<'a> {
 }
 
 pub struct Operand<'a> {
-    program: &'a Program<'a>,
+    program: &'a Symbols<'a>,
     id: ValueId,
 }
 
@@ -313,6 +430,13 @@ impl fmt::Display for Operand<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(constant) = self.program.constant(self.id) {
             return write!(f, "{constant}");
+        }
+
+        if let Some(IR::Variable { slot, name, .. }) = self.program.get(self.id) {
+            return match name {
+                Some(name) => write!(f, "${name}"),
+                None => write!(f, "$slot{slot}"),
+            };
         }
 
         write!(f, "{}", self.id)?;
@@ -325,7 +449,7 @@ impl fmt::Display for Operand<'_> {
 
 pub struct Printer<'a> {
     ir: &'a IR,
-    program: &'a Program<'a>,
+    program: &'a Symbols<'a>,
 }
 
 impl fmt::Display for Printer<'_> {
@@ -492,7 +616,7 @@ impl fmt::Display for Constant {
 }
 
 impl IR {
-    pub fn display<'a>(&'a self, program: &'a Program<'a>) -> Printer<'a> { Printer { ir: self, program } }
+    pub fn display<'a>(&'a self, program: &'a Symbols<'a>) -> Printer<'a> { Printer { ir: self, program } }
 
     pub fn draw_state(&self) -> Option<String> {
         let (state, dynamic) = match self {
@@ -536,7 +660,7 @@ impl IR {
         Some(parts.join(" "))
     }
 
-    fn fmt_with(&self, f: &mut fmt::Formatter<'_>, p: &Program<'_>) -> fmt::Result {
+    fn fmt_with(&self, f: &mut fmt::Formatter<'_>, p: &Symbols<'_>) -> fmt::Result {
         match self {
             IR::Type(ty) => match ty {
                 Type::Image { format, samples } => {
@@ -545,6 +669,7 @@ impl IR {
                 Type::Buffer => write!(f, "type buffer"),
             },
             IR::Constant(constant) => write!(f, "const {constant}"),
+            IR::Variable { slot, kind, name } => write!(f, "var{} {kind:?} slot={slot}", fmt_name(name)),
             IR::Array { ty: _, elements } => {
                 write!(f, "array [{}]", fmt_list(elements, |id| p.operand(*id).to_string()))
             },
@@ -601,16 +726,26 @@ impl IR {
                     false => write!(f, " handle={:?} view={image_view:?}", image.handle()),
                 }
             },
-            IR::AcquireNextImage {
+            IR::AcquireNextImage { swapchain } => {
+                write!(f, "acquire_next_image {}", p.operand(*swapchain))
+            },
+            IR::SwapchainImage {
                 swapchain,
-                attachments,
-                present_semaphores,
-            } => write!(
-                f,
-                "acquire_next_image swapchain={swapchain:?} attachments={} present_semaphores={}",
-                p.operand(*attachments),
-                present_semaphores.len()
-            ),
+                acquire,
+                format,
+                samples,
+            } => {
+                write!(
+                    f,
+                    "swapchain_image {}[{}] {format:?}",
+                    p.operand(*swapchain),
+                    p.operand(*acquire)
+                )?;
+                match *samples != vk::SampleCountFlags::TYPE_1 {
+                    true => write!(f, " samples={}", fmt_samples(*samples)),
+                    false => Ok(()),
+                }
+            },
             IR::Acquire { resource, access } => {
                 write!(f, "acquire {} access={}", p.operand(*resource), p.operand(*access))
             },
@@ -741,6 +876,13 @@ impl IR {
                         offset + data.len() as u32,
                         fmt_bytes(data)
                     ),
+                    StateChange::PushConstantsFrom { offset, size, source } => write!(
+                        f,
+                        "push_constants[{}..{}]={}",
+                        offset,
+                        offset + size,
+                        p.operand(*source)
+                    ),
                 }
             },
             IR::Draw {
@@ -818,6 +960,13 @@ impl IR {
                         p.operand(*y),
                         p.operand(*z)
                     )?,
+                    DispatchSize::InvocationsPerPixel { image, scale } => {
+                        write!(f, "dispatch invocations_per_pixel {}", p.operand(*image))?;
+                        if *scale != [1.0f32.to_bits(); 3] {
+                            let scale = DispatchSize::scale(*scale);
+                            write!(f, " scale=[{}, {}, {}]", scale[0], scale[1], scale[2])?;
+                        }
+                    },
                     DispatchSize::Indirect { buffer, offset } => {
                         write!(f, "dispatch.indirect {}", p.operand(*buffer))?;
                         if *offset != 0 {
@@ -828,6 +977,25 @@ impl IR {
                 write!(f, " {}", fmt_pipeline(pipeline))
             },
             IR::EndCompute { .. } => write!(f, "end_compute"),
+            IR::Label { label, .. } => write!(f, "{label}:"),
+            IR::SelectionMerge { merge, .. } => write!(f, "selection_merge {merge}"),
+            IR::Branch { target, .. } => write!(f, "branch {target}"),
+            IR::BranchConditional {
+                condition,
+                true_label,
+                false_label,
+                ..
+            } => write!(
+                f,
+                "branch_cond {} -> {true_label}, {false_label}",
+                p.operand(*condition)
+            ),
+            IR::Return => write!(f, "return"),
+            IR::Phi { incoming, .. } => write!(
+                f,
+                "phi [{}]",
+                fmt_list(incoming, |(value, label)| format!("{} from {label}", p.operand(*value)))
+            ),
             IR::MemoryBarrier { src_access, dst_access } => write!(
                 f,
                 "barrier.memory {} -> {}",
@@ -861,5 +1029,5 @@ fn fmt_pipeline(pipeline: &Option<PipelineId>) -> String {
 }
 
 impl fmt::Display for IR {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { self.fmt_with(f, &Program::default()) }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { self.fmt_with(f, &Symbols::default()) }
 }

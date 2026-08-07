@@ -15,16 +15,24 @@ use crate::{
     Image,
     ImageAttachment,
     ImageInfo,
+    LabelId,
     PassState,
     PipelineId,
+    Program,
+    PushConstants,
     RasterizationState,
     Rect2D,
     RenderingState,
     StateChange,
     SwapChain,
+    SwapchainBinding,
+    Value,
     ValueId,
     Viewport,
-    graph::ir,
+    graph::{
+        ir::{self, scaled},
+        program::Variable,
+    },
 };
 
 #[derive(Clone, Copy)]
@@ -34,39 +42,126 @@ struct ResourceState {
     access: Access,
 }
 
+struct Construct {
+    merge: LabelId,
+    entry_states: HashMap<ValueId, ResourceState>,
+    entry_buffers: HashMap<ValueId, ValueId>,
+    arms: Vec<Arm>,
+}
+
+struct Arm {
+    at: usize,
+    states: HashMap<ValueId, ResourceState>,
+    buffers: HashMap<ValueId, ValueId>,
+}
+
+/// Moves types and constants to the front of the program.
+///
+/// The barrier pass emits an access constant where it first needs one and then shares it
+/// with every later barrier that waits on the same access. Left where it was emitted that
+/// constant could sit inside one arm of a selection while the other arm's barrier names it,
+/// and the arm that did not run would leave it with no value at all. They depend on nothing,
+/// so the simplest place for all of them is before anything can branch.
+fn hoist_pure(nodes: Vec<ir::Instr>) -> Vec<ir::Instr> {
+    let (mut pure, rest): (Vec<_>, Vec<_>) = nodes
+        .into_iter()
+        .partition(|(_, ir)| matches!(ir, IR::Type(_) | IR::Constant(_)));
+    pure.extend(rest);
+    pure
+}
+
+fn alloc_id(next_id: &mut u32) -> ValueId {
+    let id = ValueId(*next_id);
+    *next_id += 1;
+    id
+}
+
 #[derive(Clone, Copy)]
 struct ImageType {
     format: vk::Format,
     samples: vk::SampleCountFlags,
-    extent: vk::Extent3D,
+    extent: Option<vk::Extent3D>,
 }
 
 fn name_of(name: &str) -> ir::Name { (!name.is_empty()).then(|| Arc::from(name)) }
 
-/// `count` scaled and rounded up, since a fraction of an invocation still has to be dispatched.
-fn scaled(count: u64, scale: f32) -> u32 {
-    let scaled = (count as f64 * scale as f64).ceil();
-    if !scaled.is_finite() {
-        tracing::warn!(
-            count,
-            scale,
-            "invocation count does not scale to a number; it is taken to be none"
-        );
-        return 0;
-    }
-
-    scaled.clamp(0.0, u32::MAX as f64) as u32
+#[derive(Clone, Copy, Default)]
+enum Terminator {
+    /// What a block ends in until it is given a branch. Control does not leave the block,
+    /// so a block is never left without an end for the walk to stop at.
+    #[default]
+    Return,
+    Branch {
+        target: LabelId,
+    },
+    BranchConditional {
+        condition: ValueId,
+        merge: LabelId,
+        true_label: LabelId,
+        false_label: LabelId,
+    },
 }
 
-#[derive(Default)]
+struct Block {
+    label: LabelId,
+    terminator: Terminator,
+}
+
+/// Whether an instruction can be moved out of the block it was recorded in.
+///
+/// Constants and resources have no place in the control flow: hoisting them keeps a
+/// resource's identity the same on every path, which is what lets the barrier pass reason
+/// about one image rather than one per branch.
+fn is_hoistable(ir: &IR) -> bool {
+    matches!(
+        ir,
+        IR::Type(_)
+            | IR::Constant(_)
+            | IR::Variable { .. }
+            | IR::Array { .. }
+            | IR::ConstructBuffer { .. }
+            | IR::ConstructImage { .. }
+    )
+}
+
 pub struct Module {
     types: HashMap<ir::Type, ValueId>,
     constants: HashMap<ir::Constant, ValueId>,
     instructions: Vec<IR>,
+    variables: Vec<Variable>,
+    variable_ids: Vec<ValueId>,
+    blocks: Vec<Block>,
+    instruction_block: Vec<Option<LabelId>>,
+    label_count: u32,
+    current_block: Option<LabelId>,
+}
+
+impl Default for Module {
+    /// A module always has an entry block, so a program with no branches is one block
+    /// rather than a special case with none.
+    fn default() -> Self {
+        let entry = LabelId(0);
+        Self {
+            types: HashMap::default(),
+            constants: HashMap::default(),
+            instructions: Vec::new(),
+            variables: Vec::new(),
+            variable_ids: Vec::new(),
+            blocks: vec![Block {
+                label: entry,
+                terminator: Terminator::default(),
+            }],
+            instruction_block: Vec::new(),
+            label_count: 1,
+            current_block: Some(entry),
+        }
+    }
 }
 
 impl Module {
     fn get(&self, id: ValueId) -> &IR { &self.instructions[id.0 as usize] }
+
+    fn block_of(&self, id: ValueId) -> Option<LabelId> { self.instruction_block.get(id.0 as usize).copied().flatten() }
 
     fn resolve_access(&self, id: ValueId) -> Access {
         match self.get(id) {
@@ -78,7 +173,118 @@ impl Module {
     fn emit(&mut self, ir: IR) -> ValueId {
         let id = ValueId(self.instructions.len() as u32);
         self.instructions.push(ir);
+        self.instruction_block.push(self.current_block);
         id
+    }
+
+    pub fn declare_label(&mut self) -> LabelId {
+        let label = LabelId(self.label_count);
+        self.label_count += 1;
+        label
+    }
+
+    pub fn place_label(&mut self, label: LabelId) {
+        if self.blocks.iter().any(|block| block.label == label) {
+            tracing::error!(%label, "label is placed more than once");
+            return;
+        }
+
+        self.blocks.push(Block {
+            label,
+            terminator: Terminator::default(),
+        });
+        self.current_block = Some(label);
+    }
+
+    pub fn branch(&mut self, target: LabelId) { self.terminate(Terminator::Branch { target }) }
+
+    pub fn branch_conditional(
+        &mut self, condition: ValueId, merge: LabelId, true_label: LabelId, false_label: LabelId,
+    ) {
+        self.terminate(Terminator::BranchConditional {
+            condition,
+            merge,
+            true_label,
+            false_label,
+        })
+    }
+
+    fn terminate(&mut self, terminator: Terminator) {
+        match self.blocks.last_mut() {
+            Some(block) if matches!(block.terminator, Terminator::Return) => block.terminator = terminator,
+            Some(block) => tracing::error!(label = %block.label, "block is terminated twice"),
+            None => tracing::error!("a branch was recorded before any block was opened"),
+        }
+    }
+
+    pub fn phi(&mut self, incoming: &[(ValueId, LabelId)]) -> ValueId {
+        self.emit(IR::Phi {
+            incoming: incoming.to_vec(),
+        })
+    }
+
+    pub fn if_else(
+        &mut self, condition: ValueId, then: impl FnOnce(&mut Module) -> ValueId,
+        otherwise: impl FnOnce(&mut Module) -> ValueId,
+    ) -> ValueId {
+        let merge = self.declare_label();
+        let true_label = self.declare_label();
+        let false_label = self.declare_label();
+
+        self.branch_conditional(condition, merge, true_label, false_label);
+
+        self.place_label(true_label);
+        let taken = then(self);
+        self.branch(merge);
+
+        self.place_label(false_label);
+        let skipped = otherwise(self);
+        self.branch(merge);
+
+        self.place_label(merge);
+        self.phi(&[(taken, true_label), (skipped, false_label)])
+    }
+
+    fn declare_variable(&mut self, kind: ir::VariableKind, name: &str, value: Value) -> ValueId {
+        let slot = self.variables.len() as u32;
+        let name: ir::Name = Some(Arc::from(name));
+        let id = self.emit(IR::Variable {
+            slot,
+            kind,
+            name: name.clone(),
+        });
+        self.variables.push(Variable { kind, name, value });
+        self.variable_ids.push(id);
+        id
+    }
+
+    pub fn variable_bool(&mut self, name: &str, default: bool) -> ValueId {
+        self.declare_variable(ir::VariableKind::Bool, name, Value::Bool(default))
+    }
+
+    pub fn variable_i32(&mut self, name: &str, default: i32) -> ValueId {
+        self.declare_variable(ir::VariableKind::I32, name, Value::I32(default))
+    }
+
+    pub fn variable_u32(&mut self, name: &str, default: u32) -> ValueId {
+        self.declare_variable(ir::VariableKind::U32, name, Value::U32(default))
+    }
+
+    pub fn variable_extent_2d(&mut self, name: &str, default: vk::Extent2D) -> ValueId {
+        self.declare_variable(ir::VariableKind::Extent2D, name, Value::Extent2D(default))
+    }
+
+    pub fn variable_extent_3d(&mut self, name: &str, default: vk::Extent3D) -> ValueId {
+        self.declare_variable(ir::VariableKind::Extent3D, name, Value::Extent3D(default))
+    }
+
+    pub fn variable_clear(&mut self, name: &str, default: ClearValue) -> ValueId {
+        self.declare_variable(ir::VariableKind::ClearValue, name, Value::ClearValue(default))
+    }
+
+    pub fn variable_bytes(&mut self, name: &str, size: u32) -> ValueId {
+        let zeroed = Value::Bytes(vec![0u8; size as usize].into());
+        self.declare_variable(ir::VariableKind::Bytes(size), name, zeroed)
     }
 
     fn lower_type(&mut self, ty: ir::Type) -> ValueId {
@@ -104,8 +310,6 @@ impl Module {
     fn lower_u32(&mut self, v: u32) -> ValueId { self.lower_constant(ir::Constant::U32(v)) }
 
     fn lower_access(&mut self, access: Access) -> ValueId { self.lower_constant(ir::Constant::Access(access)) }
-
-    fn lower_array(&mut self, ty: ValueId, elements: Vec<ValueId>) -> ValueId { self.emit(IR::Array { ty, elements }) }
 
     fn lower_image_attachment(&mut self, attachment: &ImageAttachment, name: ir::Name) -> (ValueId, ValueId) {
         let extent = self.lower_constant(ir::Constant::Extent3D(attachment.extent()));
@@ -144,6 +348,10 @@ impl Module {
 
     pub fn transient_image(&mut self, info: &ImageInfo) -> ValueId {
         let extent = self.lower_constant(ir::Constant::Extent3D(info.extent));
+        self.transient_image_sized(info, extent)
+    }
+
+    pub fn transient_image_sized(&mut self, info: &ImageInfo, extent: ValueId) -> ValueId {
         let base_level = self.lower_u32(0);
         let level_count = self.lower_u32(info.mip_levels);
         let base_layer = self.lower_u32(0);
@@ -194,8 +402,6 @@ impl Module {
         })
     }
 
-    /// Attaches a debug name to a resource or a rendering region, which is what the dump
-    /// prints in place of the bare value id.
     pub fn set_name(&mut self, id: ValueId, name: impl Into<Arc<str>>) -> ValueId {
         match self.instructions.get_mut(id.0 as usize) {
             Some(
@@ -210,28 +416,34 @@ impl Module {
         id
     }
 
-    pub fn acquire_next_image(&mut self, swapchain: &SwapChain) -> ValueId {
-        let (ty_instr, attach_instr): (Vec<_>, Vec<_>) = swapchain
-            .attachments
-            .iter()
-            .enumerate()
-            .map(|(index, attach)| self.lower_image_attachment(attach, Some(format!("swapchain#{index}").into())))
-            .unzip();
+    pub fn variable_swapchain(&mut self, name: &str) -> ValueId {
+        self.declare_variable(
+            ir::VariableKind::Swapchain,
+            name,
+            Value::Swapchain(SwapchainBinding::default()),
+        )
+    }
 
-        let ty = ty_instr[0];
-        assert!(ty_instr.iter().all(|&i| i == ty));
-        let attachments = self.lower_array(ty, attach_instr);
-
-        let image_index = self.emit(IR::AcquireNextImage {
-            swapchain: swapchain.handle,
-            attachments,
-            present_semaphores: swapchain.semaphores.clone(),
-        });
-
-        self.emit(IR::Index {
-            array: attachments,
-            index: image_index,
+    pub fn acquire_next_image_from(
+        &mut self, swapchain: ValueId, format: vk::Format, samples: vk::SampleCountFlags,
+    ) -> ValueId {
+        self.lower_type(ir::Type::Image { format, samples });
+        let acquire = self.emit(IR::AcquireNextImage { swapchain });
+        self.emit(IR::SwapchainImage {
+            swapchain,
+            acquire,
+            format,
+            samples,
         })
+    }
+
+    pub fn acquire_next_image(&mut self, swapchain: &SwapChain) -> ValueId {
+        let variable = self.variable_swapchain("swapchain");
+        if let Some(declared) = self.variables.last_mut() {
+            declared.value = Value::Swapchain(SwapchainBinding::from(swapchain));
+        }
+
+        self.acquire_next_image_from(variable, swapchain.format(), swapchain.samples())
     }
 
     pub fn release(&mut self, resource: ValueId, access: Access, dst_domain: DomainFlag) -> ValueId {
@@ -253,9 +465,8 @@ impl Module {
         self.emit(IR::Blit { src, dst, filter })
     }
 
-    /// Fills the whole of `image` from `buffer`, which has to hold the image tightly packed.
     pub fn copy_buffer_to_image(&mut self, buffer: ValueId, image: ValueId) -> ValueId {
-        let Some(extent) = self.resolve_image(image).map(|image| image.extent) else {
+        let Some(extent) = self.resolve_image(image).and_then(|image| image.extent) else {
             tracing::warn!(%image, "cannot infer the extent to copy into; the copy is dropped");
             return image;
         };
@@ -274,6 +485,10 @@ impl Module {
 
     pub fn clear(&mut self, attachment: ValueId, color: ClearValue) -> ValueId {
         let color = self.lower_constant(ir::Constant::ClearValue(color));
+        self.clear_from(attachment, color)
+    }
+
+    pub fn clear_from(&mut self, attachment: ValueId, color: ValueId) -> ValueId {
         self.emit(IR::Clear { attachment, color })
     }
 
@@ -325,13 +540,25 @@ impl Module {
         }
     }
 
-    pub fn compile(&self, id: ValueId) -> Vec<ir::Instr> { self.compile_all(&[id]) }
+    pub fn compile(&self, id: ValueId) -> Program { self.compile_all(&[id]) }
 
-    pub fn compile_all(&self, ids: &[ValueId]) -> Vec<ir::Instr> {
-        let linearized = self.topo_sort(ids);
-        let mut synced = self.sync(linearized);
+    pub fn compile_all(&self, ids: &[ValueId]) -> Program {
+        let mut roots = ids.to_vec();
+        roots.extend(self.branch_conditions());
+
+        let mut next_id = self.instructions.len() as u32;
+        let linearized = self.layout_blocks(self.topo_sort(&roots), &mut next_id);
+        let mut synced = hoist_pure(self.sync(linearized, &mut next_id));
         self.infer_usage(&mut synced);
-        self.infer(synced)
+
+        let slots = self
+            .variable_ids
+            .iter()
+            .enumerate()
+            .map(|(slot, id)| (*id, slot as u32))
+            .collect();
+
+        Program::new(self.infer(synced), self.variables.clone(), slots)
     }
 
     fn topo_sort(&self, roots: &[ValueId]) -> Vec<ir::Instr> {
@@ -351,6 +578,7 @@ impl Module {
                 match ir {
                     IR::Constant(_) => {},
                     IR::Type(_) => {},
+                    IR::Variable { .. } => {},
                     IR::Array { ty, elements } => {
                         stack.push(*ty);
                         elements.iter().rev().for_each(|v| stack.push(*v));
@@ -372,8 +600,12 @@ impl Module {
                         stack.push(*base_level);
                         stack.push(*extent);
                     },
-                    IR::AcquireNextImage { attachments, .. } => {
-                        stack.push(*attachments);
+                    IR::AcquireNextImage { swapchain } => {
+                        stack.push(*swapchain);
+                    },
+                    IR::SwapchainImage { swapchain, acquire, .. } => {
+                        stack.push(*acquire);
+                        stack.push(*swapchain);
                     },
                     IR::Index { array, index } => {
                         stack.push(*index);
@@ -471,12 +703,21 @@ impl Module {
                                 stack.push(*y);
                                 stack.push(*x);
                             },
+                            ir::DispatchSize::InvocationsPerPixel { image, .. } => stack.push(*image),
                             ir::DispatchSize::Indirect { buffer, .. } => stack.push(*buffer),
                         }
                         stack.push(*pass);
                     },
                     IR::EndCompute { pass } => {
                         stack.push(*pass);
+                    },
+                    IR::Label { .. }
+                    | IR::SelectionMerge { .. }
+                    | IR::Branch { .. }
+                    | IR::BranchConditional { .. }
+                    | IR::Return => {},
+                    IR::Phi { incoming } => {
+                        incoming.iter().rev().for_each(|(value, _)| stack.push(*value));
                     },
                     IR::MemoryBarrier { src_access, dst_access } => {
                         stack.push(*dst_access);
@@ -502,11 +743,161 @@ impl Module {
         nodes
     }
 
-    fn sync(&self, nodes: Vec<ir::Instr>) -> Vec<ir::Instr> {
+    fn layout_blocks(&self, nodes: Vec<ir::Instr>, next_id: &mut u32) -> Vec<ir::Instr> {
+        // hoisted instructions go ahead of every block: a block ends in a branch, and nothing
+        // past that terminator runs. They only depend on each other, so dependency order is
+        // enough to keep them consistent.
+        let mut hoisted = Vec::with_capacity(nodes.len());
+        let mut recorded: HashMap<LabelId, Vec<ir::Instr>> = HashMap::new();
+
+        for (id, ir) in nodes {
+            match self.block_of(id) {
+                _ if is_hoistable(&ir) => hoisted.push((id, ir)),
+                Some(label) => recorded.entry(label).or_default().push((id, ir)),
+                None => hoisted.push((id, ir)),
+            }
+        }
+
+        let mut result = hoisted;
+        for block in &self.blocks {
+            result.push((alloc_id(next_id), IR::Label { label: block.label }));
+            result.extend(recorded.remove(&block.label).unwrap_or_default());
+
+            match block.terminator {
+                Terminator::Return => {
+                    result.push((alloc_id(next_id), IR::Return));
+                },
+                Terminator::Branch { target } => {
+                    result.push((alloc_id(next_id), IR::Branch { target }));
+                },
+                Terminator::BranchConditional {
+                    condition,
+                    merge,
+                    true_label,
+                    false_label,
+                } => {
+                    result.push((alloc_id(next_id), IR::SelectionMerge { merge }));
+                    result.push((
+                        alloc_id(next_id),
+                        IR::BranchConditional {
+                            condition,
+                            true_label,
+                            false_label,
+                        },
+                    ));
+                },
+            }
+        }
+
+        result
+    }
+
+    fn branch_conditions(&self) -> Vec<ValueId> {
+        self.blocks
+            .iter()
+            .filter_map(|block| match block.terminator {
+                Terminator::BranchConditional { condition, .. } => Some(condition),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn reconcile(
+        &self, construct: Construct, predecessors: usize, result: &mut Vec<ir::Instr>, next_id: &mut u32,
+        undefined: ResourceState,
+    ) -> (HashMap<ValueId, ResourceState>, HashMap<ValueId, ValueId>) {
+        let Construct {
+            entry_states,
+            entry_buffers,
+            mut arms,
+            ..
+        } = construct;
+
+        let join_from_arm = !arms.is_empty() && arms.len() == predecessors;
+        let (join_states, join_buffers) = match join_from_arm {
+            true => (arms[0].states.clone(), arms[0].buffers.clone()),
+            false => (entry_states.clone(), entry_buffers.clone()),
+        };
+
+        // sorted so the barriers a graph compiles to do not depend on hash order
+        let mut images = join_states.iter().collect::<Vec<_>>();
+        images.sort_by_key(|(resource, _)| resource.0);
+        let mut buffers = join_buffers.iter().collect::<Vec<_>>();
+        buffers.sort_by_key(|(buffer, _)| buffer.0);
+
+        // an insertion shifts everything after it, so the arms are patched back to front
+        let first_to_patch = usize::from(join_from_arm);
+        for arm in arms.drain(first_to_patch..).rev() {
+            let mut barriers = Vec::new();
+
+            for (resource, target) in &images {
+                let current = arm
+                    .states
+                    .get(*resource)
+                    .or_else(|| entry_states.get(*resource))
+                    .copied()
+                    .unwrap_or(undefined);
+                if current.layout == target.layout && current.last_access == target.last_access {
+                    continue;
+                }
+
+                let id = alloc_id(next_id);
+                barriers.push((
+                    id,
+                    IR::ImageBarrier {
+                        src_access: current.last_access,
+                        dst_access: target.last_access,
+                        old_layout: current.layout,
+                        new_layout: target.layout,
+                        value: **resource,
+                    },
+                ));
+            }
+
+            for (buffer, target) in &buffers {
+                let current = arm.buffers.get(*buffer).copied();
+                if current == Some(**target) {
+                    continue;
+                }
+
+                let id = alloc_id(next_id);
+                barriers.push((
+                    id,
+                    IR::MemoryBarrier {
+                        src_access: current.unwrap_or(undefined.last_access),
+                        dst_access: **target,
+                    },
+                ));
+            }
+
+            result.splice(arm.at..arm.at, barriers);
+        }
+
+        (join_states, join_buffers)
+    }
+
+    fn sync(&self, nodes: Vec<ir::Instr>, next_id: &mut u32) -> Vec<ir::Instr> {
         let mut result = Vec::with_capacity(nodes.len() * 2);
         let mut states: HashMap<ValueId, ResourceState> = HashMap::new();
         let mut buffer_states: HashMap<ValueId, ValueId> = HashMap::new();
-        let mut next_id = self.instructions.len() as u32;
+
+        // how many ways there are into each block, which decides whether the state one arm
+        // ends in can stand as the join or whether control can also fall straight through
+        let mut predecessors: HashMap<LabelId, usize> = HashMap::new();
+        for (_, ir) in &nodes {
+            let targets = match ir {
+                IR::Branch { target } => vec![*target],
+                IR::BranchConditional {
+                    true_label,
+                    false_label,
+                    ..
+                } => vec![*true_label, *false_label],
+                _ => continue,
+            };
+            for target in targets {
+                *predecessors.entry(target).or_default() += 1;
+            }
+        }
 
         // what a rendering region reads, gathered up front: a layout transition cannot be
         // recorded inside a region, and a host write only has to be made visible once, so both
@@ -552,11 +943,7 @@ impl Module {
         }
 
         macro_rules! alloc {
-            () => {{
-                let id = ValueId(next_id);
-                next_id += 1;
-                id
-            }};
+            () => {{ alloc_id(next_id) }};
         }
         macro_rules! emit_access {
             ($access:expr) => {{
@@ -682,8 +1069,39 @@ impl Module {
             }};
         }
 
+        // a selection leaves a resource in one of two states, and what follows the merge
+        // cannot know which; each construct is walked from the state it was entered with
+        // and the arms are brought back into agreement before control joins
+        let mut constructs: Vec<Construct> = Vec::new();
+
         for (value_id, ir) in nodes {
             match &ir {
+                IR::SelectionMerge { merge, .. } => {
+                    constructs.push(Construct {
+                        merge: *merge,
+                        entry_states: states.clone(),
+                        entry_buffers: buffer_states.clone(),
+                        arms: Vec::new(),
+                    });
+                },
+
+                IR::Branch { target, .. } if constructs.last().is_some_and(|c| c.merge == *target) => {
+                    let construct = constructs.last_mut().expect("just matched on the top construct");
+                    construct.arms.push(Arm {
+                        at: result.len(),
+                        states: std::mem::replace(&mut states, construct.entry_states.clone()),
+                        buffers: std::mem::replace(&mut buffer_states, construct.entry_buffers.clone()),
+                    });
+                },
+
+                IR::Label { label } if constructs.last().is_some_and(|c| c.merge == *label) => {
+                    let construct = constructs.pop().expect("just matched on the top construct");
+                    let ways_in = predecessors.get(label).copied().unwrap_or_default();
+                    let joined = self.reconcile(construct, ways_in, &mut result, next_id, undefined);
+                    states = joined.0;
+                    buffer_states = joined.1;
+                },
+
                 IR::ConstructImage { initial_layout, .. } => {
                     states.insert(
                         value_id,
@@ -787,40 +1205,15 @@ impl Module {
     fn resource_root(&self, id: ValueId) -> ValueId {
         let mut id = id;
 
-        for _ in 0..256 {
+        for _ in 0..ir::MAX_RESOLVE_DEPTH {
             let Some(ir) = self.instructions.get(id.0 as usize) else {
                 return id;
             };
 
-            id = match ir {
-                IR::Clear { attachment, .. } => *attachment,
-                IR::Blit { dst, .. } => *dst,
-                IR::CopyBufferToImage { image, .. } => *image,
-                IR::BeginRendering {
-                    color_attachments,
-                    depth_attachment,
-                    ..
-                } => match color_attachments.first().or(depth_attachment.as_ref()) {
-                    Some(first) => *first,
-                    None => return id,
-                },
-                IR::BeginCompute { resources, .. } => match resources.first() {
-                    Some((first, _)) => *first,
-                    None => return id,
-                },
-                IR::BindPipeline { pass, .. }
-                | IR::SetState { pass, .. }
-                | IR::BindVertexBuffers { pass, .. }
-                | IR::BindIndexBuffer { pass, .. }
-                | IR::SampleImage { pass, .. }
-                | IR::Draw { pass, .. }
-                | IR::DrawIndexed { pass, .. }
-                | IR::EndRendering { pass }
-                | IR::Dispatch { pass, .. }
-                | IR::EndCompute { pass } => *pass,
-                IR::Acquire { resource, .. } | IR::Release { resource, .. } => *resource,
+            match ir::underlying_object(ir) {
+                ir::UnderlyingObject::Forwards(next) => id = next,
                 _ => return id,
-            };
+            }
         }
 
         id
@@ -869,59 +1262,54 @@ impl Module {
     fn resolve_resource(&self, id: ValueId) -> Option<&IR> {
         let mut id = id;
 
-        for _ in 0..256 {
+        for _ in 0..ir::MAX_RESOLVE_DEPTH {
             let ir = self.instructions.get(id.0 as usize)?;
-            id = match ir {
-                IR::ConstructImage { .. } | IR::ConstructBuffer { .. } => return Some(ir),
-                // every element of an attachment array describes the same image
-                IR::Array { elements, .. } => *elements.first()?,
-                IR::Index { array, .. } => *array,
-                IR::Clear { attachment, .. } => *attachment,
-                IR::Blit { dst, .. } => *dst,
-                IR::CopyBufferToImage { image, .. } => *image,
-                IR::BeginRendering {
-                    color_attachments,
-                    depth_attachment,
-                    ..
-                } => match color_attachments.first() {
-                    Some(first) => *first,
-                    None => (*depth_attachment)?,
-                },
-                IR::BeginCompute { resources, .. } => resources.first()?.0,
-                IR::BindPipeline { pass, .. }
-                | IR::SetState { pass, .. }
-                | IR::BindVertexBuffers { pass, .. }
-                | IR::BindIndexBuffer { pass, .. }
-                | IR::SampleImage { pass, .. }
-                | IR::Draw { pass, .. }
-                | IR::DrawIndexed { pass, .. }
-                | IR::EndRendering { pass }
-                | IR::Dispatch { pass, .. }
-                | IR::EndCompute { pass } => *pass,
-                IR::Acquire { resource, .. } | IR::Release { resource, .. } => *resource,
-                _ => return None,
+            id = match ir::underlying_object(ir) {
+                ir::UnderlyingObject::Base => return Some(ir),
+                ir::UnderlyingObject::Forwards(next) | ir::UnderlyingObject::Element(next) => next,
+                ir::UnderlyingObject::None => return None,
             };
         }
 
         None
     }
 
-    fn resolve_image(&self, id: ValueId) -> Option<ImageType> {
-        let IR::ConstructImage {
-            format,
-            samples,
-            extent,
-            ..
-        } = self.resolve_resource(id)?
-        else {
-            return None;
-        };
+    fn variable_bytes_size(&self, id: ValueId) -> Option<u32> {
+        match self.instructions.get(id.0 as usize) {
+            Some(IR::Variable {
+                kind: ir::VariableKind::Bytes(size),
+                ..
+            }) => Some(*size),
+            _ => None,
+        }
+    }
 
-        match self.instructions.get(extent.0 as usize)? {
-            IR::Constant(ir::Constant::Extent3D(extent)) => Some(ImageType {
+    fn is_image(&self, id: ValueId) -> bool {
+        matches!(
+            self.resolve_resource(id),
+            Some(IR::ConstructImage { .. } | IR::SwapchainImage { .. })
+        )
+    }
+
+    fn resolve_image(&self, id: ValueId) -> Option<ImageType> {
+        match self.resolve_resource(id)? {
+            IR::ConstructImage {
+                format,
+                samples,
+                extent,
+                ..
+            } => Some(ImageType {
                 format: *format,
                 samples: *samples,
-                extent: *extent,
+                extent: match self.instructions.get(extent.0 as usize) {
+                    Some(IR::Constant(ir::Constant::Extent3D(extent))) => Some(*extent),
+                    _ => None,
+                },
+            }),
+            IR::SwapchainImage { format, samples, .. } => Some(ImageType {
+                format: *format,
+                samples: *samples,
+                extent: None,
             }),
             _ => None,
         }
@@ -947,6 +1335,7 @@ impl Module {
             state: PassState,
             area: vk::Rect2D,
             pipeline: Option<PipelineId>,
+            late_area: bool,
         }
 
         let mut regions: HashMap<ValueId, InForce> = HashMap::new();
@@ -972,9 +1361,9 @@ impl Module {
                         if index == 0 {
                             rendering.samples = image.samples;
                             samples_from_color = true;
-                            attachment_extent = Some(vk::Extent2D {
-                                width: image.extent.width,
-                                height: image.extent.height,
+                            attachment_extent = image.extent.map(|extent| vk::Extent2D {
+                                width: extent.width,
+                                height: extent.height,
                             });
                         } else if image.samples != rendering.samples {
                             tracing::warn!(
@@ -994,9 +1383,9 @@ impl Module {
                                 // a depth-only region has nothing else to take these from
                                 if !samples_from_color {
                                     rendering.samples = image.samples;
-                                    attachment_extent = Some(vk::Extent2D {
-                                        width: image.extent.width,
-                                        height: image.extent.height,
+                                    attachment_extent = image.extent.map(|extent| vk::Extent2D {
+                                        width: extent.width,
+                                        height: extent.height,
                                     });
                                 } else if image.samples != rendering.samples {
                                     tracing::warn!(
@@ -1017,16 +1406,13 @@ impl Module {
                         Some(id) => self.resolve_extent_2d(*id),
                         None => attachment_extent,
                     };
-                    if extent.is_none() {
-                        tracing::warn!(%value_id, "cannot infer the render area; static viewports may be wrong");
-                    }
-
                     regions.insert(
                         *value_id,
                         InForce {
                             state: PassState::for_rendering(rendering),
                             area: vk::Rect2D::default().extent(extent.unwrap_or_default()),
                             pipeline: None,
+                            late_area: extent.is_none(),
                         },
                     );
                 },
@@ -1038,6 +1424,7 @@ impl Module {
                             state: PassState::default(),
                             area: vk::Rect2D::default(),
                             pipeline: None,
+                            late_area: false,
                         },
                     );
                 },
@@ -1075,7 +1462,14 @@ impl Module {
                             tracing::warn!(%value_id, "draw with no pipeline bound");
                         }
                         *pipeline = in_force.pipeline;
-                        (*state, *dynamic) = in_force.state.resolve(in_force.area);
+
+                        // an area that is only known at execute time cannot be baked into a
+                        // pipeline, so anything framebuffer-relative has to be recorded instead
+                        let mut resolved = in_force.state.clone();
+                        if in_force.late_area {
+                            resolved.dynamic |= DynamicStateFlags::Viewport | DynamicStateFlags::Scissor;
+                        }
+                        (*state, *dynamic) = resolved.resolve(in_force.area);
                         regions.insert(*value_id, in_force);
                     }
                 },
@@ -1192,6 +1586,21 @@ impl RenderPass<'_> {
         self.set_state(StateChange::PushConstants {
             offset,
             data: data.to_vec(),
+        })
+    }
+
+    pub fn push_constants_from(self, variable: ValueId) -> Self { self.push_constants_from_at(0, variable) }
+
+    pub fn push_constants_from_at(self, offset: u32, variable: ValueId) -> Self {
+        let Some(size) = self.module.variable_bytes_size(variable) else {
+            tracing::error!(%variable, "push constants can only come from a bytes variable");
+            return self;
+        };
+
+        self.set_state(StateChange::PushConstantsFrom {
+            offset,
+            size,
+            source: variable,
         })
     }
 
@@ -1338,6 +1747,27 @@ impl ComputePass<'_> {
         self.push_constant_bytes(offset, bytes)
     }
 
+    /// Pushes whatever `variable` holds when the program runs, which is how a block that
+    /// changes every frame survives being compiled once.
+    pub fn push_constants_from(self, variable: ValueId) -> Self { self.push_constants_from_at(0, variable) }
+
+    pub fn push_constants_from_at(mut self, offset: u32, variable: ValueId) -> Self {
+        let Some(size) = self.module.variable_bytes_size(variable) else {
+            tracing::error!(%variable, "push constants can only come from a bytes variable");
+            return self;
+        };
+
+        self.id = self.module.emit(IR::SetState {
+            pass: self.id,
+            change: StateChange::PushConstantsFrom {
+                offset,
+                size,
+                source: variable,
+            },
+        });
+        self
+    }
+
     pub fn push_constant_bytes(mut self, offset: u32, data: &[u8]) -> Self {
         self.id = self.module.emit(IR::SetState {
             pass: self.id,
@@ -1384,9 +1814,22 @@ impl ComputePass<'_> {
     /// Dispatches [`Self::dispatch_invocations_per_pixel`] scaled per axis: above one is more
     /// invocations than pixels, below one is fewer. Rounding up to whole workgroups happens after
     /// the scaling.
-    pub fn dispatch_invocations_per_pixel_scaled(self, image: ValueId, scale: [f32; 3]) -> Self {
-        let Some(extent) = self.module.resolve_image(image).map(|image| image.extent) else {
-            tracing::warn!(%image, "cannot infer the extent to dispatch over; the dispatch is dropped");
+    pub fn dispatch_invocations_per_pixel_scaled(mut self, image: ValueId, scale: [f32; 3]) -> Self {
+        // an image sized by a variable has no extent to read here, so the count is left for
+        // the interpreter to work out from whatever the image was allocated at
+        let Some(extent) = self.module.resolve_image(image).and_then(|image| image.extent) else {
+            if !self.module.is_image(image) {
+                tracing::warn!(%image, "cannot infer the extent to dispatch over; the dispatch is dropped");
+                return self;
+            }
+
+            let size = ir::DispatchSize::per_pixel(image, scale);
+            self.id = self.module.emit(IR::Dispatch {
+                pass: self.id,
+                size,
+                pipeline: None,
+                push_constants: PushConstants::default(),
+            });
             return self;
         };
 
@@ -1431,7 +1874,7 @@ impl ComputePass<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BlendPreset, Image, PipelineState, ResolvedViewport};
+    use crate::{BlendPreset, Image, PipelineState, ResolvedViewport, clear};
 
     const FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
     const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
@@ -1458,8 +1901,9 @@ mod tests {
 
     fn depth_info() -> ImageInfo { ImageInfo::depth_target(extent_2d(), DEPTH_FORMAT) }
 
-    fn access_constant(module: &Module, instructions: &[ir::Instr], id: &ValueId) -> Access {
-        instructions
+    fn access_constant(module: &Module, program: &Program, id: &ValueId) -> Access {
+        program
+            .instructions()
             .iter()
             .find(|(instr_id, _)| instr_id == id)
             .map(|(_, ir)| ir)
@@ -1471,13 +1915,14 @@ mod tests {
             .expect("barrier operand should be an access constant")
     }
 
-    fn memory_barriers(module: &Module, instructions: &[ir::Instr]) -> Vec<(Access, Access)> {
-        instructions
+    fn memory_barriers(module: &Module, program: &Program) -> Vec<(Access, Access)> {
+        program
+            .instructions()
             .iter()
             .filter_map(|(_, ir)| match ir {
                 IR::MemoryBarrier { src_access, dst_access } => Some((
-                    access_constant(module, instructions, src_access),
-                    access_constant(module, instructions, dst_access),
+                    access_constant(module, program, src_access),
+                    access_constant(module, program, dst_access),
                 )),
                 _ => None,
             })
@@ -1492,8 +1937,9 @@ mod tests {
         resource: ValueId,
     }
 
-    fn image_barriers(module: &Module, instructions: &[ir::Instr]) -> Vec<ImageBarrier> {
-        instructions
+    fn image_barriers(module: &Module, program: &Program) -> Vec<ImageBarrier> {
+        program
+            .instructions()
             .iter()
             .filter_map(|(_, ir)| match ir {
                 IR::ImageBarrier {
@@ -1503,8 +1949,8 @@ mod tests {
                     new_layout,
                     value,
                 } => Some(ImageBarrier {
-                    src: access_constant(module, instructions, src_access),
-                    dst: access_constant(module, instructions, dst_access),
+                    src: access_constant(module, program, src_access),
+                    dst: access_constant(module, program, dst_access),
                     old_layout: *old_layout,
                     new_layout: *new_layout,
                     resource: module.resource_root(*value),
@@ -1533,8 +1979,9 @@ mod tests {
         }
     }
 
-    fn image_usage(instructions: &[ir::Instr], id: ValueId) -> vk::ImageUsageFlags {
-        instructions
+    fn image_usage(program: &Program, id: ValueId) -> vk::ImageUsageFlags {
+        program
+            .instructions()
             .iter()
             .find_map(|(instr_id, ir)| match ir {
                 IR::ConstructImage { usage, .. } if *instr_id == id => Some(*usage),
@@ -1543,8 +1990,9 @@ mod tests {
             .expect("the image should still be declared after compiling")
     }
 
-    fn draws(instructions: &[ir::Instr]) -> Vec<(Option<PipelineId>, PipelineState)> {
-        instructions
+    fn draws(program: &Program) -> Vec<(Option<PipelineId>, PipelineState)> {
+        program
+            .instructions()
             .iter()
             .filter_map(|(_, ir)| match ir {
                 IR::Draw { pipeline, state, .. } | IR::DrawIndexed { pipeline, state, .. } => {
@@ -1659,9 +2107,15 @@ mod tests {
         let compiled = module.compile_all(&[present, resting]);
 
         // nothing consumes the release, so only naming it as a root keeps it
-        let position = |id: ValueId| compiled.iter().position(|(instr_id, _)| *instr_id == id);
+        let position = |id: ValueId| compiled.instructions().iter().position(|(instr_id, _)| *instr_id == id);
         assert!(position(resting) > position(blit));
-        assert!(module.compile(present).iter().all(|(id, _)| *id != resting));
+        assert!(
+            module
+                .compile(present)
+                .instructions()
+                .iter()
+                .all(|(id, _)| *id != resting)
+        );
 
         // and it asks for the layout the blit already left it in, so it emits no barrier
         let barriers = image_barriers(&module, &compiled);
@@ -1699,9 +2153,10 @@ mod tests {
             .draw(3, 1)
             .end_rendering();
 
-        let instructions = module.compile(end);
+        let compiled = module.compile(end);
+        let instructions = compiled.instructions();
         assert_eq!(
-            memory_barriers(&module, &instructions),
+            memory_barriers(&module, &compiled),
             vec![(Access::HostWrite, Access::AttributeRead)]
         );
 
@@ -1722,7 +2177,7 @@ mod tests {
                 < position(|ir| matches!(ir, IR::BeginRendering { .. }))
         );
 
-        let draws = draws(&instructions);
+        let draws = draws(&compiled);
         assert_eq!(draws.len(), 1);
         assert_eq!(draws[0].0, Some(PipelineId(0)));
         assert_eq!(draws[0].1.rendering.color_formats, vec![FORMAT]);
@@ -1741,9 +2196,9 @@ mod tests {
             .set_depth(DepthState::less())
             .draw(3, 1)
             .end_rendering();
-        let instructions = module.compile(end);
+        let compiled = module.compile(end);
 
-        let draws = draws(&instructions);
+        let draws = draws(&compiled);
         assert_eq!(draws.len(), 1);
         assert_eq!(draws[0].1.rendering.color_formats, vec![FORMAT]);
         assert_eq!(draws[0].1.rendering.depth_format, Some(DEPTH_FORMAT));
@@ -1762,9 +2217,9 @@ mod tests {
             .set_depth(DepthState::less())
             .draw(3, 1)
             .end_rendering();
-        let instructions = module.compile(end);
+        let compiled = module.compile(end);
 
-        let draws = draws(&instructions);
+        let draws = draws(&compiled);
         assert_eq!(draws.len(), 1);
         assert_eq!(draws[0].1.rendering.depth_format, None);
         assert_eq!(draws[0].1.depth, DepthState::default());
@@ -1783,9 +2238,9 @@ mod tests {
             .set_depth(DepthState::less())
             .draw(3, 1)
             .end_rendering();
-        let instructions = module.compile(end);
+        let compiled = module.compile(end);
 
-        let barrier = image_barriers(&module, &instructions)
+        let barrier = image_barriers(&module, &compiled)
             .into_iter()
             .find(|barrier| barrier.resource == module.resource_root(depth))
             .expect("the depth attachment should be transitioned");
@@ -1811,10 +2266,10 @@ mod tests {
             .bind_graphics_pipeline(PipelineId(0))
             .draw(3, 1)
             .end_rendering();
-        let instructions = module.compile(end);
+        let compiled = module.compile(end);
 
         assert!(
-            image_usage(&instructions, depth).contains(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT),
+            image_usage(&compiled, depth).contains(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT),
             "the depth attachment should be created as one"
         );
     }
@@ -1833,8 +2288,8 @@ mod tests {
             .draw(3, 1)
             .end_rendering();
 
-        let instructions = module.compile(end);
-        assert_eq!(memory_barriers(&module, &instructions).len(), 1);
+        let compiled = module.compile(end);
+        assert_eq!(memory_barriers(&module, &compiled).len(), 1);
     }
 
     #[test]
@@ -1849,9 +2304,10 @@ mod tests {
             .draw_indexed(3, 1)
             .end_rendering();
 
-        let instructions = module.compile(end);
+        let compiled = module.compile(end);
+        let instructions = compiled.instructions();
         assert_eq!(
-            memory_barriers(&module, &instructions),
+            memory_barriers(&module, &compiled),
             vec![(Access::HostWrite, Access::IndexRead)]
         );
 
@@ -1939,7 +2395,8 @@ mod tests {
             .draw_indexed_range(9, 2, 3, -4, 5)
             .end_rendering();
 
-        let instructions = module.compile(end);
+        let compiled = module.compile(end);
+        let instructions = compiled.instructions();
         let (_, ir) = instructions
             .iter()
             .find(|(_, ir)| matches!(ir, IR::DrawIndexed { .. }))
@@ -2117,6 +2574,7 @@ mod tests {
 
         let compiled = module.compile(end);
         let dynamic = compiled
+            .instructions()
             .iter()
             .filter_map(|(_, ir)| match ir {
                 IR::Draw { dynamic, .. } => Some(dynamic.clone()),
@@ -2203,6 +2661,7 @@ mod tests {
 
         let compiled = module.compile(end);
         let pushed = compiled
+            .instructions()
             .iter()
             .filter_map(|(_, ir)| match ir {
                 IR::Draw { dynamic, .. } => Some(dynamic.push_constants.clone()),
@@ -2234,6 +2693,7 @@ mod tests {
 
         let pushed = module
             .compile(end)
+            .instructions()
             .iter()
             .filter_map(|(_, ir)| match ir {
                 IR::Draw { dynamic, .. } => Some(dynamic.push_constants.clone()),
@@ -2258,6 +2718,7 @@ mod tests {
 
         let compiled = module.compile(end);
         let (_, IR::Draw { dynamic, .. }) = compiled
+            .instructions()
             .iter()
             .find(|(_, ir)| matches!(ir, IR::Draw { .. }))
             .expect("draw should be present")
@@ -2291,6 +2752,7 @@ mod tests {
                 ..
             },
         ) = compiled
+            .instructions()
             .iter()
             .find(|(_, ir)| matches!(ir, IR::Dispatch { .. }))
             .expect("dispatch should be present")
@@ -2310,8 +2772,9 @@ mod tests {
         );
     }
 
-    fn dispatch_sizes(instructions: &[ir::Instr]) -> Vec<ir::DispatchSize> {
-        instructions
+    fn dispatch_sizes(program: &Program) -> Vec<ir::DispatchSize> {
+        program
+            .instructions()
             .iter()
             .filter_map(|(_, ir)| match ir {
                 IR::Dispatch { size, .. } => Some(*size),
@@ -2320,8 +2783,8 @@ mod tests {
             .collect()
     }
 
-    fn invocations(module: &Module, instructions: &[ir::Instr]) -> [u32; 3] {
-        match dispatch_sizes(instructions).as_slice() {
+    fn invocations(module: &Module, program: &Program) -> [u32; 3] {
+        match dispatch_sizes(program).as_slice() {
             [ir::DispatchSize::Invocations { x, y, z }] => [
                 u32_constant(module, x),
                 u32_constant(module, y),
@@ -2602,6 +3065,7 @@ mod tests {
         let compiled = module.compile(rendered);
         let position = |predicate: fn(&IR) -> bool| {
             compiled
+                .instructions()
                 .iter()
                 .position(|(_, ir)| predicate(ir))
                 .expect("instruction should be present")
@@ -2668,10 +3132,12 @@ mod tests {
         assert_eq!(sampled.new_layout, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
         let last_barrier = compiled
+            .instructions()
             .iter()
             .rposition(|(_, ir)| matches!(ir, IR::ImageBarrier { .. }))
             .expect("barriers should be present");
         let begin = compiled
+            .instructions()
             .iter()
             .position(|(_, ir)| matches!(ir, IR::BeginRendering { .. }))
             .expect("the region should be present");
@@ -2766,6 +3232,7 @@ mod tests {
 
         let regions = module
             .compile(patch)
+            .instructions()
             .iter()
             .filter_map(|(_, ir)| match ir {
                 IR::CopyBufferToImage { region, .. } => Some((region.image_offset, region.image_extent)),
@@ -2804,5 +3271,428 @@ mod tests {
         assert_eq!(draws[0].1.blend, vec![ColorBlendAttachmentState::default()]);
         assert_eq!(draws[1].1.blend, vec![BlendPreset::AlphaBlend.into()]);
         assert_ne!(draws[0].1, draws[1].1);
+    }
+
+    /// Constants are interned so the same number is one value, but two variables are two
+    /// things the caller sets independently, however alike they start out.
+    #[test]
+    fn variables_that_start_the_same_are_still_two_separate_slots() {
+        let mut module = Module::default();
+        assert_eq!(module.lower_u32(7), module.lower_u32(7));
+
+        let first = module.variable_u32("first", 7);
+        let second = module.variable_u32("second", 7);
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn setting_a_variable_leaves_the_compiled_instructions_alone() {
+        let (mut module, target) = module_with_attachment();
+        let color = module.variable_clear("clear color", clear::f32::BLACK);
+        let cleared = module.clear_from(target, color);
+        let end = module.present(cleared);
+
+        let before = module.compile(end);
+        let mut after = module.compile(end);
+        after.set(color, clear::f32::WHITE);
+
+        assert_eq!(before.instructions().len(), after.instructions().len());
+        assert!(
+            before
+                .instructions()
+                .iter()
+                .zip(after.instructions())
+                .all(|((a, _), (b, _))| a == b)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "was given")]
+    fn setting_a_variable_to_the_wrong_kind_is_rejected() {
+        let mut module = Module::default();
+        let color = module.variable_clear("clear color", clear::f32::BLACK);
+        let target = module.transient_image(&transient_info());
+        let end = module.clear_from(target, color);
+
+        module.compile(end).set(color, 3u32);
+    }
+
+    /// A pipeline outlives the frame it was compiled in, so an extent that is only known at
+    /// execute time cannot be folded into one.
+    #[test]
+    fn an_image_sized_by_a_variable_leaves_the_viewport_to_be_recorded() {
+        let mut module = Module::default();
+        let extent = module.variable_extent_3d("size", vk::Extent3D::default().width(8).height(8).depth(1));
+        let target = module.transient_image_sized(&transient_info(), extent);
+
+        let end = module
+            .begin_rendering(&[target])
+            .bind_graphics_pipeline(PipelineId(0))
+            .set_viewport(0, Rect2D::framebuffer())
+            .set_dynamic_state(DynamicStateFlags::None)
+            .draw(3, 1)
+            .end_rendering();
+
+        let draws = draws(&module.compile(end));
+        assert_eq!(draws.len(), 1);
+        assert!(draws[0].1.viewports.is_empty(), "{:?}", draws[0].1.viewports);
+        assert!(draws[0].1.scissors.is_empty(), "{:?}", draws[0].1.scissors);
+        assert!(draws[0].1.dynamic.contains(DynamicStateFlags::Viewport));
+        assert!(draws[0].1.dynamic.contains(DynamicStateFlags::Scissor));
+    }
+
+    /// An extent that is not known until the program runs cannot be turned into a count
+    /// here, so the dispatch keeps the image and is sized when it executes.
+    #[test]
+    fn a_dispatch_per_pixel_of_a_variable_sized_image_is_sized_when_it_runs() {
+        let mut module = Module::default();
+        let extent = module.variable_extent_3d("size", vk::Extent3D::default().width(8).height(8).depth(1));
+        let target = module.transient_image_sized(&transient_info(), extent);
+
+        let end = module
+            .begin_compute()
+            .bind_pipeline(PipelineId(0))
+            .write(target)
+            .dispatch_invocations_per_pixel(target)
+            .end_compute();
+
+        let compiled = module.compile(end);
+        match dispatch_sizes(&compiled).as_slice() {
+            [ir::DispatchSize::InvocationsPerPixel { image, scale }] => {
+                assert_eq!(module.resource_root(*image), target);
+                assert_eq!(ir::DispatchSize::scale(*scale), [1.0; 3]);
+            },
+            sizes => panic!("expected one dispatch sized per pixel, got {sizes:?}"),
+        }
+    }
+
+    /// A conditional clear followed by a blit: the arm that clears leaves the image in the
+    /// transfer-destination layout, the arm that does not leaves it untouched, and the two
+    /// have to agree before the blit that follows the merge can name one layout.
+    fn module_with_a_conditional_clear() -> (Module, ValueId, ValueId) {
+        let (mut module, destination) = module_with_attachment();
+        let source = module.transient_image(&transient_info());
+        let animate = module.variable_bool("animate", true);
+
+        let cleared = module.if_else(animate, |m| m.clear(source, clear::f32::WHITE), |_| source);
+        let end = module.blit(cleared, destination);
+
+        (module, source, end)
+    }
+
+    fn block_at(compiled: &Program, label: LabelId) -> usize {
+        compiled
+            .instructions()
+            .iter()
+            .position(|(_, ir)| matches!(ir, IR::Label { label: l, .. } if *l == label))
+            .expect("every declared label is placed")
+    }
+
+    /// The labels of the one selection the module records, read back off the branch rather
+    /// than assumed, since which number a label gets is not part of the contract.
+    fn selection_labels(compiled: &Program) -> (LabelId, LabelId, LabelId) {
+        let merge = compiled
+            .instructions()
+            .iter()
+            .find_map(|(_, ir)| match ir {
+                IR::SelectionMerge { merge } => Some(*merge),
+                _ => None,
+            })
+            .expect("the module records one selection");
+
+        let (taken, skipped) = compiled
+            .instructions()
+            .iter()
+            .find_map(|(_, ir)| match ir {
+                IR::BranchConditional {
+                    true_label,
+                    false_label,
+                    ..
+                } => Some((*true_label, *false_label)),
+                _ => None,
+            })
+            .expect("the selection branches");
+
+        (merge, taken, skipped)
+    }
+
+    /// Every block ends in a terminator, whether or not it was given one: a block the builder
+    /// never branched out of falls back to a return rather than running into the next label.
+    #[test]
+    fn every_block_ends_in_a_terminator() {
+        let (module, _, end) = module_with_a_conditional_clear();
+        let compiled = module.compile(end);
+        let instructions = compiled.instructions();
+
+        let terminated = |index: usize| {
+            matches!(
+                instructions.get(index),
+                Some((_, IR::Branch { .. } | IR::BranchConditional { .. } | IR::Return))
+            )
+        };
+
+        // the hoisted instructions sit ahead of the first label, so only a label that follows
+        // another one closes a block
+        let mut blocks = 0;
+        for (index, (_, ir)) in instructions.iter().enumerate() {
+            if !matches!(ir, IR::Label { .. }) {
+                continue;
+            }
+            if blocks > 0 {
+                assert!(
+                    terminated(index - 1),
+                    "the block before {index} runs on\n{}",
+                    compiled.dump()
+                );
+            }
+            blocks += 1;
+        }
+
+        assert!(blocks > 0, "{}", compiled.dump());
+        assert!(
+            terminated(instructions.len() - 1),
+            "the last block runs off the end\n{}",
+            compiled.dump()
+        );
+    }
+
+    /// A block ends in a branch, and nothing after that terminator runs. Resources and
+    /// variables are hoisted out of the blocks, so they have to land ahead of the first
+    /// branch rather than merely inside the entry block.
+    #[test]
+    fn everything_hoisted_out_of_a_block_lands_before_the_first_branch() {
+        let (module, _, end) = module_with_a_conditional_clear();
+        let compiled = module.compile(end);
+
+        let first_branch = compiled
+            .instructions()
+            .iter()
+            .position(|(_, ir)| matches!(ir, IR::Branch { .. } | IR::BranchConditional { .. }))
+            .expect("the selection branches");
+
+        for (index, (id, ir)) in compiled.instructions().iter().enumerate() {
+            assert!(
+                !is_hoistable(ir) || index < first_branch,
+                "{id} is hoisted but sits past the branch at {first_branch}\n{}",
+                compiled.dump()
+            );
+        }
+    }
+
+    /// The barrier pass shares one access constant between every barrier waiting on that
+    /// access. If it were left inside an arm, the other arm's barrier would name a value the
+    /// path it ran on never produced.
+    #[test]
+    fn a_constant_a_barrier_names_is_never_defined_inside_a_block() {
+        let (module, _, end) = module_with_a_conditional_clear();
+        let compiled = module.compile(end);
+        let instructions = compiled.instructions();
+
+        let first_label = instructions
+            .iter()
+            .position(|(_, ir)| matches!(ir, IR::Label { .. }))
+            .expect("the selection opens a block");
+
+        let defined_before = instructions[..first_label]
+            .iter()
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+
+        for (_, ir) in instructions {
+            let operands = match ir {
+                IR::MemoryBarrier { src_access, dst_access } => vec![*src_access, *dst_access],
+                IR::ImageBarrier {
+                    src_access, dst_access, ..
+                } => vec![*src_access, *dst_access],
+                _ => continue,
+            };
+
+            for operand in operands {
+                assert!(
+                    defined_before.contains(&operand),
+                    "{operand} is only defined on some paths\n{}",
+                    compiled.dump()
+                );
+            }
+        }
+    }
+
+    /// A branch jumps to the label, so anything the sort left ahead of it inside its own
+    /// block would be stepped straight over.
+    #[test]
+    fn a_label_is_the_first_instruction_of_its_block() {
+        let (module, _, end) = module_with_a_conditional_clear();
+        let compiled = module.compile(end);
+
+        let mut open = None;
+        for (id, ir) in compiled.instructions() {
+            match ir {
+                IR::Label { label, .. } => open = Some(*label),
+                _ => assert!(
+                    is_hoistable(ir) || module.block_of(*id).is_none_or(|block| Some(block) == open),
+                    "{id} comes before the label of the block it was recorded in\n{}",
+                    compiled.dump()
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn a_selection_lays_each_block_out_in_one_piece() {
+        let (module, _, end) = module_with_a_conditional_clear();
+        let compiled = module.compile(end);
+
+        let mut seen = Vec::new();
+        let mut current = None;
+        for (id, ir) in compiled.instructions() {
+            if let IR::Label { label, .. } = ir {
+                assert!(!seen.contains(label), "block {label} is laid out in two pieces");
+                seen.push(*label);
+                current = Some(*label);
+                continue;
+            }
+
+            // an instruction the module recorded in a block never drifts into another one
+            if let Some(block) = module.block_of(*id)
+                && !is_hoistable(ir)
+            {
+                assert_eq!(Some(block), current, "{id} left the block it was recorded in");
+            }
+        }
+
+        assert_eq!(seen.len(), 4, "an entry block plus the selection's three");
+    }
+
+    /// Nothing after the merge knows which way control went, so it can only name one layout
+    /// for the image. The arm that skipped the clear has to be brought to the layout the arm
+    /// that cleared ended in, however little it did itself.
+    #[test]
+    fn both_arms_of_a_selection_leave_a_resource_in_the_same_layout() {
+        let (module, source, end) = module_with_a_conditional_clear();
+        let compiled = module.compile(end);
+
+        let (merge, taken, skipped) = selection_labels(&compiled);
+        let (merge, taken, skipped) = (
+            block_at(&compiled, merge),
+            block_at(&compiled, taken),
+            block_at(&compiled, skipped),
+        );
+
+        let layout_leaving = |range: std::ops::Range<usize>| {
+            compiled.instructions()[range]
+                .iter()
+                .filter_map(|(_, ir)| match ir {
+                    IR::ImageBarrier { new_layout, value, .. } if module.resource_root(*value) == source => {
+                        Some(*new_layout)
+                    },
+                    _ => None,
+                })
+                .next_back()
+        };
+
+        let cleared = layout_leaving(taken..skipped);
+        assert_eq!(
+            cleared,
+            Some(vk::ImageLayout::TRANSFER_DST_OPTIMAL),
+            "{}",
+            compiled.dump()
+        );
+        assert_eq!(layout_leaving(skipped..merge), cleared, "{}", compiled.dump());
+    }
+
+    /// The arm that does nothing still has to end where the other one did, so reconciling it
+    /// is the only reason it holds a barrier at all.
+    #[test]
+    fn an_arm_that_touches_nothing_is_still_brought_to_the_join() {
+        let (module, source, end) = module_with_a_conditional_clear();
+        let compiled = module.compile(end);
+
+        let (merge, _, skipped) = selection_labels(&compiled);
+        let barriers = compiled.instructions()[block_at(&compiled, skipped)..block_at(&compiled, merge)]
+            .iter()
+            .filter(|(_, ir)| matches!(ir, IR::ImageBarrier { value, .. } if module.resource_root(*value) == source))
+            .count();
+        assert_eq!(barriers, 1, "{}", compiled.dump());
+    }
+
+    /// Bytes pushed from a variable are only sized when compiled; what they hold is read
+    /// when the draw is recorded, so the block has to reach the draw naming its variable.
+    #[test]
+    fn push_constants_from_a_variable_reach_the_draw_as_a_variable() {
+        let (mut module, target) = module_with_attachment();
+        let block = module.variable_bytes("push block", 16);
+
+        let end = module
+            .begin_rendering(&[target])
+            .bind_graphics_pipeline(PipelineId(0))
+            .push_constants_from(block)
+            .draw(3, 1)
+            .end_rendering();
+
+        let compiled = module.compile(end);
+        let pushed = compiled
+            .instructions()
+            .iter()
+            .find_map(|(_, ir)| match ir {
+                IR::Draw { dynamic, .. } => Some(dynamic.push_constants.clone()),
+                _ => None,
+            })
+            .expect("the draw carries the block in force");
+
+        assert_eq!(pushed.source, Some(block));
+        assert_eq!(pushed.size(), 16);
+        assert_eq!(pushed.offset, 0);
+    }
+
+    /// A block cannot be half literal and half variable, so whichever was asked for last is
+    /// the whole of it.
+    #[test]
+    fn writing_bytes_over_a_variable_block_replaces_it() {
+        let (mut module, target) = module_with_attachment();
+        let block = module.variable_bytes("push block", 16);
+
+        let end = module
+            .begin_rendering(&[target])
+            .bind_graphics_pipeline(PipelineId(0))
+            .push_constants_from(block)
+            .push_constants(&7u32)
+            .draw(3, 1)
+            .end_rendering();
+
+        let compiled = module.compile(end);
+        let pushed = compiled
+            .instructions()
+            .iter()
+            .find_map(|(_, ir)| match ir {
+                IR::Draw { dynamic, .. } => Some(dynamic.push_constants.clone()),
+                _ => None,
+            })
+            .expect("the draw carries the block in force");
+
+        assert_eq!(pushed.source, None);
+        assert_eq!(pushed.data, 7u32.to_ne_bytes());
+    }
+
+    #[test]
+    fn a_branch_target_resolves_to_the_block_it_names() {
+        let (module, _, end) = module_with_a_conditional_clear();
+        let compiled = module.compile(end);
+
+        for (_, ir) in compiled.instructions() {
+            let targets = match ir {
+                IR::Branch { target, .. } => vec![*target],
+                IR::BranchConditional {
+                    true_label,
+                    false_label,
+                    ..
+                } => vec![*true_label, *false_label],
+                _ => continue,
+            };
+
+            for target in targets {
+                let index = compiled.label_index(target).expect("a branch names a placed block");
+                assert!(matches!(compiled.instructions()[index], (_, IR::Label { label, .. }) if label == target));
+            }
+        }
     }
 }

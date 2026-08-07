@@ -223,9 +223,10 @@ mod tests {
             .end_compute();
 
         // the expand region is the last one the compiled module opens
-        let expand = module
-            .compile(expanded)
-            .into_iter()
+        let compiled = module.compile(expanded);
+        let expand = compiled
+            .instructions()
+            .iter()
             .rev()
             .find_map(|(_, ir)| match ir {
                 IR::BeginCompute { resources, .. } => Some(resources),

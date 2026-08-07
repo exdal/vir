@@ -409,16 +409,14 @@ impl<E: Example> App<E> {
         // is not the one worth looking at
         if !self.dumped_ir && egui_frame.draw_count() > 0 {
             if std::env::var_os("VIR_DUMP_IR").is_some() {
-                RenderGraph::dump(executable.as_slice());
+                RenderGraph::dump(&executable);
             }
             self.dumped_ir = true;
         }
 
-        renderer.graph.execute(
-            &renderer.ctx,
-            executable.as_slice(),
-            &mut AllocatorKind::Frame(next_frame),
-        )
+        renderer
+            .graph
+            .execute(&renderer.ctx, &executable, &mut AllocatorKind::Frame(next_frame))
     }
 }
 

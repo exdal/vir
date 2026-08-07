@@ -674,7 +674,6 @@ impl Example for Deferred {
             .set_viewport(0, Rect2D::framebuffer())
             .set_scissor(0, Rect2D::framebuffer())
             .broadcast_color_blend(BlendPreset::Off)
-            // what makes the pass a G-buffer fill rather than a race between overlapping draws
             .set_depth(DepthState::less())
             .set_rasterization(RasterizationState {
                 cull_mode: match self.ui.cull_backfaces {

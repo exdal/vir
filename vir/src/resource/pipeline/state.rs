@@ -3,6 +3,8 @@ use std::hash::{Hash, Hasher};
 use ash::vk;
 use bitflags::bitflags;
 
+use crate::ValueId;
+
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct DynamicStateFlags: u32 {
@@ -402,6 +404,7 @@ impl From<BlendPreset> for ColorBlendAttachmentState {
 pub struct PushConstants {
     pub offset: u32,
     pub data: Vec<u8>,
+    pub source: Option<ValueId>,
 }
 
 impl PushConstants {
@@ -411,7 +414,17 @@ impl PushConstants {
 
     pub fn end(&self) -> u32 { self.offset + self.size() }
 
+    pub fn from_variable(&mut self, offset: u32, size: u32, source: ValueId) {
+        self.offset = offset;
+        self.data = vec![0; size as usize];
+        self.source = Some(source);
+    }
+
     pub fn write(&mut self, offset: u32, bytes: &[u8]) {
+        if self.source.take().is_some() {
+            self.data.clear();
+        }
+
         if self.is_empty() {
             self.offset = offset;
             self.data = bytes.to_vec();
@@ -455,6 +468,11 @@ pub enum StateChange {
     PushConstants {
         offset: u32,
         data: Vec<u8>,
+    },
+    PushConstantsFrom {
+        offset: u32,
+        size: u32,
+        source: ValueId,
     },
 }
 
@@ -525,6 +543,9 @@ impl PassState {
             },
             StateChange::Depth(depth) => self.depth = depth,
             StateChange::PushConstants { offset, data } => self.push_constants.write(offset, &data),
+            StateChange::PushConstantsFrom { offset, size, source } => {
+                self.push_constants.from_variable(offset, size, source)
+            },
         }
     }
 
