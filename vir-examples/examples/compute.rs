@@ -1,13 +1,13 @@
 //! Geometry that never exists on the CPU.
 //!
-//! Two dispatches and a draw, chained by what each one writes: the first places a triangle per
-//! thread, the second expands those placements into corners, and the draw binds the result as
-//! its vertex buffer. Nothing here binds a descriptor set, since both buffers reach the
-//! dispatches as device addresses pushed in a constant block.
+//! Two dispatches and a draw, chained by what each writes: the first places a triangle per
+//! thread, the second expands the placements into corners, and the draw binds the result as its
+//! vertex buffer. No descriptor sets; both buffers reach the dispatches as device addresses in
+//! the push constant block.
 //!
-//! What the example is really about is the two barriers it never writes: the graph reads the
-//! accesses each region declares and works out that the expand has to wait on the place, and
-//! that the draw's vertex input has to wait on the expand.
+//! The point is the two barriers the example never writes. From the accesses each region
+//! declares, the graph works out that the expand waits on the place and the draw's vertex input
+//! waits on the expand.
 
 use ash::vk;
 use vir::{
@@ -31,20 +31,16 @@ const FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/compute.frag.s
 
 const BACKGROUND: ClearValue = ClearValue::rgba_f32(0.02, 0.02, 0.05, 1.0);
 
-/// The `[numthreads]` both dispatches declare, which is what turns a triangle count into a
-/// group count.
+/// The `[numthreads]` both dispatches declare, used to turn a triangle count into groups.
 const WORKGROUP_SIZE: u32 = 64;
 
-/// What `cs_expand` writes per vertex: `float2 position` then `float3 color`, tightly packed,
-/// which is the layout reflection reads back off the vertex stage.
+/// Bytes `cs_expand` writes per vertex: `float2 position` then `float3 color`, tightly packed.
 const VERTEX_SIZE: u64 = 20;
 
-/// What `cs_place` writes per triangle: `float2 center`, `float radius`, `float3 color`. Only
-/// the two shaders ever see this one.
+/// Bytes `cs_place` writes per triangle: `float2 center`, `float radius`, `float3 color`.
 const INSTANCE_SIZE: u64 = 24;
 
-/// A buffer only ever touched on the device still needs an address to be reachable from a
-/// pointer in the push constant block.
+/// Device-only buffer, still given an address so a pushed pointer can reach it.
 fn device_buffer(size: u64, extra: vk::BufferUsageFlags, name: &str) -> BufferInfo {
     BufferInfo::new(
         size,
@@ -54,8 +50,7 @@ fn device_buffer(size: u64, extra: vk::BufferUsageFlags, name: &str) -> BufferIn
     .with_name(name)
 }
 
-/// The block `compute.slang` declares. Both dispatches read the whole of it; the draw reads
-/// none of it, so the graphics pipeline has no push constant range at all.
+/// The block `compute.slang` declares. Both dispatches read it; the draw reads none of it.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct PushConstants {
@@ -87,7 +82,7 @@ impl Default for UiState {
     }
 }
 
-/// How far each axis has to shrink for the ring to stay round in a framebuffer of `target`.
+/// Per-axis shrink that keeps the ring round in `target`.
 fn ring_scale(target: vk::Extent2D) -> [f32; 2] {
     let aspect = target.width.max(1) as f32 / target.height.max(1) as f32;
     if aspect > 1.0 {
@@ -135,8 +130,7 @@ impl Example for Compute {
     fn render(&mut self, frame: &mut Frame) -> Result<ValueId, vk::Result> {
         let count = self.ui.count;
 
-        // both buffers live and die with the frame, so the frame allocator recycles them once
-        // it retires and no two frames in flight ever share one
+        // both buffers live and die with the frame, recycled by the frame allocator once it retires
         let instances = frame.allocator.allocate_buffer(&device_buffer(
             count as u64 * INSTANCE_SIZE,
             vk::BufferUsageFlags::empty(),
@@ -171,9 +165,8 @@ impl Example for Compute {
             .dispatch_invocations(count, 1, 1)
             .end_compute();
 
-        // a region stands in for the first resource it declared, so writing the vertices first
-        // is what makes `expanded` the value the draw can bind, while reading `placed` rather
-        // than `instances` is what puts this dispatch after the one that filled them
+        // write vertices first so `expanded` is what the draw binds; read `placed`, not
+        // `instances`, to order this dispatch after the place
         let expanded = frame
             .module
             .begin_compute()
@@ -213,9 +206,8 @@ mod tests {
 
     use super::*;
 
-    /// What the draw binds is the expand region rather than the buffer it imported, so the
-    /// example rests on a region standing in for the first resource it declared. Writing the
-    /// vertices before reading the placements is the whole of what makes that the right buffer.
+    /// A region stands in for the first resource it declared, so writing vertices before reading
+    /// placements makes `expanded` the buffer the draw binds.
     #[test]
     fn the_expand_region_stands_in_for_the_buffer_the_draw_binds() {
         let mut module = Module::default();
@@ -243,9 +235,8 @@ mod tests {
         assert_eq!(expand.first().map(|(id, _)| *id), Some(vertices));
     }
 
-    /// The dispatch writes through a pointer and the draw reads through vertex input state, so
-    /// nothing checks that the two agree but this: the layout reflection derives has to be the
-    /// tightly packed 20 bytes `cs_expand` stores.
+    /// Nothing else checks that the dispatch's writes and the draw's vertex input agree, so the
+    /// reflected layout must be the tightly packed 20 bytes `cs_expand` stores.
     #[test]
     fn the_reflected_vertex_layout_matches_what_the_dispatch_writes() {
         let reflections = [
@@ -272,9 +263,8 @@ mod tests {
         );
     }
 
-    /// Both dispatches reach their buffers through addresses in the block, which is the whole
-    /// reason neither one declares a binding: a descriptor here would be a set the graph has
-    /// no way to write.
+    /// Both dispatches reach their buffers through addresses in the block, so neither declares a
+    /// binding.
     #[test]
     fn the_dispatches_reach_their_buffers_without_a_descriptor_set() {
         for spirv in [PLACE_SPV, EXPAND_SPV] {
@@ -288,8 +278,7 @@ mod tests {
         }
     }
 
-    /// The geometry arrives through the vertex buffer, so the draw has nothing to push and the
-    /// block stays a compute-only range.
+    /// The geometry arrives through the vertex buffer, so the draw pushes nothing.
     #[test]
     fn the_draw_pushes_nothing() {
         let reflect = |spirv| shader::reflect(&read_spirv(spirv)).expect("shader should reflect");

@@ -11,11 +11,11 @@ pkgs.mkShell {
   nativeBuildInputs = [
     toolchain
     pkgs.pkg-config
-    pkgs.xorg.libX11
-    pkgs.xorg.libXcursor
-    pkgs.xorg.libXrandr
-    pkgs.xorg.libXi
-    pkgs.xorg.libxcb
+    pkgs.libX11
+    pkgs.libXcursor
+    pkgs.libXrandr
+    pkgs.libXi
+    pkgs.libxcb
     pkgs.libxkbcommon
     pkgs.vulkan-loader
     pkgs.wayland

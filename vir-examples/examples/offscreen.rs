@@ -1,10 +1,9 @@
-//! Rendering into something other than the swapchain, and letting the graph move it from there.
+//! Rendering into an offscreen target and letting the graph move it to the swapchain.
 //!
-//! A frame here is a chain: clear and draw into a persistent offscreen target, blit that into a
-//! half-resolution image the graph owns for the length of the frame, then blit that onto the
-//! swapchain. Nothing in it declares a barrier or a layout; the accesses are what the graph
-//! reads the transitions off. The offscreen target outlives the frame, so it is released back
-//! into the layout it is re-imported in and named as a second root of the frame.
+//! Each frame is a chain: clear and draw into a persistent offscreen target, blit that into a
+//! downscaled image the graph owns for the frame, then blit that onto the swapchain. It declares
+//! no barriers or layouts; the graph reads those off the accesses. The offscreen target outlives
+//! the frame, so it is released back into its resting layout and added as a second frame root.
 
 use ash::vk;
 use vir::{
@@ -28,8 +27,7 @@ use vir_examples::{Example, Frame, Setup, graphics_pipeline};
 const VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/triangle.vert.spv"));
 const FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/triangle.frag.spv"));
 
-/// The last thing a frame does to the offscreen target is blit out of it, so that is the layout
-/// it is created in and handed back in.
+/// The frame's last use of the target is a blit out of it, so that is its resting layout.
 const RESTING_ACCESS: Access = Access::BlitRead;
 
 /// The block `triangle.slang` declares.
@@ -48,7 +46,7 @@ struct Offscreen {
 }
 
 struct UiState {
-    /// How much smaller the intermediate the frame blits through is, as a divisor.
+    /// Divisor for the size of the intermediate the frame blits through.
     downscale: u32,
     animate_clear: bool,
 }
@@ -114,8 +112,7 @@ impl Example for Offscreen {
 
         let attachment = ImageAttachment::from_image(&image, vk::ImageLayout::UNDEFINED).with_image_view(view);
 
-        // a module with nothing in it but the release, which is all it takes to put a fresh
-        // image into the layout the first frame expects to find it in
+        // a module with only the release, enough to put a fresh image into its resting layout
         let mut module = vir::Module::default();
         let target = module.import_attachment(&attachment);
         let ready = module.release(target, RESTING_ACCESS, DomainFlag::Graphics);
@@ -180,8 +177,7 @@ impl Example for Offscreen {
             .draw(3, 1)
             .end_rendering();
 
-        // the graph allocates this one, keeps it for exactly as long as the two blits need it,
-        // and hands it back without the example ever naming a lifetime for it
+        // the graph owns this one for as long as the two blits need it
         let scaled = vk::Extent2D {
             width: (extent.width / self.ui.downscale).max(1),
             height: (extent.height / self.ui.downscale).max(1),
@@ -192,8 +188,8 @@ impl Example for Offscreen {
         let scratch = frame.module.blit(attachment, scratch);
         let presented = frame.module.blit(scratch, frame.swapchain_image);
 
-        // presenting does not depend on the offscreen target ending up anywhere in particular,
-        // so the resting layout has to be asked for as a root of its own
+        // present does not depend on the offscreen target's final layout, so its release is a
+        // root of its own
         let resting = frame.module.release(attachment, RESTING_ACCESS, DomainFlag::Graphics);
         frame.add_root(resting);
 
@@ -217,8 +213,7 @@ mod tests {
 
     use super::*;
 
-    /// This example pushes the same block `triangle.slang` declares, so its struct has to keep
-    /// matching what reflection reads back out of that shader.
+    /// Pushes the same block `triangle.slang` declares, so the struct must match reflection.
     #[test]
     fn the_reflected_push_constant_block_matches_the_pushed_struct() {
         let reflection = shader::reflect(&read_spirv(VERT_SPV)).expect("shader should reflect");
@@ -226,8 +221,7 @@ mod tests {
         assert_eq!(reflection.push_constant_size as usize, size_of::<PushConstants>());
     }
 
-    /// The blit out of the offscreen target is what decides its resting layout, so the two have
-    /// to keep agreeing.
+    /// The blit out of the target decides its resting layout, so the two must agree.
     #[test]
     fn the_resting_access_is_the_layout_the_frame_leaves_it_in() {
         assert_eq!(

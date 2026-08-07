@@ -1,9 +1,8 @@
-//! The smallest thing `vir` draws: a triangle whose geometry lives in the shader, so the whole
-//! pipeline comes out of reflection and a draw needs no buffer at all.
+//! A triangle with its geometry in the shader, so the pipeline comes from reflection and the
+//! draw binds no buffer.
 //!
-//! It renders twice to show what a pass costs to vary: once with the viewport and scissor
-//! baked into the pipeline, and once with both promoted to dynamic state and pointed at a
-//! corner of the framebuffer.
+//! It draws twice: once with the viewport and scissor baked into the pipeline, and once with
+//! both set as dynamic state and aimed at a corner of the framebuffer.
 
 use ash::vk;
 use vir::{BlendPreset, ClearValue, DynamicStateFlags, PipelineId, RasterizationState, Rect2D, ValueId};
@@ -12,7 +11,7 @@ use vir_examples::{Example, Frame, Setup, graphics_pipeline};
 const VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/triangle.vert.spv"));
 const FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/triangle.frag.spv"));
 
-/// The block `triangle.slang` declares, laid out to match it member for member.
+/// Matches the push constant block in `triangle.slang`, member for member.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct PushConstants {
@@ -21,7 +20,7 @@ struct PushConstants {
     tint: f32,
 }
 
-/// Where `tint` sits in the block, for the draws that push nothing else.
+/// Byte offset of `tint` in the block.
 const TINT_OFFSET: u32 = 12;
 
 const BACKGROUND: ClearValue = ClearValue::rgba_f32(0.02, 0.02, 0.05, 1.0);
@@ -31,7 +30,7 @@ struct Triangle {
     ui: UiState,
 }
 
-/// What the panel is driving.
+/// State the UI drives.
 struct UiState {
     slide: bool,
     scale: f32,
@@ -107,8 +106,7 @@ impl Example for Triangle {
             return Ok(target);
         }
 
-        // the same pipeline again, but with the viewport and the scissor set per draw rather
-        // than baked in, which is what keeps this from being a second pipeline
+        // same pipeline, but viewport and scissor set dynamically instead of baked in
         Ok(frame
             .module
             .begin_rendering(&[target])
@@ -151,8 +149,7 @@ mod tests {
         assert_eq!(VertexLayout::interleaved(&reflections), VertexLayout::default());
     }
 
-    /// What `push_constants` sends has to be the block Slang laid out, or the shader reads
-    /// whatever the neighbouring member happened to be.
+    /// The pushed struct must match the block Slang reflected, or its members misalign.
     #[test]
     fn the_reflected_push_constant_block_matches_the_pushed_struct() {
         for spirv in [VERT_SPV, FRAG_SPV] {

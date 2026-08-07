@@ -1,9 +1,8 @@
-//! Geometry that comes from buffers rather than from the shader.
+//! Geometry from vertex buffers instead of the shader.
 //!
-//! Two allocators show up here and they are not interchangeable: the quad is uploaded once into
-//! a persistent buffer and drawn indexed every frame after, while the spinning triangle is
-//! rebuilt on the CPU each frame and takes its buffer from the frame allocator, which recycles
-//! it once the frame retires.
+//! The quad is uploaded once to a persistent buffer and drawn indexed each frame. The spinning
+//! triangle is rebuilt on the CPU every frame in a frame-allocator buffer, recycled once the
+//! frame retires.
 
 use ash::vk;
 use vir::{
@@ -25,8 +24,7 @@ use vir_examples::{Example, Frame, Setup, graphics_pipeline};
 const VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/vertex_buffer.vert.spv"));
 const FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/vertex_buffer.frag.spv"));
 
-/// One vertex as `vs_main` reads it: `float2 position` then `float3 color`, which is exactly
-/// what reflection packs into binding 0.
+/// One vertex as `vs_main` reads it: `float2 position` then `float3 color`.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Vertex {
@@ -42,7 +40,7 @@ struct PushConstants {
     tint: f32,
 }
 
-/// Where `tint` sits in the block, for the draw that pushes nothing else.
+/// Byte offset of `tint` in the block.
 const TINT_OFFSET: u32 = 12;
 
 const BACKGROUND: ClearValue = ClearValue::rgba_f32(0.02, 0.02, 0.05, 1.0);
@@ -67,7 +65,7 @@ const QUAD: [Vertex; 4] = [
     },
 ];
 
-/// Two triangles over those four corners, which is the whole reason the quad is drawn indexed.
+/// Two triangles over the four quad corners, drawn indexed.
 const QUAD_INDICES: [u32; 6] = [0, 1, 2, 2, 3, 0];
 
 /// A triangle on the other side, spun by `angle`, rebuilt every frame.
@@ -161,8 +159,7 @@ impl Example for VertexBuffer {
         frame.module.set_name(quad_indices, "quad indices");
         frame.module.set_name(spinning, "spinning triangle");
 
-        // one pass, two draws: only the bound buffer and the tail of the push constant block
-        // change between them
+        // one pass, two draws: only the bound buffer and the tail of the block change
         Ok(frame
             .module
             .begin_rendering(&[target])
@@ -207,8 +204,7 @@ mod tests {
 
     use super::*;
 
-    /// The whole chain: Slang emits POSITION/COLOR as locations, reflection reads them back, and
-    /// the layout that comes out has to match the `Vertex` struct the example uploads.
+    /// The reflected vertex layout must match the `Vertex` struct the example uploads.
     #[test]
     fn the_reflected_vertex_layout_matches_the_uploaded_vertex() {
         let reflections = [
@@ -235,8 +231,7 @@ mod tests {
         );
     }
 
-    /// The vertex stage ignores the block, so the range it lands in is fragment-only even
-    /// though the pipeline is built from both stages at once.
+    /// The vertex stage ignores the block, so its range is fragment-only.
     #[test]
     fn a_stage_that_ignores_the_block_stays_out_of_its_range() {
         let reflect = |spirv| shader::reflect(&read_spirv(spirv)).expect("shader should reflect");
@@ -246,7 +241,7 @@ mod tests {
         assert_eq!(ranges[0].stage_flags, vk::ShaderStageFlags::FRAGMENT);
         assert_eq!(ranges[0].size as usize, size_of::<PushConstants>());
 
-        // TINT_OFFSET has to name the last member, since the spinning draw pushes it alone
+        // TINT_OFFSET names the last member, pushed alone by the spinning draw
         assert_eq!(TINT_OFFSET as usize, size_of::<PushConstants>() - size_of::<f32>());
     }
 }

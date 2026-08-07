@@ -1,10 +1,9 @@
-//! The overlay on its own.
+//! The egui overlay on its own.
 //!
-//! Every example draws its controls through the same egui backend the harness owns, so this one
-//! is what that backend looks like with nothing underneath it: the frame clears the swapchain
-//! and hands it straight back, and the entire image is the UI. The backend itself lives in
-//! `src/egui_pass.rs`, and between the font atlas and the meshes it is where texture uploads,
-//! indexed draws, per-draw scissors and bindless sampling are exercised.
+//! Every example draws its controls through the same egui backend the harness owns. Here there
+//! is nothing under it: the frame clears the swapchain and hands it back, and the whole image is
+//! the UI. The backend lives in `src/egui_pass.rs`, where the font atlas and meshes exercise
+//! texture uploads, indexed draws, per-draw scissors, and bindless sampling.
 
 use ash::vk;
 use vir::{ClearValue, ValueId};

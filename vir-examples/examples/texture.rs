@@ -1,9 +1,8 @@
-//! Getting an image from the host onto the GPU and sampling it.
+//! Uploading an image to the GPU and sampling it.
 //!
-//! The upload is a one-shot module run at startup: a staging buffer, one copy into the image,
-//! and a release into the layout a shader read wants. After that the image only ever appears as
-//! a slot in the graph's bindless table, so a draw names it by pushing an index rather than by
-//! binding a descriptor set.
+//! Startup runs a one-shot module: staging buffer, one copy into the image, then a release into
+//! the layout a shader read wants. After that the image is a slot in the graph's bindless table,
+//! so a draw names it by pushing an index instead of binding a descriptor set.
 
 use ash::vk;
 use vir::{
@@ -33,11 +32,10 @@ const FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/texture.frag.s
 
 const PNG: &[u8] = include_bytes!("../assets/checkerboard.png");
 
-/// The pixels are sRGB, so an `_SRGB` format is what makes a sample come back linear.
+/// sRGB pixels, so an `_SRGB` format samples back linear.
 const TEXTURE_FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
 
-/// Once uploaded, the image is only ever read by a fragment shader, so that is the layout it
-/// rests in between frames.
+/// Between frames the image rests in the layout a fragment sample wants.
 const RESTING_ACCESS: Access = Access::FragmentSampled;
 
 const BACKGROUND: ClearValue = ClearValue::rgba_f32(0.02, 0.02, 0.05, 1.0);
@@ -55,7 +53,7 @@ struct Texture {
     image: Image,
     image_view: vk::ImageView,
     sampler: vk::Sampler,
-    /// The image's slot in the graph's bindless table, which is what a draw pushes.
+    /// The image's slot in the bindless table, pushed by the draw.
     slot: TextureId,
     extent: vk::Extent2D,
     ui: UiState,
@@ -80,8 +78,7 @@ impl Texture {
         ImageAttachment::from_image(&self.image, RESTING_ACCESS.into()).with_image_view(self.image_view)
     }
 
-    /// How far the quad has to shrink on each axis for the image to land unsquashed in a
-    /// framebuffer of `target`.
+    /// Per-axis shrink that fits the image into `target` without stretching.
     fn quad_scale(&self, target: vk::Extent2D) -> [f32; 2] {
         if !self.ui.keep_aspect {
             return [self.ui.zoom, self.ui.zoom];
@@ -134,8 +131,7 @@ impl Example for Texture {
         )?;
         staging.write(0, &pixels)?;
 
-        // one module, run to completion: the copy, then the release that leaves the image in
-        // the layout every frame after this re-imports it in
+        // one module run to completion: the copy, then the release into the resting layout
         let mut module = vir::Module::default();
         let source = module.import_buffer(&staging);
         let destination = module.import_attachment(&ImageAttachment::from_image(&image, vk::ImageLayout::UNDEFINED));
@@ -224,9 +220,8 @@ mod tests {
 
     use super::*;
 
-    /// The whole bindless path rests on this shape: a variable-count combined image sampler
-    /// array is what a pipeline layout recognises as the slot the graph's texture table is
-    /// written into, so a shader that reflects as anything else silently samples nothing.
+    /// The bindless table is a variable-count combined image sampler array; a shader that
+    /// reflects as anything else silently samples nothing.
     #[test]
     fn the_fragment_shader_declares_the_bindless_texture_table() {
         let reflection = shader::reflect(&read_spirv(FRAG_SPV)).expect("shader should reflect");
@@ -247,8 +242,8 @@ mod tests {
         assert!(vertex.bindings.is_empty());
     }
 
-    /// The vertex stage reads the scale out of the block and the fragment stage the texture
-    /// index, so one range covers both and spans exactly the struct the draw pushes.
+    /// The vertex stage reads scale and the fragment stage the texture index, so one range
+    /// covers both stages.
     #[test]
     fn the_push_constant_range_covers_both_stages() {
         let reflect = |spirv| shader::reflect(&read_spirv(spirv)).expect("shader should reflect");
@@ -263,8 +258,7 @@ mod tests {
         assert_eq!(ranges[0].size as usize, size_of::<PushConstants>());
     }
 
-    /// A sampled image rests in the layout a shader read wants, which is what the frame
-    /// re-imports it in.
+    /// The resting access maps to the layout a sample wants.
     #[test]
     fn the_resting_access_is_the_layout_a_sample_wants() {
         assert_eq!(
