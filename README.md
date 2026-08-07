@@ -103,3 +103,5 @@ It brings in `ash`, so you supply the instance, physical device, and logical dev
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+This project is heavily inspired by the [vuk](https://github.com/martty/vuk). Please check it out.
