@@ -80,6 +80,7 @@ cargo run -p vir-examples --example vertex_buffer
 cargo run -p vir-examples --example texture
 cargo run -p vir-examples --example compute
 cargo run -p vir-examples --example offscreen
+cargo run -p vir-examples --example deferred
 cargo run -p vir-examples --example egui
 ```
 
