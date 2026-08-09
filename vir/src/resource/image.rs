@@ -95,6 +95,11 @@ impl ImageInfo {
         self
     }
 
+    pub fn with_extent3d(mut self, extent: vk::Extent3D) -> Self {
+        self.extent = extent;
+        self
+    }
+
     pub fn subresource_range(&self) -> vk::ImageSubresourceRange {
         vk::ImageSubresourceRange::default()
             .aspect_mask(aspect_mask(self.format))

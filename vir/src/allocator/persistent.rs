@@ -160,9 +160,7 @@ impl Allocator for PersistentAllocator {
             },
         };
 
-        if let Err(err) =
-            unsafe { device.bind_buffer_memory(handle, allocation.memory(), allocation.offset()) }
-        {
+        if let Err(err) = unsafe { device.bind_buffer_memory(handle, allocation.memory(), allocation.offset()) } {
             let _ = self.memory.borrow_mut().free(allocation);
             unsafe { device.destroy_buffer(handle, None) };
             return Err(err);

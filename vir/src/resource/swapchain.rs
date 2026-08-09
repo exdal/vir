@@ -10,6 +10,33 @@ pub struct SwapChain {
     pub attachments: Vec<ImageAttachment>,
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct SwapchainBinding {
+    pub handle: vk::SwapchainKHR,
+    pub attachments: Vec<ImageAttachment>,
+    pub present_semaphores: Vec<vk::Semaphore>,
+}
+
+impl From<&SwapChain> for SwapchainBinding {
+    fn from(swapchain: &SwapChain) -> Self {
+        Self {
+            handle: swapchain.handle,
+            attachments: swapchain.attachments.clone(),
+            present_semaphores: swapchain.semaphores.clone(),
+        }
+    }
+}
+
+impl SwapChain {
+    pub fn format(&self) -> vk::Format { self.attachments.first().map_or(vk::Format::UNDEFINED, |a| a.format()) }
+
+    pub fn samples(&self) -> vk::SampleCountFlags {
+        self.attachments
+            .first()
+            .map_or(vk::SampleCountFlags::TYPE_1, |a| a.samples())
+    }
+}
+
 impl SwapChain {
     #[allow(clippy::too_many_arguments)]
     pub fn new(

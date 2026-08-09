@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     ptr::NonNull,
+    sync::Arc,
 };
 
 use ash::vk::{self, Handle};
@@ -9,6 +10,8 @@ use crate::{
     Access,
     AllocatorKind,
     Buffer,
+    BufferImageCopy,
+    BufferInfo,
     ClearValue,
     CommandBuffer,
     ComputePipelineInfo,
@@ -24,14 +27,19 @@ use crate::{
     PipelineId,
     PipelineLayout,
     PipelineState,
+    Program,
     PushConstants,
     ResolvedViewport,
+    SwapchainBinding,
     TextureId,
     Value,
     ValueId,
     VertexLayout,
     core::ScopedStack,
-    graph::{dump, ir, value::FromValue},
+    graph::{
+        ir::{self, scaled},
+        value::FromValue,
+    },
     resource::{
         self,
         pipeline::{ComputePipelineRequest, PipelineRequest, create_compute_pipelines, create_pipelines},
@@ -496,11 +504,31 @@ impl RenderGraph {
         Ok(())
     }
 
-    fn reset(&mut self, instructions: &[ir::Instr]) {
+    fn reset(&mut self, program: &Program) -> Result<(), vk::Result> {
+        let instructions = program.instructions();
         let value_count = instructions.iter().map(|(id, _)| id.0 as usize + 1).max().unwrap_or(0);
 
         self.values.clear();
         self.values.resize(value_count, Value::None);
+
+        for (value_id, ir) in instructions {
+            let IR::Variable { slot, .. } = ir else {
+                continue;
+            };
+            if let Some(variable) = program.variable(*slot) {
+                self.set_value(value_id, variable.value.clone());
+            }
+        }
+
+        for (resource, variable) in program.bound_variables() {
+            if matches!(variable.value, Value::None) {
+                tracing::error!(%resource, name = ?variable.name, "nothing was bound to this slot");
+                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+            }
+
+            self.set_value(&resource, variable.value.clone());
+        }
+
         self.bound_pipeline = None;
         self.bound_layout = None;
         self.render_area = vk::Rect2D::default();
@@ -513,6 +541,8 @@ impl RenderGraph {
         self.presents.clear();
         self.resource_to_swapchain.clear();
         self.timeline_signals.clear();
+
+        Ok(())
     }
 
     fn set_value(&mut self, value_id: &ValueId, value: Value) {
@@ -579,14 +609,53 @@ impl RenderGraph {
     }
 
     pub fn execute(
-        &mut self, ctx: &Context, instructions: &[ir::Instr], allocator: &mut AllocatorKind,
+        &mut self, ctx: &Context, program: &Program, allocator: &mut AllocatorKind,
     ) -> Result<(), vk::Result> {
+        let instructions = program.instructions();
         self.construct_pipelines(instructions)?;
         self.update_descriptors();
-        self.reset(instructions);
+        self.reset(program)?;
 
-        for (value_id, node) in instructions {
-            self.execute_one(ctx, value_id, node, allocator)?;
+        let mut pc = 0;
+        let mut block = None;
+        let mut arrived_from = None;
+        while let Some((value_id, node)) = instructions.get(pc) {
+            match node {
+                IR::Label { label, .. } => block = Some(*label),
+                IR::SelectionMerge { .. } => {},
+                IR::Branch { target, .. } => {
+                    arrived_from = block;
+                    pc = program.label_index(*target).ok_or(vk::Result::ERROR_UNKNOWN)?;
+                    continue;
+                },
+                IR::BranchConditional {
+                    condition,
+                    true_label,
+                    false_label,
+                    ..
+                } => {
+                    let taken = match self.get::<bool>(condition) {
+                        true => *true_label,
+                        false => *false_label,
+                    };
+                    arrived_from = block;
+                    pc = program.label_index(taken).ok_or(vk::Result::ERROR_UNKNOWN)?;
+                    continue;
+                },
+                IR::Return => break,
+                // a bound resource was placed by reset, there is nothing here to allocate
+                IR::ConstructBuffer { .. } | IR::ConstructImage { .. } if program.bound(value_id).is_some() => {},
+                IR::Phi { incoming, .. } => {
+                    let chosen = incoming
+                        .iter()
+                        .find(|(_, from)| Some(*from) == arrived_from)
+                        .map(|(value, _)| *value)
+                        .ok_or(vk::Result::ERROR_UNKNOWN)?;
+                    self.set_value(value_id, Value::Reference(chosen));
+                },
+                node => self.execute_one(ctx, value_id, node, allocator)?,
+            }
+            pc += 1;
         }
 
         if self.current_batch.is_some() || !self.current_submit.cmd_buffers.is_empty() {
@@ -660,9 +729,9 @@ impl RenderGraph {
     }
 
     pub fn execute_blocking(
-        &mut self, ctx: &Context, instructions: &[ir::Instr], allocator: &mut AllocatorKind,
+        &mut self, ctx: &Context, program: &Program, allocator: &mut AllocatorKind,
     ) -> Result<(), vk::Result> {
-        self.execute(ctx, instructions, allocator)?;
+        self.execute(ctx, program, allocator)?;
         self.wait()?;
         allocator.free_command_buffers();
 
@@ -673,6 +742,54 @@ impl RenderGraph {
         if push.is_empty() {
             return Ok(());
         }
+
+        let mut resolved;
+        let push = match push.source {
+            None => push,
+            Some(source) => {
+                let bytes = self.get::<Arc<[u8]>>(&source);
+                if bytes.len() != push.data.len() {
+                    tracing::error!(
+                        %pipeline,
+                        expected = push.data.len(),
+                        got = bytes.len(),
+                        "push constant variable does not hold the number of bytes it was declared with"
+                    );
+                    return Err(vk::Result::ERROR_UNKNOWN);
+                }
+
+                resolved = push.clone();
+                resolved.data = bytes.to_vec();
+                &resolved
+            },
+        };
+
+        // a transient buffer has no address until it is allocated, so the block only gets one
+        // here, over whatever the bytes above left in that range
+        let push = match push.addresses.is_empty() {
+            true => push,
+            false => {
+                let mut patched = push.clone();
+                for (offset, buffer) in push.addresses.iter() {
+                    let address = self.get::<Buffer>(buffer).device_address();
+                    let Some(head) = offset.checked_sub(patched.offset).map(|head| head as usize) else {
+                        continue;
+                    };
+                    let Some(slot) = patched.data.get_mut(head..head + size_of::<vk::DeviceAddress>()) else {
+                        tracing::error!(
+                            %pipeline,
+                            offset,
+                            "a pushed device address does not fit the block it was declared in"
+                        );
+                        return Err(vk::Result::ERROR_UNKNOWN);
+                    };
+                    slot.copy_from_slice(&address.to_ne_bytes());
+                }
+
+                resolved = patched;
+                &resolved
+            },
+        };
 
         let cmd_buf = self.batch()?.clone();
         let layout = self
@@ -777,6 +894,15 @@ impl RenderGraph {
             .map_or([1; 3], |reflection| reflection.local_size)
     }
 
+    fn groups_for(&self, invocations: [u32; 3], pipeline: Option<PipelineId>) -> [u32; 3] {
+        let local_size = pipeline.map_or([1; 3], |pipeline| self.local_size(pipeline));
+        [
+            invocations[0].div_ceil(local_size[0]),
+            invocations[1].div_ceil(local_size[1]),
+            invocations[2].div_ceil(local_size[2]),
+        ]
+    }
+
     fn prepare_dispatch(
         &mut self, pipeline: Option<PipelineId>, push_constants: &PushConstants,
     ) -> Result<(), vk::Result> {
@@ -800,8 +926,8 @@ impl RenderGraph {
         self.record_push_constants(pipeline, push_constants)
     }
 
-    pub fn dump(instructions: &[ir::Instr]) {
-        println!("{}", dump::dump(instructions));
+    pub fn dump(program: &Program) {
+        println!("{}", program.dump());
     }
 
     fn execute_one(
@@ -812,20 +938,43 @@ impl RenderGraph {
             IR::Constant(c) => match c {
                 ir::Constant::I32(v) => self.set_value(value_id, Value::I32(*v)),
                 ir::Constant::U32(v) => self.set_value(value_id, Value::U32(*v)),
+                ir::Constant::Size(v) => self.set_value(value_id, Value::Size(*v)),
                 ir::Constant::Extent2D(v) => self.set_value(value_id, Value::Extent2D(*v)),
                 ir::Constant::Extent3D(v) => self.set_value(value_id, Value::Extent3D(*v)),
                 ir::Constant::Access(v) => self.set_value(value_id, Value::Access(*v)),
                 ir::Constant::ClearValue(v) => self.set_value(value_id, Value::ClearValue(*v)),
             },
-            IR::Array { ty: _, elements } => self.set_value(value_id, Value::Slice(elements.clone())),
+            IR::Variable { .. } => {},
+            IR::Array { elements, .. } => self.set_value(value_id, Value::Slice(elements.clone())),
             IR::Index { array, index } => {
                 let elements = self.get::<Vec<ValueId>>(array);
                 let index = self.get::<u32>(index) as usize;
                 let element = *elements.get(index).ok_or(vk::Result::ERROR_UNKNOWN)?;
                 self.set_value(value_id, Value::Reference(element));
             },
-            IR::ConstructBuffer { buffer, .. } => {
-                self.set_value(value_id, Value::Buffer(*buffer));
+            IR::ConstructBuffer {
+                buffer,
+                size,
+                usage,
+                location,
+                name,
+                ..
+            } => {
+                let buffer = if buffer.is_null() {
+                    allocator.allocate_buffer(&BufferInfo {
+                        size: size.map_or(0, |size| self.get::<usize>(&size) as u64),
+                        usage: *usage,
+                        location: *location,
+                        name: match name {
+                            Some(name) => name.to_string(),
+                            None => format!("transient buffer {value_id}"),
+                        },
+                    })?
+                } else {
+                    *buffer
+                };
+
+                self.set_value(value_id, Value::Buffer(buffer));
             },
             IR::ConstructImage {
                 image,
@@ -842,7 +991,7 @@ impl RenderGraph {
                 initial_layout,
                 name,
             } => {
-                let extent = self.get::<vk::Extent3D>(extent);
+                let extent = extent.map_or_else(vk::Extent3D::default, |extent| self.get::<vk::Extent3D>(&extent));
                 let subresource_range = vk::ImageSubresourceRange {
                     aspect_mask: resource::aspect_mask(*format),
                     base_mip_level: self.get::<u32>(base_level),
@@ -881,13 +1030,10 @@ impl RenderGraph {
                     .with_subresource_range(subresource_range);
                 self.set_value(value_id, Value::ImageAttachment(attachment));
             },
-            IR::AcquireNextImage {
-                swapchain,
-                attachments,
-                present_semaphores,
-            } => {
+            IR::AcquireNextImage { swapchain } => {
+                let handle = self.get::<SwapchainBinding>(swapchain).handle;
                 let acquire_semaphore = allocator.allocate_binary_semaphore()?;
-                let image_index = ctx.acquire_next_image(*swapchain, acquire_semaphore)?;
+                let image_index = ctx.acquire_next_image(handle, acquire_semaphore)?;
 
                 self.current_submit.wait_semas.push(SemaphoreSubmitInfo {
                     semaphore: acquire_semaphore,
@@ -895,15 +1041,27 @@ impl RenderGraph {
                     access: Access::MemoryRW,
                 });
 
-                let elements = self.get::<Vec<ValueId>>(attachments);
-                let element = *elements.get(image_index as usize).ok_or(vk::Result::ERROR_UNKNOWN)?;
-                let present_semaphore = *present_semaphores
+                self.set_value(value_id, Value::U32(image_index));
+            },
+            IR::SwapchainImage { swapchain, acquire, .. } => {
+                let image_index = self.get::<u32>(acquire);
+                let binding = self.get::<SwapchainBinding>(swapchain);
+
+                let attachment = binding
+                    .attachments
+                    .get(image_index as usize)
+                    .ok_or(vk::Result::ERROR_UNKNOWN)?
+                    .clone();
+                let present_semaphore = *binding
+                    .present_semaphores
                     .get(image_index as usize)
                     .ok_or(vk::Result::ERROR_UNKNOWN)?;
-                self.resource_to_swapchain
-                    .insert(element, PresentInfo::new(image_index, *swapchain, present_semaphore));
 
-                self.set_value(value_id, Value::U32(image_index));
+                self.resource_to_swapchain.insert(
+                    *value_id,
+                    PresentInfo::new(image_index, binding.handle, present_semaphore),
+                );
+                self.set_value(value_id, Value::ImageAttachment(attachment));
             },
             IR::Acquire { .. } => todo!(),
             IR::Release {
@@ -975,6 +1133,7 @@ impl RenderGraph {
                 let buffer = self.get::<Buffer>(buffer);
                 let attachment = self.get::<ImageAttachment>(image);
                 let subresource_range = attachment.subresource_range();
+                let region = region.unwrap_or_else(|| BufferImageCopy::whole(attachment.extent()));
 
                 let copy = vk::BufferImageCopy::default()
                     .buffer_offset(region.buffer_offset)
@@ -1153,12 +1312,28 @@ impl RenderGraph {
                     },
                     ir::DispatchSize::Invocations { x, y, z } => {
                         let invocations = [self.get::<u32>(x), self.get::<u32>(y), self.get::<u32>(z)];
-                        let local_size = pipeline.map_or([1; 3], |pipeline| self.local_size(pipeline));
-                        let groups = [
-                            invocations[0].div_ceil(local_size[0]),
-                            invocations[1].div_ceil(local_size[1]),
-                            invocations[2].div_ceil(local_size[2]),
+                        let groups = self.groups_for(invocations, *pipeline);
+                        self.batch()?.dispatch(groups[0], groups[1], groups[2]);
+                    },
+                    ir::DispatchSize::InvocationsPerPixel { image, scale } => {
+                        let extent = self.get::<ImageAttachment>(image).extent();
+                        let scale = ir::DispatchSize::scale(*scale);
+                        let invocations = [
+                            scaled(extent.width as u64, scale[0]),
+                            scaled(extent.height as u64, scale[1]),
+                            scaled(extent.depth as u64, scale[2]),
                         ];
+                        let groups = self.groups_for(invocations, *pipeline);
+                        self.batch()?.dispatch(groups[0], groups[1], groups[2]);
+                    },
+                    ir::DispatchSize::InvocationsPerElement {
+                        buffer,
+                        element_size,
+                        scale,
+                    } => {
+                        let size = self.get::<Buffer>(buffer).size();
+                        let invocations = [scaled(size / element_size.max(&1), f32::from_bits(*scale)), 1, 1];
+                        let groups = self.groups_for(invocations, *pipeline);
                         self.batch()?.dispatch(groups[0], groups[1], groups[2]);
                     },
                     ir::DispatchSize::Indirect { buffer, offset } => {
@@ -1167,6 +1342,12 @@ impl RenderGraph {
                     },
                 }
             },
+            IR::Label { .. }
+            | IR::SelectionMerge { .. }
+            | IR::Branch { .. }
+            | IR::BranchConditional { .. }
+            | IR::Return
+            | IR::Phi { .. } => {},
             IR::MemoryBarrier { src_access, dst_access } => {
                 self.ensure_batch(ctx, allocator)?;
                 let src_access_flags = self.get::<Access>(src_access);

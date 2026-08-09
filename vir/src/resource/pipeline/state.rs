@@ -3,6 +3,8 @@ use std::hash::{Hash, Hasher};
 use ash::vk;
 use bitflags::bitflags;
 
+use crate::ValueId;
+
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct DynamicStateFlags: u32 {
@@ -402,16 +404,43 @@ impl From<BlendPreset> for ColorBlendAttachmentState {
 pub struct PushConstants {
     pub offset: u32,
     pub data: Vec<u8>,
+    pub source: Option<ValueId>,
+    /// Buffers whose device address is patched over `data` when the module runs, at the offsets
+    /// paired with them. A transient buffer has no address until then, so it cannot be written
+    /// into the block up front.
+    pub addresses: Vec<(u32, ValueId)>,
 }
 
 impl PushConstants {
     pub fn is_empty(&self) -> bool { self.data.is_empty() }
 
+    /// Reserves the eight bytes at `offset` for `buffer`'s device address, which is patched in
+    /// when the module runs. Addresses win over whatever else put bytes in that range, so this
+    /// composes with a block that otherwise comes from a variable.
+    pub fn address(&mut self, offset: u32, buffer: ValueId) {
+        // a sourced block is already as wide as the variable declared it
+        if self.source.is_none() {
+            self.write(offset, &[0u8; size_of::<vk::DeviceAddress>()]);
+        }
+        self.addresses.retain(|(at, _)| *at != offset);
+        self.addresses.push((offset, buffer));
+    }
+
     pub fn size(&self) -> u32 { self.data.len() as u32 }
 
     pub fn end(&self) -> u32 { self.offset + self.size() }
 
+    pub fn from_variable(&mut self, offset: u32, size: u32, source: ValueId) {
+        self.offset = offset;
+        self.data = vec![0; size as usize];
+        self.source = Some(source);
+    }
+
     pub fn write(&mut self, offset: u32, bytes: &[u8]) {
+        if self.source.take().is_some() {
+            self.data.clear();
+        }
+
         if self.is_empty() {
             self.offset = offset;
             self.data = bytes.to_vec();
@@ -455,6 +484,15 @@ pub enum StateChange {
     PushConstants {
         offset: u32,
         data: Vec<u8>,
+    },
+    PushConstantsFrom {
+        offset: u32,
+        size: u32,
+        source: ValueId,
+    },
+    PushConstantAddress {
+        offset: u32,
+        buffer: ValueId,
     },
 }
 
@@ -525,6 +563,10 @@ impl PassState {
             },
             StateChange::Depth(depth) => self.depth = depth,
             StateChange::PushConstants { offset, data } => self.push_constants.write(offset, &data),
+            StateChange::PushConstantsFrom { offset, size, source } => {
+                self.push_constants.from_variable(offset, size, source)
+            },
+            StateChange::PushConstantAddress { offset, buffer } => self.push_constants.address(offset, buffer),
         }
     }
 

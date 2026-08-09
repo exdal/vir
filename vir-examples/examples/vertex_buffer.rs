@@ -152,9 +152,9 @@ impl Example for VertexBuffer {
 
         let target = frame.module.clear(frame.swapchain_image, BACKGROUND);
 
-        let quad = frame.module.import_buffer(&self.quad);
-        let quad_indices = frame.module.import_buffer(&self.quad_indices);
-        let spinning = frame.module.import_buffer(&spinning_buffer);
+        let quad = frame.module.import_buffer(&self.quad, vir::Access::HostWrite);
+        let quad_indices = frame.module.import_buffer(&self.quad_indices, vir::Access::HostWrite);
+        let spinning = frame.module.import_buffer(&spinning_buffer, vir::Access::HostWrite);
         frame.module.set_name(quad, "quad vertices");
         frame.module.set_name(quad_indices, "quad indices");
         frame.module.set_name(spinning, "spinning triangle");

@@ -1,9 +1,14 @@
-//! Rendering into an offscreen target and letting the graph move it to the swapchain.
+//! A render graph compiled once and re-run every frame.
 //!
-//! Each frame is a chain: clear and draw into a persistent offscreen target, blit that into a
-//! downscaled image the graph owns for the frame, then blit that onto the swapchain. It declares
-//! no barriers or layouts; the graph reads those off the accesses. The offscreen target outlives
-//! the frame, so it is released back into its resting layout and added as a second frame root.
+//! The offscreen pass is a `Program` built in `new`: it clears and draws into a persistent
+//! target, blits that through a downscaled intermediate the graph owns for the frame, and
+//! releases the target into its resting layout. Nothing about it is rebuilt per frame — the
+//! clear colour, the intermediate's size and the pushed block are variables the program reads
+//! when it runs, and whether to clear at all is a branch on a variable rather than a Rust
+//! `if` around the builder.
+//!
+//! The frame itself only blits that target onto the swapchain, which is what the harness's
+//! per-frame module does alongside the UI.
 
 use ash::vk;
 use vir::{
@@ -14,13 +19,16 @@ use vir::{
     DomainFlag,
     ImageAttachment,
     ImageInfo,
+    Module,
     PersistentAllocator,
     PipelineId,
+    Program,
     RasterizationState,
     Rect2D,
     RenderGraph,
     ValueId,
     allocator::Allocator,
+    clear,
 };
 use vir_examples::{Example, Frame, Setup, graphics_pipeline};
 
@@ -39,9 +47,19 @@ struct PushConstants {
     tint: f32,
 }
 
+/// The compiled offscreen pass and the slots the frame writes into it.
+struct Pass {
+    program: Program,
+    clear_color: ValueId,
+    animate: ValueId,
+    scratch_extent: ValueId,
+    push: ValueId,
+}
+
 struct Offscreen {
     pipeline: PipelineId,
     target: Option<ImageAttachment>,
+    pass: Option<Pass>,
     ui: UiState,
 }
 
@@ -77,6 +95,68 @@ fn rainbow(hue: f32) -> ClearValue {
     ClearValue::rgba_f32(r, g, b, 1.0)
 }
 
+impl Offscreen {
+    /// Records the offscreen pass once. Everything that changes between frames is a variable
+    /// the compiled program reads when it runs, so this is not called again until the
+    /// swapchain is remade and the target it draws into is a different image.
+    fn compile_pass(target: &ImageAttachment, pipeline: PipelineId) -> Pass {
+        let mut module = Module::default();
+
+        let clear_color = module.declare_clear_var("clear color", clear::f32::BLACK);
+        let animate = module.declare_bool_var("animate clear", true);
+        let scratch_extent = module.declare_extent_3d_var("scratch extent", target.extent());
+        let push = module.declare_bytes_var("triangle push block", size_of::<PushConstants>() as u32);
+
+        let attachment = module.import_attachment(target);
+        module.set_name(attachment, "offscreen");
+
+        // which colour to clear to is a branch rather than a Rust `if`, so turning the
+        // animation off does not mean compiling a second graph
+        let attachment = module.set_condition(
+            animate,
+            |m| m.clear_from(attachment, clear_color),
+            |m| m.clear(attachment, clear::f32::BLACK),
+        );
+
+        let attachment = module
+            .begin_rendering(&[attachment])
+            .with_name("offscreen triangle")
+            .bind_graphics_pipeline(pipeline)
+            .set_viewport(0, Rect2D::framebuffer())
+            .set_scissor(0, Rect2D::framebuffer())
+            .broadcast_color_blend(BlendPreset::Off)
+            .set_rasterization(RasterizationState {
+                cull_mode: vk::CullModeFlags::NONE,
+                ..Default::default()
+            })
+            .push_constants_from(push)
+            .draw(3, 1)
+            .end_rendering();
+
+        // down and back up again through an image the graph owns for the frame, which is where
+        // the pixelation comes from; the intermediate is sized by a variable
+        let info = ImageInfo::color_target(vk::Extent2D::default(), target.format())
+            .with_usage(vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST)
+            .with_extent3d(target.extent())
+            .with_name("downscaled scratch");
+        let scratch = module.transient_image(&info);
+        let scratch = module.blit(attachment, scratch);
+        let attachment = module.blit(scratch, attachment);
+
+        let ready = module.release(attachment, RESTING_ACCESS, DomainFlag::Graphics);
+        let program = module.compile(ready);
+        vir_examples::dump_ir("offscreen", &program);
+
+        Pass {
+            program,
+            clear_color,
+            animate,
+            scratch_extent,
+            push,
+        }
+    }
+}
+
 impl Example for Offscreen {
     const TITLE: &'static str = "vir: offscreen";
 
@@ -84,6 +164,7 @@ impl Example for Offscreen {
         let mut this = Self {
             pipeline: graphics_pipeline(setup.graph, VERT_SPV, FRAG_SPV)?,
             target: None,
+            pass: None,
             ui: UiState::default(),
         };
         this.resize(setup)?;
@@ -91,7 +172,6 @@ impl Example for Offscreen {
         Ok(this)
     }
 
-    /// The offscreen target matches the swapchain, so it is thrown away and remade with it.
     fn resize(&mut self, setup: &mut Setup) -> Result<(), vk::Result> {
         if let Some(previous) = self.target.take() {
             unsafe { setup.ctx.device().device_wait_idle() }?;
@@ -122,9 +202,11 @@ impl Example for Offscreen {
             &mut AllocatorKind::Persistent(setup.allocator),
         )?;
 
-        self.target = Some(attachment.with_layout(RESTING_ACCESS.into()));
+        let attachment = attachment.with_layout(RESTING_ACCESS.into());
+        self.pass = Some(Self::compile_pass(&attachment, self.pipeline));
+        self.target = Some(attachment);
 
-        Ok(()) 
+        Ok(())
     }
 
     fn ui(&mut self, ctx: &egui::Context) {
@@ -132,7 +214,10 @@ impl Example for Offscreen {
             .default_pos([24.0, 24.0])
             .default_size([300.0, 180.0])
             .show(ctx, |ui| {
-                ui.label("Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.");
+                ui.label(
+                    "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut \
+                     labore et dolore magna aliqua.",
+                );
                 ui.checkbox(&mut self.ui.animate_clear, "animate the clear");
                 ui.add(egui::Slider::new(&mut self.ui.downscale, 1..=16).text("downscale"));
                 ui.separator();
@@ -144,56 +229,40 @@ impl Example for Offscreen {
 
     fn render(&mut self, frame: &mut Frame) -> Result<ValueId, vk::Result> {
         let offscreen = self.target.as_ref().ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+        let pass = self.pass.as_mut().ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+
+        // the whole of this frame's offscreen work is four writes into an already compiled
+        // program, with no graph rebuilt and no pipeline recompiled
         let extent = offscreen.extent();
-        let format = offscreen.format();
-
-        let attachment = frame.module.import_attachment(offscreen);
-        frame.module.set_name(attachment, "offscreen");
-
-        let hue = if self.ui.animate_clear {
-            frame.elapsed * 0.2
-        } else {
-            0.0
-        };
-        let attachment = frame.module.clear(attachment, rainbow(hue));
-
-        let attachment = frame
-            .module
-            .begin_rendering(&[attachment])
-            .with_name("offscreen triangle")
-            .bind_graphics_pipeline(self.pipeline)
-            .set_viewport(0, Rect2D::framebuffer())
-            .set_scissor(0, Rect2D::framebuffer())
-            .broadcast_color_blend(BlendPreset::Off)
-            .set_rasterization(RasterizationState {
-                cull_mode: vk::CullModeFlags::NONE,
-                ..Default::default()
-            })
-            .push_constants(&PushConstants {
+        pass.program.set(pass.animate, self.ui.animate_clear);
+        pass.program.set(pass.clear_color, rainbow(frame.elapsed * 0.2));
+        pass.program.set(
+            pass.scratch_extent,
+            vk::Extent3D {
+                width: (extent.width / self.ui.downscale).max(1),
+                height: (extent.height / self.ui.downscale).max(1),
+                depth: 1,
+            },
+        );
+        pass.program.set_bytes(
+            pass.push,
+            &PushConstants {
                 offset: [0.25 * frame.elapsed.sin(), 0.0],
                 scale: 1.0,
                 tint: 0.0,
-            })
-            .draw(3, 1)
-            .end_rendering();
+            },
+        );
 
-        // the graph owns this one for as long as the two blits need it
-        let scaled = vk::Extent2D {
-            width: (extent.width / self.ui.downscale).max(1),
-            height: (extent.height / self.ui.downscale).max(1),
-        };
-        let scratch = frame
-            .module
-            .transient_image(&ImageInfo::color_target(scaled, format).with_name("downscaled scratch"));
-        let scratch = frame.module.blit(attachment, scratch);
-        let presented = frame.module.blit(scratch, frame.swapchain_image);
+        frame
+            .graph
+            .execute(frame.ctx, &pass.program, &mut AllocatorKind::Frame(frame.allocator))?;
 
-        // present does not depend on the offscreen target's final layout, so its release is a
-        // root of its own
-        let resting = frame.module.release(attachment, RESTING_ACCESS, DomainFlag::Graphics);
-        frame.add_root(resting);
+        // the program left the target in its resting layout, which is the layout the frame's
+        // own module imports it at
+        let attachment = frame.module.import_attachment(offscreen);
+        frame.module.set_name(attachment, "offscreen");
 
-        Ok(presented)
+        Ok(frame.module.blit(attachment, frame.swapchain_image))
     }
 
     fn destroy(&mut self, _graph: &mut RenderGraph, allocator: &mut PersistentAllocator) {

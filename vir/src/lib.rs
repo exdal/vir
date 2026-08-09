@@ -15,11 +15,14 @@ use ash::vk;
 pub use context::{Access, CommandBuffer, Context, DomainFlag};
 pub use graph::{
     ComputePass,
+    Count,
     DispatchSize,
     IR,
     ImageAttachment,
+    LabelId,
     Module,
     PassCallback,
+    Program,
     RenderGraph,
     RenderPass,
     Value,
@@ -55,6 +58,7 @@ pub use resource::{
     SetLayout,
     StateChange,
     SwapChain,
+    SwapchainBinding,
     TextureBinding,
     TextureId,
     VertexAttribute,

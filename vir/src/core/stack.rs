@@ -1,26 +1,41 @@
-use std::cell::Cell;
+use std::{
+    alloc::{Layout, alloc_zeroed, dealloc, handle_alloc_error},
+    cell::Cell,
+    ptr::NonNull,
+};
 
-const STACK_SIZE: usize = 1 * 1024 * 1024; // 1 MiB
+const STACK_SIZE: usize = 1024 * 1024; // 1 MiB
+const STACK_ALIGN: usize = 16;
 
 struct ThreadStack {
-    data: Box<[u8]>,
+    data: NonNull<u8>,
     ptr: Cell<usize>,
 }
 
 impl ThreadStack {
+    fn layout() -> Layout { Layout::from_size_align(STACK_SIZE, STACK_ALIGN).unwrap() }
+
     fn new() -> Self {
+        let layout = Self::layout();
+        let data = unsafe { alloc_zeroed(layout) };
         Self {
-            data: vec![0u8; STACK_SIZE].into_boxed_slice(),
+            data: NonNull::new(data).unwrap_or_else(|| handle_alloc_error(layout)),
             ptr: Cell::new(0),
         }
     }
 
     fn alloc(&self, size: usize, align: usize) -> *mut u8 {
-        let offset = self.ptr.get();
-        let aligned = (offset + align - 1) & !(align - 1);
-        self.ptr.set(aligned + size);
-        unsafe { self.data.as_ptr().add(aligned) as *mut u8 }
+        assert!(align <= STACK_ALIGN, "alignment {align} exceeds stack alignment");
+        let aligned = (self.ptr.get() + align - 1) & !(align - 1);
+        let end = aligned.checked_add(size).expect("stack allocation overflowed");
+        assert!(end <= STACK_SIZE, "thread stack exhausted");
+        self.ptr.set(end);
+        unsafe { self.data.as_ptr().add(aligned) }
     }
+}
+
+impl Drop for ThreadStack {
+    fn drop(&mut self) { unsafe { dealloc(self.data.as_ptr(), Self::layout()) } }
 }
 
 thread_local! {
@@ -39,8 +54,10 @@ impl ScopedStack {
 
     pub fn alloc<T>(&self) -> *mut T { STACK.with(|s| s.alloc(size_of::<T>(), align_of::<T>()) as *mut T) }
 
+    #[expect(clippy::mut_from_ref)]
     pub fn alloc_slice<T>(&self, count: usize) -> &mut [T] {
-        let ptr = STACK.with(|s| s.alloc(size_of::<T>() * count, align_of::<T>()) as *mut T);
+        let size = size_of::<T>().checked_mul(count).expect("stack allocation overflowed");
+        let ptr = STACK.with(|s| s.alloc(size, align_of::<T>()) as *mut T);
         unsafe { std::slice::from_raw_parts_mut(ptr, count) }
     }
 
@@ -54,6 +71,10 @@ impl ScopedStack {
         }
         out
     }
+}
+
+impl Default for ScopedStack {
+    fn default() -> Self { Self::new() }
 }
 
 impl Drop for ScopedStack {

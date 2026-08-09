@@ -394,7 +394,7 @@ impl Deferred {
             )?;
             buffer.write(0, &data.pixels)?;
 
-            let source = module.import_buffer(&buffer);
+            let source = module.import_buffer(&buffer, vir::Access::HostWrite);
             let destination =
                 module.import_attachment(&ImageAttachment::from_image(&image, vk::ImageLayout::UNDEFINED));
             module.set_name(destination, "material texture");
@@ -635,8 +635,8 @@ impl Example for Deferred {
             .iter()
             .map(|mesh| {
                 (
-                    frame.module.import_buffer(&mesh.vertices),
-                    frame.module.import_buffer(&mesh.indices),
+                    frame.module.import_buffer(&mesh.vertices, vir::Access::HostWrite),
+                    frame.module.import_buffer(&mesh.indices, vir::Access::HostWrite),
                     mesh.index_count,
                     mesh.base_color,
                     mesh.base_color_texture,
@@ -674,7 +674,6 @@ impl Example for Deferred {
             .set_viewport(0, Rect2D::framebuffer())
             .set_scissor(0, Rect2D::framebuffer())
             .broadcast_color_blend(BlendPreset::Off)
-            // what makes the pass a G-buffer fill rather than a race between overlapping draws
             .set_depth(DepthState::less())
             .set_rasterization(RasterizationState {
                 cull_mode: match self.ui.cull_backfaces {
