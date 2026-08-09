@@ -1,5 +1,8 @@
 use core::fmt;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use ash::vk;
 use bitflags::Flags;
@@ -14,6 +17,7 @@ use crate::{
     DomainFlag,
     DynamicValues,
     Image,
+    MemoryLocation,
     PipelineId,
     PipelineState,
     PushConstants,
@@ -45,6 +49,7 @@ pub enum Type {
 pub enum Constant {
     I32(i32),
     U32(u32),
+    Size(usize),
     Extent2D(vk::Extent2D),
     Extent3D(vk::Extent3D),
     Access(Access),
@@ -61,14 +66,35 @@ pub enum VariableKind {
     ClearValue,
     Bytes(u32),
     Swapchain,
+    Buffer,
+    ImageAttachment,
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub enum DispatchSize {
-    Groups { x: ValueId, y: ValueId, z: ValueId },
-    Invocations { x: ValueId, y: ValueId, z: ValueId },
-    InvocationsPerPixel { image: ValueId, scale: [u32; 3] },
-    Indirect { buffer: ValueId, offset: u64 },
+    Groups {
+        x: ValueId,
+        y: ValueId,
+        z: ValueId,
+    },
+    Invocations {
+        x: ValueId,
+        y: ValueId,
+        z: ValueId,
+    },
+    InvocationsPerPixel {
+        image: ValueId,
+        scale: [u32; 3],
+    },
+    InvocationsPerElement {
+        buffer: ValueId,
+        element_size: u64,
+        scale: u32,
+    },
+    Indirect {
+        buffer: ValueId,
+        offset: u64,
+    },
 }
 
 pub fn scaled(count: u64, scale: f32) -> u32 {
@@ -90,6 +116,14 @@ impl DispatchSize {
         Self::InvocationsPerPixel {
             image,
             scale: scale.map(f32::to_bits),
+        }
+    }
+
+    pub fn per_element(buffer: ValueId, element_size: u64, scale: f32) -> Self {
+        Self::InvocationsPerElement {
+            buffer,
+            element_size,
+            scale: scale.to_bits(),
         }
     }
 
@@ -116,14 +150,17 @@ pub enum IR {
 
     ConstructBuffer {
         buffer: Buffer,
-        size: ValueId,
+        size: Option<ValueId>,
+        usage: vk::BufferUsageFlags,
+        location: MemoryLocation,
+        initial_access: Access,
         name: Name,
     },
     ConstructImage {
         image: Image,
         image_view: vk::ImageView,
         view_type: vk::ImageViewType,
-        extent: ValueId,
+        extent: Option<ValueId>,
         format: vk::Format,
         samples: vk::SampleCountFlags,
         base_level: ValueId,
@@ -171,7 +208,7 @@ pub enum IR {
     CopyBufferToImage {
         buffer: ValueId,
         image: ValueId,
-        region: BufferImageCopy,
+        region: Option<BufferImageCopy>,
     },
 
     BeginRendering {
@@ -256,7 +293,6 @@ pub enum IR {
         true_label: LabelId,
         false_label: LabelId,
     },
-    /// Ends a block that control does not leave, and with it the program.
     Return,
     Phi {
         incoming: Vec<(ValueId, LabelId)>,
@@ -279,11 +315,7 @@ pub enum UnderlyingObject {
     Base,
     /// The instruction passes the same resource on through this operand.
     Forwards(ValueId),
-    /// The instruction names several resources that share a description, and this is a
-    /// representative one. Good for reading a shared name or format off an attachment
-    /// array, never for identity: which element it is is only known at execute time.
     Element(ValueId),
-    /// Not a resource.
     None,
 }
 
@@ -349,14 +381,22 @@ pub fn underlying_object(ir: &IR) -> UnderlyingObject {
 #[derive(Default)]
 pub struct Symbols<'a> {
     values: HashMap<ValueId, &'a IR>,
+    bound: HashSet<ValueId>,
 }
 
 impl<'a> Symbols<'a> {
-    pub fn new(instructions: &'a [Instr]) -> Self {
+    pub fn new(instructions: &'a [Instr]) -> Self { Self::with_bound(instructions, std::iter::empty()) }
+
+    pub fn with_bound(instructions: &'a [Instr], bound: impl IntoIterator<Item = ValueId>) -> Self {
         Self {
             values: instructions.iter().map(|(id, ir)| (*id, ir)).collect(),
+            bound: bound.into_iter().collect(),
         }
     }
+
+    /// Whether the resource constructed here is one a slot fills in, rather than one the graph
+    /// allocates or one whose handle was written into it.
+    fn is_bound(&self, id: ValueId) -> bool { self.bound.contains(&id) }
 
     fn get(&self, id: ValueId) -> Option<&'a IR> { self.values.get(&id).copied() }
 
@@ -412,7 +452,7 @@ impl<'a> Symbols<'a> {
             return None;
         };
 
-        match self.constant(*extent)? {
+        match self.constant((*extent)?)? {
             Constant::Extent3D(extent) => Some(*extent),
             _ => None,
         }
@@ -448,12 +488,13 @@ impl fmt::Display for Operand<'_> {
 }
 
 pub struct Printer<'a> {
+    id: ValueId,
     ir: &'a IR,
     program: &'a Symbols<'a>,
 }
 
 impl fmt::Display for Printer<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { self.ir.fmt_with(f, self.program) }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { self.ir.fmt_with(f, self.program, self.id) }
 }
 
 fn fmt_flags<F: Flags>(value: F) -> String {
@@ -611,12 +652,15 @@ impl fmt::Display for Constant {
                 1 => write!(f, "{}x{}", e.width, e.height),
                 depth => write!(f, "{}x{}x{depth}", e.width, e.height),
             },
+            Constant::Size(v) => write!(f, "{v}"),
         }
     }
 }
 
 impl IR {
-    pub fn display<'a>(&'a self, program: &'a Symbols<'a>) -> Printer<'a> { Printer { ir: self, program } }
+    pub fn display<'a>(&'a self, program: &'a Symbols<'a>, id: ValueId) -> Printer<'a> {
+        Printer { id, ir: self, program }
+    }
 
     pub fn draw_state(&self) -> Option<String> {
         let (state, dynamic) = match self {
@@ -660,7 +704,7 @@ impl IR {
         Some(parts.join(" "))
     }
 
-    fn fmt_with(&self, f: &mut fmt::Formatter<'_>, p: &Symbols<'_>) -> fmt::Result {
+    fn fmt_with(&self, f: &mut fmt::Formatter<'_>, p: &Symbols<'_>, id: ValueId) -> fmt::Result {
         match self {
             IR::Type(ty) => match ty {
                 Type::Image { format, samples } => {
@@ -674,13 +718,26 @@ impl IR {
                 write!(f, "array [{}]", fmt_list(elements, |id| p.operand(*id).to_string()))
             },
             IR::Index { array, index } => write!(f, "index {}[{}]", p.operand(*array), p.operand(*index)),
-            IR::ConstructBuffer { buffer, size, name } => write!(
-                f,
-                "buffer{} size={} handle={:?}",
-                fmt_name(name),
-                p.operand(*size),
-                buffer.handle()
-            ),
+            IR::ConstructBuffer {
+                buffer,
+                size,
+                usage,
+                location,
+                initial_access,
+                name,
+            } => {
+                write!(f, "buffer{}", fmt_name(name))?;
+                if let Some(size) = size {
+                    write!(f, " size={}", p.operand(*size))?;
+                }
+                write!(f, " usage={usage:?} {location:?} resting={initial_access:?}")?;
+
+                match (p.is_bound(id), buffer.is_null()) {
+                    (true, _) => write!(f, " bound"),
+                    (false, true) => write!(f, " transient"),
+                    (false, false) => write!(f, " handle={:?}", buffer.handle()),
+                }
+            },
             IR::ConstructImage {
                 image,
                 image_view,
@@ -696,7 +753,11 @@ impl IR {
                 initial_layout,
                 name,
             } => {
-                write!(f, "image{} {} {format:?}", fmt_name(name), p.operand(*extent))?;
+                write!(f, "image{}", fmt_name(name))?;
+                if let Some(extent) = extent {
+                    write!(f, " {}", p.operand(*extent))?;
+                }
+                write!(f, " {format:?}")?;
                 if *samples != vk::SampleCountFlags::TYPE_1 {
                     write!(f, " samples={}", fmt_samples(*samples))?;
                 }
@@ -721,9 +782,10 @@ impl IR {
                 }
                 write!(f, " usage={} layout={}", fmt_usage(*usage), fmt_layout(*initial_layout))?;
 
-                match image.is_null() {
-                    true => write!(f, " transient"),
-                    false => write!(f, " handle={:?} view={image_view:?}", image.handle()),
+                match (p.is_bound(id), image.is_null()) {
+                    (true, _) => write!(f, " bound"),
+                    (false, true) => write!(f, " transient"),
+                    (false, false) => write!(f, " handle={:?} view={image_view:?}", image.handle()),
                 }
             },
             IR::AcquireNextImage { swapchain } => {
@@ -778,9 +840,17 @@ impl IR {
             IR::CopyBufferToImage { buffer, image, region } => {
                 write!(
                     f,
-                    "copy_buffer_to_image {} -> {} buffer_offset={} image={},{} {}x{}",
+                    "copy_buffer_to_image {} -> {}",
                     p.operand(*buffer),
-                    p.operand(*image),
+                    p.operand(*image)
+                )?;
+
+                let Some(region) = region else {
+                    return write!(f, " whole");
+                };
+                write!(
+                    f,
+                    " buffer_offset={} image={},{} {}x{}",
                     region.buffer_offset,
                     region.image_offset.x,
                     region.image_offset.y,
@@ -883,6 +953,13 @@ impl IR {
                         offset + size,
                         p.operand(*source)
                     ),
+                    StateChange::PushConstantAddress { offset, buffer } => write!(
+                        f,
+                        "push_constants[{}..{}]=address {}",
+                        offset,
+                        offset + size_of::<vk::DeviceAddress>() as u32,
+                        p.operand(*buffer)
+                    ),
                 }
             },
             IR::Draw {
@@ -967,6 +1044,20 @@ impl IR {
                             write!(f, " scale=[{}, {}, {}]", scale[0], scale[1], scale[2])?;
                         }
                     },
+                    DispatchSize::InvocationsPerElement {
+                        buffer,
+                        element_size,
+                        scale,
+                    } => {
+                        write!(
+                            f,
+                            "dispatch invocations_per_element {} element_size={element_size}",
+                            p.operand(*buffer)
+                        )?;
+                        if *scale != 1.0f32.to_bits() {
+                            write!(f, " scale={}", f32::from_bits(*scale))?;
+                        }
+                    },
                     DispatchSize::Indirect { buffer, offset } => {
                         write!(f, "dispatch.indirect {}", p.operand(*buffer))?;
                         if *offset != 0 {
@@ -1029,5 +1120,5 @@ fn fmt_pipeline(pipeline: &Option<PipelineId>) -> String {
 }
 
 impl fmt::Display for IR {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { self.fmt_with(f, &Symbols::default()) }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { self.fmt_with(f, &Symbols::default(), ValueId(0)) }
 }

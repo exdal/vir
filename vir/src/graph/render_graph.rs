@@ -10,6 +10,8 @@ use crate::{
     Access,
     AllocatorKind,
     Buffer,
+    BufferImageCopy,
+    BufferInfo,
     ClearValue,
     CommandBuffer,
     ComputePipelineInfo,
@@ -502,7 +504,7 @@ impl RenderGraph {
         Ok(())
     }
 
-    fn reset(&mut self, program: &Program) {
+    fn reset(&mut self, program: &Program) -> Result<(), vk::Result> {
         let instructions = program.instructions();
         let value_count = instructions.iter().map(|(id, _)| id.0 as usize + 1).max().unwrap_or(0);
 
@@ -518,6 +520,15 @@ impl RenderGraph {
             }
         }
 
+        for (resource, variable) in program.bound_variables() {
+            if matches!(variable.value, Value::None) {
+                tracing::error!(%resource, name = ?variable.name, "nothing was bound to this slot");
+                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+            }
+
+            self.set_value(&resource, variable.value.clone());
+        }
+
         self.bound_pipeline = None;
         self.bound_layout = None;
         self.render_area = vk::Rect2D::default();
@@ -530,6 +541,8 @@ impl RenderGraph {
         self.presents.clear();
         self.resource_to_swapchain.clear();
         self.timeline_signals.clear();
+
+        Ok(())
     }
 
     fn set_value(&mut self, value_id: &ValueId, value: Value) {
@@ -601,7 +614,7 @@ impl RenderGraph {
         let instructions = program.instructions();
         self.construct_pipelines(instructions)?;
         self.update_descriptors();
-        self.reset(program);
+        self.reset(program)?;
 
         let mut pc = 0;
         let mut block = None;
@@ -630,6 +643,8 @@ impl RenderGraph {
                     continue;
                 },
                 IR::Return => break,
+                // a bound resource was placed by reset, there is nothing here to allocate
+                IR::ConstructBuffer { .. } | IR::ConstructImage { .. } if program.bound(value_id).is_some() => {},
                 IR::Phi { incoming, .. } => {
                     let chosen = incoming
                         .iter()
@@ -728,7 +743,7 @@ impl RenderGraph {
             return Ok(());
         }
 
-        let sourced;
+        let mut resolved;
         let push = match push.source {
             None => push,
             Some(source) => {
@@ -743,12 +758,36 @@ impl RenderGraph {
                     return Err(vk::Result::ERROR_UNKNOWN);
                 }
 
-                sourced = PushConstants {
-                    offset: push.offset,
-                    data: bytes.to_vec(),
-                    source: Some(source),
-                };
-                &sourced
+                resolved = push.clone();
+                resolved.data = bytes.to_vec();
+                &resolved
+            },
+        };
+
+        // a transient buffer has no address until it is allocated, so the block only gets one
+        // here, over whatever the bytes above left in that range
+        let push = match push.addresses.is_empty() {
+            true => push,
+            false => {
+                let mut patched = push.clone();
+                for (offset, buffer) in push.addresses.iter() {
+                    let address = self.get::<Buffer>(buffer).device_address();
+                    let Some(head) = offset.checked_sub(patched.offset).map(|head| head as usize) else {
+                        continue;
+                    };
+                    let Some(slot) = patched.data.get_mut(head..head + size_of::<vk::DeviceAddress>()) else {
+                        tracing::error!(
+                            %pipeline,
+                            offset,
+                            "a pushed device address does not fit the block it was declared in"
+                        );
+                        return Err(vk::Result::ERROR_UNKNOWN);
+                    };
+                    slot.copy_from_slice(&address.to_ne_bytes());
+                }
+
+                resolved = patched;
+                &resolved
             },
         };
 
@@ -899,21 +938,43 @@ impl RenderGraph {
             IR::Constant(c) => match c {
                 ir::Constant::I32(v) => self.set_value(value_id, Value::I32(*v)),
                 ir::Constant::U32(v) => self.set_value(value_id, Value::U32(*v)),
+                ir::Constant::Size(v) => self.set_value(value_id, Value::Size(*v)),
                 ir::Constant::Extent2D(v) => self.set_value(value_id, Value::Extent2D(*v)),
                 ir::Constant::Extent3D(v) => self.set_value(value_id, Value::Extent3D(*v)),
                 ir::Constant::Access(v) => self.set_value(value_id, Value::Access(*v)),
                 ir::Constant::ClearValue(v) => self.set_value(value_id, Value::ClearValue(*v)),
             },
             IR::Variable { .. } => {},
-            IR::Array { ty: _, elements } => self.set_value(value_id, Value::Slice(elements.clone())),
+            IR::Array { elements, .. } => self.set_value(value_id, Value::Slice(elements.clone())),
             IR::Index { array, index } => {
                 let elements = self.get::<Vec<ValueId>>(array);
                 let index = self.get::<u32>(index) as usize;
                 let element = *elements.get(index).ok_or(vk::Result::ERROR_UNKNOWN)?;
                 self.set_value(value_id, Value::Reference(element));
             },
-            IR::ConstructBuffer { buffer, .. } => {
-                self.set_value(value_id, Value::Buffer(*buffer));
+            IR::ConstructBuffer {
+                buffer,
+                size,
+                usage,
+                location,
+                name,
+                ..
+            } => {
+                let buffer = if buffer.is_null() {
+                    allocator.allocate_buffer(&BufferInfo {
+                        size: size.map_or(0, |size| self.get::<usize>(&size) as u64),
+                        usage: *usage,
+                        location: *location,
+                        name: match name {
+                            Some(name) => name.to_string(),
+                            None => format!("transient buffer {value_id}"),
+                        },
+                    })?
+                } else {
+                    *buffer
+                };
+
+                self.set_value(value_id, Value::Buffer(buffer));
             },
             IR::ConstructImage {
                 image,
@@ -930,7 +991,7 @@ impl RenderGraph {
                 initial_layout,
                 name,
             } => {
-                let extent = self.get::<vk::Extent3D>(extent);
+                let extent = extent.map_or_else(vk::Extent3D::default, |extent| self.get::<vk::Extent3D>(&extent));
                 let subresource_range = vk::ImageSubresourceRange {
                     aspect_mask: resource::aspect_mask(*format),
                     base_mip_level: self.get::<u32>(base_level),
@@ -1072,6 +1133,7 @@ impl RenderGraph {
                 let buffer = self.get::<Buffer>(buffer);
                 let attachment = self.get::<ImageAttachment>(image);
                 let subresource_range = attachment.subresource_range();
+                let region = region.unwrap_or_else(|| BufferImageCopy::whole(attachment.extent()));
 
                 let copy = vk::BufferImageCopy::default()
                     .buffer_offset(region.buffer_offset)
@@ -1261,6 +1323,16 @@ impl RenderGraph {
                             scaled(extent.height as u64, scale[1]),
                             scaled(extent.depth as u64, scale[2]),
                         ];
+                        let groups = self.groups_for(invocations, *pipeline);
+                        self.batch()?.dispatch(groups[0], groups[1], groups[2]);
+                    },
+                    ir::DispatchSize::InvocationsPerElement {
+                        buffer,
+                        element_size,
+                        scale,
+                    } => {
+                        let size = self.get::<Buffer>(buffer).size();
+                        let invocations = [scaled(size / element_size.max(&1), f32::from_bits(*scale)), 1, 1];
                         let groups = self.groups_for(invocations, *pipeline);
                         self.batch()?.dispatch(groups[0], groups[1], groups[2]);
                     },

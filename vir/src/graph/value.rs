@@ -30,6 +30,7 @@ pub enum Value {
     Bool(bool),
     I32(i32),
     U32(u32),
+    Size(usize),
     Extent2D(vk::Extent2D),
     Extent3D(vk::Extent3D),
     ImageAttachment(ImageAttachment),
@@ -53,6 +54,8 @@ impl Value {
             Value::ClearValue(_) => Some(VariableKind::ClearValue),
             Value::Bytes(bytes) => Some(VariableKind::Bytes(bytes.len() as u32)),
             Value::Swapchain(_) => Some(VariableKind::Swapchain),
+            Value::Buffer(_) => Some(VariableKind::Buffer),
+            Value::ImageAttachment(_) => Some(VariableKind::ImageAttachment),
             _ => None,
         }
     }
@@ -66,6 +69,9 @@ impl From<i32> for Value {
 }
 impl From<u32> for Value {
     fn from(v: u32) -> Self { Value::U32(v) }
+}
+impl From<usize> for Value {
+    fn from(v: usize) -> Self { Value::Size(v) }
 }
 impl From<vk::Extent2D> for Value {
     fn from(v: vk::Extent2D) -> Self { Value::Extent2D(v) }
@@ -81,6 +87,18 @@ impl From<&[u8]> for Value {
 }
 impl From<SwapchainBinding> for Value {
     fn from(v: SwapchainBinding) -> Self { Value::Swapchain(v) }
+}
+impl From<Buffer> for Value {
+    fn from(v: Buffer) -> Self { Value::Buffer(v) }
+}
+impl From<&Buffer> for Value {
+    fn from(v: &Buffer) -> Self { Value::Buffer(*v) }
+}
+impl From<ImageAttachment> for Value {
+    fn from(v: ImageAttachment) -> Self { Value::ImageAttachment(v) }
+}
+impl From<&ImageAttachment> for Value {
+    fn from(v: &ImageAttachment) -> Self { Value::ImageAttachment(v.clone()) }
 }
 
 pub trait FromValue {
@@ -128,6 +146,15 @@ impl FromValue for u32 {
         match value {
             Value::U32(v) => *v,
             _ => panic!("expected U32, got {:?}", value),
+        }
+    }
+}
+
+impl FromValue for usize {
+    fn from_value(value: &Value) -> Self {
+        match value {
+            Value::Size(v) => *v,
+            _ => panic!("expected Size, got {:?}", value),
         }
     }
 }

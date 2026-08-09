@@ -428,7 +428,7 @@ impl EguiPass {
             };
 
             let index = value_of(module, &mut values, upload.texture, texture);
-            let staging = module.import_buffer(&upload.staging);
+            let staging = module.import_buffer(&upload.staging, vir::Access::HostWrite);
             module.set_name(staging, format!("egui staging {:?}", upload.texture));
             values[index].1 = module.copy_buffer_to_image_region(staging, values[index].1, upload.region);
         }
@@ -441,8 +441,8 @@ impl EguiPass {
         }
 
         let geometry = (!frame.draws.is_empty()).then(|| {
-            let vertices = module.import_buffer(&frame.vertices);
-            let indices = module.import_buffer(&frame.indices);
+            let vertices = module.import_buffer(&frame.vertices, vir::Access::HostWrite);
+            let indices = module.import_buffer(&frame.indices, vir::Access::HostWrite);
             module.set_name(vertices, "egui vertices");
             module.set_name(indices, "egui indices");
             (vertices, indices)

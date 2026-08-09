@@ -102,17 +102,17 @@ impl Offscreen {
     fn compile_pass(target: &ImageAttachment, pipeline: PipelineId) -> Pass {
         let mut module = Module::default();
 
-        let clear_color = module.variable_clear("clear color", clear::f32::BLACK);
-        let animate = module.variable_bool("animate clear", true);
-        let scratch_extent = module.variable_extent_3d("scratch extent", target.extent());
-        let push = module.variable_bytes("triangle push block", size_of::<PushConstants>() as u32);
+        let clear_color = module.declare_clear_var("clear color", clear::f32::BLACK);
+        let animate = module.declare_bool_var("animate clear", true);
+        let scratch_extent = module.declare_extent_3d_var("scratch extent", target.extent());
+        let push = module.declare_bytes_var("triangle push block", size_of::<PushConstants>() as u32);
 
         let attachment = module.import_attachment(target);
         module.set_name(attachment, "offscreen");
 
         // which colour to clear to is a branch rather than a Rust `if`, so turning the
         // animation off does not mean compiling a second graph
-        let attachment = module.if_else(
+        let attachment = module.set_condition(
             animate,
             |m| m.clear_from(attachment, clear_color),
             |m| m.clear(attachment, clear::f32::BLACK),
@@ -137,15 +137,18 @@ impl Offscreen {
         // the pixelation comes from; the intermediate is sized by a variable
         let info = ImageInfo::color_target(vk::Extent2D::default(), target.format())
             .with_usage(vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST)
+            .with_extent3d(target.extent())
             .with_name("downscaled scratch");
-        let scratch = module.transient_image_sized(&info, scratch_extent);
+        let scratch = module.transient_image(&info);
         let scratch = module.blit(attachment, scratch);
         let attachment = module.blit(scratch, attachment);
 
         let ready = module.release(attachment, RESTING_ACCESS, DomainFlag::Graphics);
+        let program = module.compile(ready);
+        vir_examples::dump_ir("offscreen", &program);
 
         Pass {
-            program: module.compile(ready),
+            program,
             clear_color,
             animate,
             scratch_extent,

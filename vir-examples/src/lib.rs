@@ -10,7 +10,14 @@ pub mod device_builder;
 pub mod egui_pass;
 mod window;
 
-use std::{error::Error, io::Cursor, result::Result, time::Instant};
+use std::{
+    collections::HashSet,
+    error::Error,
+    io::Cursor,
+    result::Result,
+    sync::{LazyLock, Mutex},
+    time::Instant,
+};
 
 use ash::{Entry, khr, vk};
 pub use egui;
@@ -61,6 +68,23 @@ pub fn graphics_pipeline(graph: &mut RenderGraph, vertex: &[u8], fragment: &[u8]
             .with_shader(&read_spirv(vertex))
             .with_shader(&read_spirv(fragment)),
     )
+}
+
+/// Prints `program` under `VIR_DUMP_IR`, once per `name`. The harness dumps the frame's own
+/// module, which holds nothing an example compiled ahead of time and runs itself: such a program
+/// is dumped by asking for it here.
+pub fn dump_ir(name: &str, program: &vir::Program) {
+    static DUMPED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Mutex::default);
+
+    if std::env::var_os("VIR_DUMP_IR").is_none() {
+        return;
+    }
+
+    let mut dumped = DUMPED.lock().expect("the dumped set should not be poisoned");
+    if dumped.insert(name.to_owned()) {
+        println!("; program \"{name}\"");
+        RenderGraph::dump(program);
+    }
 }
 
 /// What the swapchain currently looks like, which is what any target an example renders into
@@ -408,9 +432,7 @@ impl<E: Example> App<E> {
         // the first frame egui produces is the font atlas upload with nothing drawn yet, which
         // is not the one worth looking at
         if !self.dumped_ir && egui_frame.draw_count() > 0 {
-            if std::env::var_os("VIR_DUMP_IR").is_some() {
-                RenderGraph::dump(&executable);
-            }
+            dump_ir("frame", &executable);
             self.dumped_ir = true;
         }
 

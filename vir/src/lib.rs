@@ -15,6 +15,7 @@ use ash::vk;
 pub use context::{Access, CommandBuffer, Context, DomainFlag};
 pub use graph::{
     ComputePass,
+    Count,
     DispatchSize,
     IR,
     ImageAttachment,

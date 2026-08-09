@@ -1,9 +1,12 @@
 use std::fmt::Write;
 
-use crate::graph::ir::{IR, Instr, Symbols};
+use crate::{
+    ValueId,
+    graph::ir::{IR, Instr, Symbols},
+};
 
-pub fn dump(instructions: &[Instr]) -> String {
-    let program = Symbols::new(instructions);
+pub fn dump(instructions: &[Instr], bound: impl IntoIterator<Item = ValueId>) -> String {
+    let program = Symbols::with_bound(instructions, bound);
     let width = instructions
         .iter()
         .map(|(id, _)| id.to_string().len())
@@ -32,7 +35,7 @@ pub fn dump(instructions: &[Instr]) -> String {
             IR::Type(_) | IR::Constant(_) => continue,
             IR::BeginRendering { .. } | IR::BeginCompute { .. } => {
                 blank_line(&mut out);
-                let _ = writeln!(out, "{}; Pass {}", indent(block + region), pass_header(&program, ir));
+                let _ = writeln!(out, ";{} Pass {}", indent(block + region), pass_header(&program, ir));
             },
             IR::EndRendering { .. } | IR::EndCompute { .. } => region = region.saturating_sub(1),
             IR::Label { .. } => {
@@ -44,9 +47,14 @@ pub fn dump(instructions: &[Instr]) -> String {
         }
 
         let indent = indent(block + region);
-        let _ = writeln!(out, "{:>width$} = {indent}{}", id.to_string(), ir.display(&program));
+        let _ = writeln!(
+            out,
+            "{:>width$} = {indent}{}",
+            id.to_string(),
+            ir.display(&program, *id)
+        );
         if let Some(state) = ir.draw_state() {
-            let _ = writeln!(out, "{:width$}   {indent}  ; {state}", "");
+            let _ = writeln!(out, ";{:width$}   {indent}   {state}", "");
         }
 
         match ir {
@@ -151,7 +159,11 @@ mod tests {
     #[test]
     fn a_named_pass_heads_the_region_it_opened() {
         let dump = dump_of_one_pass();
-        assert!(dump.contains("; Pass \"triangle\" -> \"target\" 64x32"), "{dump}");
+        assert!(
+            dump.lines()
+                .any(|line| line.starts_with(';') && line.contains("Pass \"triangle\" -> \"target\" 64x32")),
+            "{dump}"
+        );
     }
 
     #[test]
@@ -183,12 +195,12 @@ mod tests {
             .end_compute();
 
         let dump = module.compile(end).dump();
-        assert!(dump.contains("; Pass \"blur\" -> \"storage\" 64x32"), "{dump}");
+        assert!(dump.contains("Pass \"blur\" -> \"storage\" 64x32"), "{dump}");
         assert!(
             dump.contains("  dispatch groups_x=8 groups_y=4 groups_z=1 pipeline=#0"),
             "{dump}"
         );
-        assert!(dump.contains("; push_constants=[0..4]"), "{dump}");
+        assert!(dump.contains("push_constants=[0..4]"), "{dump}");
         assert!(dump.contains("end_compute"), "{dump}");
     }
 
@@ -212,9 +224,9 @@ mod tests {
         });
         module.set_name(target, "target");
 
-        let animate = module.variable_bool("animate", true);
-        let color = module.variable_clear("hue", crate::clear::f32::BLACK);
-        let cleared = module.if_else(animate, |m| m.clear_from(target, color), |_| target);
+        let animate = module.declare_bool_var("animate", true);
+        let color = module.declare_clear_var("hue", crate::clear::f32::BLACK);
+        let cleared = module.set_condition(animate, |m| m.clear_from(target, color), |_| target);
         let end = module.release(cleared, crate::Access::BlitRead, crate::DomainFlag::Graphics);
 
         let dump = module.compile(end).dump();

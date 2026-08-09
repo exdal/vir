@@ -369,6 +369,43 @@ impl From<Access> for vk::ImageLayout {
     }
 }
 
+impl From<Access> for vk::BufferUsageFlags {
+    fn from(access: Access) -> Self {
+        let mut usage = vk::BufferUsageFlags::empty();
+
+        if access.intersects(Access::MemoryRW | Access::FragmentRW | Access::ComputeRW | Access::RayTracingRW) {
+            usage |= vk::BufferUsageFlags::STORAGE_BUFFER;
+        }
+        if access.intersects(
+            Access::MemoryRW
+                | Access::ComputeUniformRead
+                | Access::VertexUniformRead
+                | Access::FragmentUniformRead
+                | Access::TessellationUniformRead
+                | Access::RayTracingUniformRead,
+        ) {
+            usage |= vk::BufferUsageFlags::UNIFORM_BUFFER;
+        }
+        if access.intersects(Access::MemoryRW | Access::AttributeRead) {
+            usage |= vk::BufferUsageFlags::VERTEX_BUFFER;
+        }
+        if access.intersects(Access::MemoryRW | Access::IndexRead) {
+            usage |= vk::BufferUsageFlags::INDEX_BUFFER;
+        }
+        if access.intersects(Access::MemoryRW | Access::IndirectRead) {
+            usage |= vk::BufferUsageFlags::INDIRECT_BUFFER;
+        }
+        if access.intersects(Access::MemoryRW | Access::TransferRead) {
+            usage |= vk::BufferUsageFlags::TRANSFER_SRC;
+        }
+        if access.intersects(Access::MemoryRW | Access::TransferWrite) {
+            usage |= vk::BufferUsageFlags::TRANSFER_DST;
+        }
+
+        usage
+    }
+}
+
 impl From<Access> for vk::ImageUsageFlags {
     fn from(access: Access) -> Self {
         let mut usage = vk::ImageUsageFlags::empty();

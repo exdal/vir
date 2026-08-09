@@ -405,10 +405,26 @@ pub struct PushConstants {
     pub offset: u32,
     pub data: Vec<u8>,
     pub source: Option<ValueId>,
+    /// Buffers whose device address is patched over `data` when the module runs, at the offsets
+    /// paired with them. A transient buffer has no address until then, so it cannot be written
+    /// into the block up front.
+    pub addresses: Vec<(u32, ValueId)>,
 }
 
 impl PushConstants {
     pub fn is_empty(&self) -> bool { self.data.is_empty() }
+
+    /// Reserves the eight bytes at `offset` for `buffer`'s device address, which is patched in
+    /// when the module runs. Addresses win over whatever else put bytes in that range, so this
+    /// composes with a block that otherwise comes from a variable.
+    pub fn address(&mut self, offset: u32, buffer: ValueId) {
+        // a sourced block is already as wide as the variable declared it
+        if self.source.is_none() {
+            self.write(offset, &[0u8; size_of::<vk::DeviceAddress>()]);
+        }
+        self.addresses.retain(|(at, _)| *at != offset);
+        self.addresses.push((offset, buffer));
+    }
 
     pub fn size(&self) -> u32 { self.data.len() as u32 }
 
@@ -473,6 +489,10 @@ pub enum StateChange {
         offset: u32,
         size: u32,
         source: ValueId,
+    },
+    PushConstantAddress {
+        offset: u32,
+        buffer: ValueId,
     },
 }
 
@@ -546,6 +566,7 @@ impl PassState {
             StateChange::PushConstantsFrom { offset, size, source } => {
                 self.push_constants.from_variable(offset, size, source)
             },
+            StateChange::PushConstantAddress { offset, buffer } => self.push_constants.address(offset, buffer),
         }
     }
 

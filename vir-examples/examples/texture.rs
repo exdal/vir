@@ -133,7 +133,7 @@ impl Example for Texture {
 
         // one module run to completion: the copy, then the release into the resting layout
         let mut module = vir::Module::default();
-        let source = module.import_buffer(&staging);
+        let source = module.import_buffer(&staging, vir::Access::HostWrite);
         let destination = module.import_attachment(&ImageAttachment::from_image(&image, vk::ImageLayout::UNDEFINED));
         module.set_name(source, "texture staging");
         module.set_name(destination, "vir logo");

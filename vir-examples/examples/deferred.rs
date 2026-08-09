@@ -394,7 +394,7 @@ impl Deferred {
             )?;
             buffer.write(0, &data.pixels)?;
 
-            let source = module.import_buffer(&buffer);
+            let source = module.import_buffer(&buffer, vir::Access::HostWrite);
             let destination =
                 module.import_attachment(&ImageAttachment::from_image(&image, vk::ImageLayout::UNDEFINED));
             module.set_name(destination, "material texture");
@@ -635,8 +635,8 @@ impl Example for Deferred {
             .iter()
             .map(|mesh| {
                 (
-                    frame.module.import_buffer(&mesh.vertices),
-                    frame.module.import_buffer(&mesh.indices),
+                    frame.module.import_buffer(&mesh.vertices, vir::Access::HostWrite),
+                    frame.module.import_buffer(&mesh.indices, vir::Access::HostWrite),
                     mesh.index_count,
                     mesh.base_color,
                     mesh.base_color_texture,

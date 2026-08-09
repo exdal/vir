@@ -6,6 +6,7 @@ use crate::{
     Access,
     Buffer,
     BufferImageCopy,
+    BufferInfo,
     ClearValue,
     ColorBlendAttachmentState,
     DepthState,
@@ -16,10 +17,10 @@ use crate::{
     ImageAttachment,
     ImageInfo,
     LabelId,
+    MemoryLocation,
     PassState,
     PipelineId,
     Program,
-    PushConstants,
     RasterizationState,
     Rect2D,
     RenderingState,
@@ -87,8 +88,6 @@ fn name_of(name: &str) -> ir::Name { (!name.is_empty()).then(|| Arc::from(name))
 
 #[derive(Clone, Copy, Default)]
 enum Terminator {
-    /// What a block ends in until it is given a branch. Control does not leave the block,
-    /// so a block is never left without an end for the walk to stop at.
     #[default]
     Return,
     Branch {
@@ -137,8 +136,6 @@ pub struct Module {
 }
 
 impl Default for Module {
-    /// A module always has an entry block, so a program with no branches is one block
-    /// rather than a special case with none.
     fn default() -> Self {
         let entry = LabelId(0);
         Self {
@@ -177,13 +174,13 @@ impl Module {
         id
     }
 
-    pub fn declare_label(&mut self) -> LabelId {
+    fn declare_label(&mut self) -> LabelId {
         let label = LabelId(self.label_count);
         self.label_count += 1;
         label
     }
 
-    pub fn place_label(&mut self, label: LabelId) {
+    fn place_label(&mut self, label: LabelId) {
         if self.blocks.iter().any(|block| block.label == label) {
             tracing::error!(%label, "label is placed more than once");
             return;
@@ -196,11 +193,9 @@ impl Module {
         self.current_block = Some(label);
     }
 
-    pub fn branch(&mut self, target: LabelId) { self.terminate(Terminator::Branch { target }) }
+    fn branch(&mut self, target: LabelId) { self.terminate(Terminator::Branch { target }) }
 
-    pub fn branch_conditional(
-        &mut self, condition: ValueId, merge: LabelId, true_label: LabelId, false_label: LabelId,
-    ) {
+    fn branch_conditional(&mut self, condition: ValueId, merge: LabelId, true_label: LabelId, false_label: LabelId) {
         self.terminate(Terminator::BranchConditional {
             condition,
             merge,
@@ -217,13 +212,13 @@ impl Module {
         }
     }
 
-    pub fn phi(&mut self, incoming: &[(ValueId, LabelId)]) -> ValueId {
+    fn phi(&mut self, incoming: &[(ValueId, LabelId)]) -> ValueId {
         self.emit(IR::Phi {
             incoming: incoming.to_vec(),
         })
     }
 
-    pub fn if_else(
+    pub fn set_condition(
         &mut self, condition: ValueId, then: impl FnOnce(&mut Module) -> ValueId,
         otherwise: impl FnOnce(&mut Module) -> ValueId,
     ) -> ValueId {
@@ -245,7 +240,7 @@ impl Module {
         self.phi(&[(taken, true_label), (skipped, false_label)])
     }
 
-    fn declare_variable(&mut self, kind: ir::VariableKind, name: &str, value: Value) -> ValueId {
+    fn declare_var(&mut self, kind: ir::VariableKind, name: &str, value: Value) -> ValueId {
         let slot = self.variables.len() as u32;
         let name: ir::Name = Some(Arc::from(name));
         let id = self.emit(IR::Variable {
@@ -253,38 +248,98 @@ impl Module {
             kind,
             name: name.clone(),
         });
-        self.variables.push(Variable { kind, name, value });
+        self.variables.push(Variable {
+            kind,
+            name,
+            value,
+            resource: None,
+        });
         self.variable_ids.push(id);
         id
     }
 
-    pub fn variable_bool(&mut self, name: &str, default: bool) -> ValueId {
-        self.declare_variable(ir::VariableKind::Bool, name, Value::Bool(default))
+    fn declare_resource_var(&mut self, kind: ir::VariableKind, name: &str, resource: ValueId) -> ValueId {
+        self.variables.push(Variable {
+            kind,
+            name: name_of(name),
+            value: Value::None,
+            resource: Some(resource),
+        });
+        self.variable_ids.push(resource);
+        resource
     }
 
-    pub fn variable_i32(&mut self, name: &str, default: i32) -> ValueId {
-        self.declare_variable(ir::VariableKind::I32, name, Value::I32(default))
+    pub fn declare_buffer_var(&mut self, name: &str, access: Access) -> ValueId {
+        self.lower_type(ir::Type::Buffer);
+        let resource = self.emit(IR::ConstructBuffer {
+            buffer: Buffer::default(),
+            size: None,
+            usage: vk::BufferUsageFlags::empty(),
+            location: MemoryLocation::Unknown,
+            initial_access: access,
+            name: name_of(name),
+        });
+
+        self.declare_resource_var(ir::VariableKind::Buffer, name, resource)
     }
 
-    pub fn variable_u32(&mut self, name: &str, default: u32) -> ValueId {
-        self.declare_variable(ir::VariableKind::U32, name, Value::U32(default))
+    pub fn declare_image_var(
+        &mut self, name: &str, format: vk::Format, samples: vk::SampleCountFlags, layout: vk::ImageLayout,
+    ) -> ValueId {
+        let base_level = self.lower_u32(0);
+        let level_count = self.lower_u32(1);
+        let base_layer = self.lower_u32(0);
+        let layer_count = self.lower_u32(1);
+        self.lower_type(ir::Type::Image { format, samples });
+
+        let resource = self.emit(IR::ConstructImage {
+            image: Image::default(),
+            image_view: vk::ImageView::null(),
+            view_type: vk::ImageViewType::TYPE_2D,
+            extent: None,
+            format,
+            samples,
+            base_level,
+            level_count,
+            base_layer,
+            layer_count,
+            usage: vk::ImageUsageFlags::empty(),
+            initial_layout: layout,
+            name: name_of(name),
+        });
+
+        self.declare_resource_var(ir::VariableKind::ImageAttachment, name, resource)
     }
 
-    pub fn variable_extent_2d(&mut self, name: &str, default: vk::Extent2D) -> ValueId {
-        self.declare_variable(ir::VariableKind::Extent2D, name, Value::Extent2D(default))
+    pub fn constant_u32(&mut self, value: u32) -> ValueId { self.lower_u32(value) }
+
+    pub fn declare_bool_var(&mut self, name: &str, default: bool) -> ValueId {
+        self.declare_var(ir::VariableKind::Bool, name, Value::Bool(default))
     }
 
-    pub fn variable_extent_3d(&mut self, name: &str, default: vk::Extent3D) -> ValueId {
-        self.declare_variable(ir::VariableKind::Extent3D, name, Value::Extent3D(default))
+    pub fn declare_i32_var(&mut self, name: &str, default: i32) -> ValueId {
+        self.declare_var(ir::VariableKind::I32, name, Value::I32(default))
     }
 
-    pub fn variable_clear(&mut self, name: &str, default: ClearValue) -> ValueId {
-        self.declare_variable(ir::VariableKind::ClearValue, name, Value::ClearValue(default))
+    pub fn declare_u32_var(&mut self, name: &str, default: u32) -> ValueId {
+        self.declare_var(ir::VariableKind::U32, name, Value::U32(default))
     }
 
-    pub fn variable_bytes(&mut self, name: &str, size: u32) -> ValueId {
+    pub fn declare_extent_2d_var(&mut self, name: &str, default: vk::Extent2D) -> ValueId {
+        self.declare_var(ir::VariableKind::Extent2D, name, Value::Extent2D(default))
+    }
+
+    pub fn declare_extent_3d_var(&mut self, name: &str, default: vk::Extent3D) -> ValueId {
+        self.declare_var(ir::VariableKind::Extent3D, name, Value::Extent3D(default))
+    }
+
+    pub fn declare_clear_var(&mut self, name: &str, default: ClearValue) -> ValueId {
+        self.declare_var(ir::VariableKind::ClearValue, name, Value::ClearValue(default))
+    }
+
+    pub fn declare_bytes_var(&mut self, name: &str, size: u32) -> ValueId {
         let zeroed = Value::Bytes(vec![0u8; size as usize].into());
-        self.declare_variable(ir::VariableKind::Bytes(size), name, zeroed)
+        self.declare_var(ir::VariableKind::Bytes(size), name, zeroed)
     }
 
     fn lower_type(&mut self, ty: ir::Type) -> ValueId {
@@ -331,7 +386,7 @@ impl Module {
             image: *attachment.image(),
             image_view: attachment.image_view(),
             view_type,
-            extent,
+            extent: Some(extent),
             format: attachment.format(),
             samples: attachment.samples(),
             base_level,
@@ -348,10 +403,6 @@ impl Module {
 
     pub fn transient_image(&mut self, info: &ImageInfo) -> ValueId {
         let extent = self.lower_constant(ir::Constant::Extent3D(info.extent));
-        self.transient_image_sized(info, extent)
-    }
-
-    pub fn transient_image_sized(&mut self, info: &ImageInfo, extent: ValueId) -> ValueId {
         let base_level = self.lower_u32(0);
         let level_count = self.lower_u32(info.mip_levels);
         let base_layer = self.lower_u32(0);
@@ -371,7 +422,7 @@ impl Module {
             image: Image::default(),
             image_view: vk::ImageView::null(),
             view_type,
-            extent,
+            extent: Some(extent),
             format: info.format,
             samples: info.samples,
             base_level,
@@ -392,12 +443,28 @@ impl Module {
         self.lower_image_attachment(attachment, None).1
     }
 
-    pub fn import_buffer(&mut self, buffer: &Buffer) -> ValueId {
+    pub fn transient_buffer(&mut self, info: &BufferInfo) -> ValueId {
+        let size = self.lower_constant(ir::Constant::Size(info.size as usize));
+        self.lower_type(ir::Type::Buffer);
+        self.emit(IR::ConstructBuffer {
+            buffer: Buffer::default(),
+            size: Some(size),
+            usage: info.usage,
+            location: info.location,
+            initial_access: Access::None,
+            name: name_of(&info.name),
+        })
+    }
+
+    pub fn import_buffer(&mut self, buffer: &Buffer, access: Access) -> ValueId {
         self.lower_type(ir::Type::Buffer);
         let size = self.lower_u32(buffer.size() as u32);
         self.emit(IR::ConstructBuffer {
             buffer: *buffer,
-            size,
+            size: Some(size),
+            usage: vk::BufferUsageFlags::empty(),
+            location: MemoryLocation::Unknown,
+            initial_access: access,
             name: None,
         })
     }
@@ -416,8 +483,8 @@ impl Module {
         id
     }
 
-    pub fn variable_swapchain(&mut self, name: &str) -> ValueId {
-        self.declare_variable(
+    pub fn declare_swapchain_var(&mut self, name: &str) -> ValueId {
+        self.declare_var(
             ir::VariableKind::Swapchain,
             name,
             Value::Swapchain(SwapchainBinding::default()),
@@ -438,7 +505,7 @@ impl Module {
     }
 
     pub fn acquire_next_image(&mut self, swapchain: &SwapChain) -> ValueId {
-        let variable = self.variable_swapchain("swapchain");
+        let variable = self.declare_swapchain_var("swapchain");
         if let Some(declared) = self.variables.last_mut() {
             declared.value = Value::Swapchain(SwapchainBinding::from(swapchain));
         }
@@ -466,9 +533,19 @@ impl Module {
     }
 
     pub fn copy_buffer_to_image(&mut self, buffer: ValueId, image: ValueId) -> ValueId {
+        // an image bound to a variable has no extent to read here, so the whole of it is left
+        // for the interpreter to measure off whatever was bound
         let Some(extent) = self.resolve_image(image).and_then(|image| image.extent) else {
-            tracing::warn!(%image, "cannot infer the extent to copy into; the copy is dropped");
-            return image;
+            if !self.is_image(image) {
+                tracing::warn!(%image, "cannot infer the extent to copy into; the copy is dropped");
+                return image;
+            }
+
+            return self.emit(IR::CopyBufferToImage {
+                buffer,
+                image,
+                region: None,
+            });
         };
 
         self.copy_buffer_to_image_region(buffer, image, BufferImageCopy::whole(extent))
@@ -480,7 +557,11 @@ impl Module {
             return image;
         }
 
-        self.emit(IR::CopyBufferToImage { buffer, image, region })
+        self.emit(IR::CopyBufferToImage {
+            buffer,
+            image,
+            region: Some(region),
+        })
     }
 
     pub fn clear(&mut self, attachment: ValueId, color: ClearValue) -> ValueId {
@@ -522,9 +603,7 @@ impl Module {
             name: None,
         });
         RenderPass {
-            module: self,
-            id,
-            begin: id,
+            pass: Pass::begin(self, id),
         }
     }
 
@@ -534,9 +613,7 @@ impl Module {
             name: None,
         });
         ComputePass {
-            module: self,
-            id,
-            begin: id,
+            pass: Pass::begin(self, id),
         }
     }
 
@@ -551,7 +628,7 @@ impl Module {
         let mut synced = hoist_pure(self.sync(linearized, &mut next_id));
         self.infer_usage(&mut synced);
 
-        let slots = self
+        let slots: HashMap<ValueId, u32> = self
             .variable_ids
             .iter()
             .enumerate()
@@ -584,7 +661,7 @@ impl Module {
                         elements.iter().rev().for_each(|v| stack.push(*v));
                     },
                     IR::ConstructBuffer { size, .. } => {
-                        stack.push(*size);
+                        size.iter().for_each(|v| stack.push(*v));
                     },
                     IR::ConstructImage {
                         extent,
@@ -598,7 +675,7 @@ impl Module {
                         stack.push(*base_layer);
                         stack.push(*level_count);
                         stack.push(*base_level);
-                        stack.push(*extent);
+                        extent.iter().for_each(|v| stack.push(*v));
                     },
                     IR::AcquireNextImage { swapchain } => {
                         stack.push(*swapchain);
@@ -645,8 +722,17 @@ impl Module {
                         depth_attachment.iter().for_each(|v| stack.push(*v));
                         color_attachments.iter().rev().for_each(|v| stack.push(*v));
                     },
-                    IR::BindPipeline { pass, .. } | IR::SetState { pass, .. } => {
+                    IR::BindPipeline { pass, .. } => {
                         stack.push(*pass);
+                    },
+                    IR::SetState { pass, change } => {
+                        stack.push(*pass);
+                        match change {
+                            StateChange::PushConstantsFrom { source, .. } => stack.push(*source),
+                            // a transient reached only through its address still has to be built
+                            StateChange::PushConstantAddress { buffer, .. } => stack.push(*buffer),
+                            _ => {},
+                        }
                     },
                     IR::BindVertexBuffers { pass, buffers, .. } => {
                         stack.push(*pass);
@@ -704,7 +790,8 @@ impl Module {
                                 stack.push(*x);
                             },
                             ir::DispatchSize::InvocationsPerPixel { image, .. } => stack.push(*image),
-                            ir::DispatchSize::Indirect { buffer, .. } => stack.push(*buffer),
+                            ir::DispatchSize::InvocationsPerElement { buffer, .. }
+                            | ir::DispatchSize::Indirect { buffer, .. } => stack.push(*buffer),
                         }
                         stack.push(*pass);
                     },
@@ -1000,6 +1087,36 @@ impl Module {
             }};
         }
 
+        // every buffer the host filled rests at the same point, so one constant names it
+        macro_rules! host_write {
+            () => {{
+                match host_write_id {
+                    Some(id) => id,
+                    None => {
+                        let id = emit_access!(Access::HostWrite);
+                        host_write_id = Some(id);
+                        id
+                    },
+                }
+            }};
+        }
+
+        /// The access a buffer rests at until something in the module touches it, which is what
+        /// its first barrier waits on. A buffer the graph allocates for this run rests at
+        /// nothing, since there is no earlier use of it to wait for.
+        macro_rules! resting_access {
+            ($access:expr) => {{
+                let access: Access = $access;
+                match access {
+                    Access::None => no_access_id,
+                    Access::HostWrite => host_write!(),
+                    // a write is never shared, so it stays a barrier point of its own
+                    _ if access.writes() => emit_access!(access),
+                    _ => read_access!(access),
+                }
+            }};
+        }
+
         /// A buffer the host filled is visible to the GPU only after a barrier, and stays
         /// visible until something writes it again, which only a dispatch does today.
         macro_rules! buffer_barrier {
@@ -1008,14 +1125,7 @@ impl Module {
                 let access: Access = $access;
                 let last = match buffer_states.get(&buffer).copied() {
                     Some(id) => id,
-                    None => match host_write_id {
-                        Some(id) => id,
-                        None => {
-                            let id = emit_access!(Access::HostWrite);
-                            host_write_id = Some(id);
-                            id
-                        },
-                    },
+                    None => host_write!(),
                 };
 
                 // a write is never shared, so it always ends up with a barrier of its own
@@ -1024,7 +1134,11 @@ impl Module {
                     false => read_access!(access),
                 };
                 if last != next_id {
-                    emit_memory_barrier!(last, next_id);
+                    // nothing rests at no access, so there is nothing for the first use of a
+                    // buffer the graph just allocated to wait on
+                    if last != no_access_id {
+                        emit_memory_barrier!(last, next_id);
+                    }
                     buffer_states.insert(buffer, next_id);
                 }
             }};
@@ -1111,6 +1225,11 @@ impl Module {
                             access: Access::None,
                         },
                     );
+                },
+
+                IR::ConstructBuffer { initial_access, .. } => {
+                    let id = resting_access!(*initial_access);
+                    buffer_states.insert(value_id, id);
                 },
 
                 IR::Acquire { resource, access } => {
@@ -1244,17 +1363,59 @@ impl Module {
             *usages.entry(self.resource_root(*value)).or_default() |= vk::ImageUsageFlags::from(access);
         }
 
-        for (value_id, ir) in nodes.iter_mut() {
-            let IR::ConstructImage { image, usage, .. } = ir else {
-                continue;
-            };
-            if !image.is_null() {
-                continue;
+        // a buffer's barriers are global, so unlike an image's there is nothing in them naming
+        // the buffer: what a transient buffer is for has to be read off the uses themselves
+        let mut buffer_usages: HashMap<ValueId, vk::BufferUsageFlags> = HashMap::new();
+        let mut used = |buffer: &ValueId, usage: vk::BufferUsageFlags| {
+            *buffer_usages.entry(self.resource_root(*buffer)).or_default() |= usage;
+        };
+        for (_, ir) in nodes.iter() {
+            match ir {
+                IR::CopyBufferToImage { buffer, .. } => used(buffer, vk::BufferUsageFlags::TRANSFER_SRC),
+                IR::BindVertexBuffers { buffers, .. } => buffers
+                    .iter()
+                    .for_each(|b| used(b, vk::BufferUsageFlags::VERTEX_BUFFER)),
+                IR::BindIndexBuffer { buffer, .. } => used(buffer, vk::BufferUsageFlags::INDEX_BUFFER),
+                IR::BeginCompute { resources, .. } => {
+                    for (resource, access) in resources {
+                        if self.is_buffer(*resource) {
+                            used(resource, vk::BufferUsageFlags::from(*access));
+                        }
+                    }
+                },
+                IR::Dispatch {
+                    size: ir::DispatchSize::Indirect { buffer, .. },
+                    ..
+                } => used(buffer, vk::BufferUsageFlags::INDIRECT_BUFFER),
+                // a pushed address is the only thing that says a shader reaches the buffer
+                // through a pointer rather than through a binding. the state changes have not
+                // been folded into the draws and dispatches yet, so this reads them where they
+                // still are
+                IR::SetState {
+                    change: StateChange::PushConstantAddress { buffer, .. },
+                    ..
+                } => used(buffer, vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS),
+                _ => {},
             }
+        }
 
-            *usage |= usages.get(value_id).copied().unwrap_or_default();
-            if usage.is_empty() {
-                tracing::warn!(%value_id, "transient image is never used; it will be created with no usage");
+        // a bound resource is not created here, so what the graph works out it is used for is
+        // recorded rather than acted on: it is what the caller has to have allocated it for
+        for (value_id, ir) in nodes.iter_mut() {
+            match ir {
+                IR::ConstructImage { image, usage, .. } if image.is_null() => {
+                    *usage |= usages.get(value_id).copied().unwrap_or_default();
+                    if usage.is_empty() {
+                        tracing::warn!(%value_id, "transient image is never used; it will be created with no usage");
+                    }
+                },
+                IR::ConstructBuffer { buffer, usage, .. } if buffer.is_null() => {
+                    *usage |= buffer_usages.get(value_id).copied().unwrap_or_default();
+                    if usage.is_empty() {
+                        tracing::warn!(%value_id, "transient buffer is never used; it will be created with no usage");
+                    }
+                },
+                _ => {},
             }
         }
     }
@@ -1301,7 +1462,7 @@ impl Module {
             } => Some(ImageType {
                 format: *format,
                 samples: *samples,
-                extent: match self.instructions.get(extent.0 as usize) {
+                extent: match extent.and_then(|extent| self.instructions.get(extent.0 as usize)) {
                     Some(IR::Constant(ir::Constant::Extent3D(extent))) => Some(*extent),
                     _ => None,
                 },
@@ -1317,6 +1478,14 @@ impl Module {
 
     fn resolve_buffer_size(&self, id: ValueId) -> Option<u64> {
         match self.resolve_resource(id)? {
+            // a transient buffer has no handle to ask, and one sized by a variable or bound to
+            // one has no size to read here at all
+            IR::ConstructBuffer { buffer, size, .. } if buffer.is_null() => {
+                match size.and_then(|size| self.instructions.get(size.0 as usize)) {
+                    Some(IR::Constant(ir::Constant::U32(size))) => Some(*size as u64),
+                    _ => None,
+                }
+            },
             IR::ConstructBuffer { buffer, .. } => Some(buffer.size()),
             _ => None,
         }
@@ -1508,31 +1677,103 @@ impl Module {
     }
 }
 
-pub struct RenderPass<'a> {
+struct Pass<'a> {
     module: &'a mut Module,
     id: ValueId,
     begin: ValueId,
 }
 
-impl RenderPass<'_> {
-    pub fn id(&self) -> ValueId { self.id }
+impl<'a> Pass<'a> {
+    fn begin(module: &'a mut Module, id: ValueId) -> Self { Self { module, id, begin: id } }
 
-    pub fn with_name(self, name: impl Into<Arc<str>>) -> Self {
-        self.module.set_name(self.begin, name);
-        self
-    }
+    fn chain(&mut self, ir: IR) { self.id = self.module.emit(ir); }
 
-    pub fn bind_graphics_pipeline(mut self, pipeline: PipelineId) -> Self {
-        self.id = self.module.emit(IR::BindPipeline {
+    fn set_state(&mut self, change: StateChange) { self.chain(IR::SetState { pass: self.id, change }) }
+
+    fn bind_pipeline(&mut self, pipeline: PipelineId, bind_point: vk::PipelineBindPoint) {
+        self.chain(IR::BindPipeline {
             pass: self.id,
             pipeline,
-            bind_point: vk::PipelineBindPoint::GRAPHICS,
-        });
+            bind_point,
+        })
+    }
+
+    fn push_constant_bytes(&mut self, offset: u32, data: &[u8]) {
+        self.set_state(StateChange::PushConstants {
+            offset,
+            data: data.to_vec(),
+        })
+    }
+
+    fn push_constants_from_at(&mut self, offset: u32, variable: ValueId) {
+        let Some(size) = self.module.variable_bytes_size(variable) else {
+            tracing::error!(%variable, "push constants can only come from a bytes variable");
+            return;
+        };
+
+        self.set_state(StateChange::PushConstantsFrom {
+            offset,
+            size,
+            source: variable,
+        })
+    }
+
+    fn push_constant_address(&mut self, offset: u32, buffer: ValueId) {
+        self.set_state(StateChange::PushConstantAddress { offset, buffer })
+    }
+}
+
+macro_rules! pass_builder {
+    ($pass:ident) => {
+        impl $pass<'_> {
+            pub fn id(&self) -> ValueId { self.pass.id }
+
+            pub fn with_name(self, name: impl Into<Arc<str>>) -> Self {
+                self.pass.module.set_name(self.pass.begin, name);
+                self
+            }
+
+            pub fn push_constants<T: Copy>(self, value: &T) -> Self { self.push_constants_at(0, value) }
+
+            pub fn push_constants_at<T: Copy>(self, offset: u32, value: &T) -> Self {
+                let bytes = unsafe { std::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) };
+                self.push_constant_bytes(offset, bytes)
+            }
+
+            pub fn push_constant_bytes(mut self, offset: u32, data: &[u8]) -> Self {
+                self.pass.push_constant_bytes(offset, data);
+                self
+            }
+
+            pub fn push_constants_from(self, variable: ValueId) -> Self { self.push_constants_from_at(0, variable) }
+
+            pub fn push_constants_from_at(mut self, offset: u32, variable: ValueId) -> Self {
+                self.pass.push_constants_from_at(offset, variable);
+                self
+            }
+
+            pub fn push_constant_address(mut self, offset: u32, buffer: ValueId) -> Self {
+                self.pass.push_constant_address(offset, buffer);
+                self
+            }
+        }
+    };
+}
+
+pub struct RenderPass<'a> {
+    pass: Pass<'a>,
+}
+
+pass_builder!(RenderPass);
+
+impl RenderPass<'_> {
+    pub fn bind_graphics_pipeline(mut self, pipeline: PipelineId) -> Self {
+        self.pass.bind_pipeline(pipeline, vk::PipelineBindPoint::GRAPHICS);
         self
     }
 
     fn set_state(mut self, change: StateChange) -> Self {
-        self.id = self.module.emit(IR::SetState { pass: self.id, change });
+        self.pass.set_state(change);
         self
     }
 
@@ -1547,8 +1788,8 @@ impl RenderPass<'_> {
             "every bound vertex buffer needs an offset"
         );
 
-        self.id = self.module.emit(IR::BindVertexBuffers {
-            pass: self.id,
+        self.pass.chain(IR::BindVertexBuffers {
+            pass: self.pass.id,
             first_binding,
             buffers: buffers.to_vec(),
             offsets: offsets.to_vec(),
@@ -1561,8 +1802,8 @@ impl RenderPass<'_> {
     }
 
     pub fn bind_index_buffer_at(mut self, buffer: ValueId, offset: u64, index_type: vk::IndexType) -> Self {
-        self.id = self.module.emit(IR::BindIndexBuffer {
-            pass: self.id,
+        self.pass.chain(IR::BindIndexBuffer {
+            pass: self.pass.id,
             buffer,
             offset,
             index_type,
@@ -1571,37 +1812,11 @@ impl RenderPass<'_> {
     }
 
     pub fn sample_image(mut self, image: ValueId) -> Self {
-        self.id = self.module.emit(IR::SampleImage { pass: self.id, image });
+        self.pass.chain(IR::SampleImage {
+            pass: self.pass.id,
+            image,
+        });
         self
-    }
-
-    pub fn push_constants<T: Copy>(self, value: &T) -> Self { self.push_constants_at(0, value) }
-
-    pub fn push_constants_at<T: Copy>(self, offset: u32, value: &T) -> Self {
-        let bytes = unsafe { std::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) };
-        self.push_constant_bytes(offset, bytes)
-    }
-
-    pub fn push_constant_bytes(self, offset: u32, data: &[u8]) -> Self {
-        self.set_state(StateChange::PushConstants {
-            offset,
-            data: data.to_vec(),
-        })
-    }
-
-    pub fn push_constants_from(self, variable: ValueId) -> Self { self.push_constants_from_at(0, variable) }
-
-    pub fn push_constants_from_at(self, offset: u32, variable: ValueId) -> Self {
-        let Some(size) = self.module.variable_bytes_size(variable) else {
-            tracing::error!(%variable, "push constants can only come from a bytes variable");
-            return self;
-        };
-
-        self.set_state(StateChange::PushConstantsFrom {
-            offset,
-            size,
-            source: variable,
-        })
     }
 
     pub fn set_primitive_topology(self, topology: vk::PrimitiveTopology) -> Self {
@@ -1641,19 +1856,20 @@ impl RenderPass<'_> {
         })
     }
 
-    pub fn draw(self, vertex_count: u32, instance_count: u32) -> Self {
+    pub fn draw(self, vertex_count: impl Count, instance_count: impl Count) -> Self {
         self.draw_range(vertex_count, instance_count, 0, 0)
     }
 
     pub fn draw_range(
-        mut self, vertex_count: u32, instance_count: u32, first_vertex: u32, first_instance: u32,
+        mut self, vertex_count: impl Count, instance_count: impl Count, first_vertex: impl Count,
+        first_instance: impl Count,
     ) -> Self {
-        let vertex_count = self.module.lower_u32(vertex_count);
-        let instance_count = self.module.lower_u32(instance_count);
-        let first_vertex = self.module.lower_u32(first_vertex);
-        let first_instance = self.module.lower_u32(first_instance);
-        self.id = self.module.emit(IR::Draw {
-            pass: self.id,
+        let vertex_count = vertex_count.lower(self.pass.module);
+        let instance_count = instance_count.lower(self.pass.module);
+        let first_vertex = first_vertex.lower(self.pass.module);
+        let first_instance = first_instance.lower(self.pass.module);
+        self.pass.chain(IR::Draw {
+            pass: self.pass.id,
             vertex_count,
             instance_count,
             first_vertex,
@@ -1665,20 +1881,21 @@ impl RenderPass<'_> {
         self
     }
 
-    pub fn draw_indexed(self, index_count: u32, instance_count: u32) -> Self {
+    pub fn draw_indexed(self, index_count: impl Count, instance_count: impl Count) -> Self {
         self.draw_indexed_range(index_count, instance_count, 0, 0, 0)
     }
 
     pub fn draw_indexed_range(
-        mut self, index_count: u32, instance_count: u32, first_index: u32, vertex_offset: i32, first_instance: u32,
+        mut self, index_count: impl Count, instance_count: impl Count, first_index: impl Count, vertex_offset: i32,
+        first_instance: impl Count,
     ) -> Self {
-        let index_count = self.module.lower_u32(index_count);
-        let instance_count = self.module.lower_u32(instance_count);
-        let first_index = self.module.lower_u32(first_index);
-        let vertex_offset = self.module.lower_i32(vertex_offset);
-        let first_instance = self.module.lower_u32(first_instance);
-        self.id = self.module.emit(IR::DrawIndexed {
-            pass: self.id,
+        let index_count = index_count.lower(self.pass.module);
+        let instance_count = instance_count.lower(self.pass.module);
+        let first_index = first_index.lower(self.pass.module);
+        let vertex_offset = self.pass.module.lower_i32(vertex_offset);
+        let first_instance = first_instance.lower(self.pass.module);
+        self.pass.chain(IR::DrawIndexed {
+            pass: self.pass.id,
             index_count,
             instance_count,
             first_index,
@@ -1691,34 +1908,36 @@ impl RenderPass<'_> {
         self
     }
 
-    pub fn end_rendering(self) -> ValueId { self.module.emit(IR::EndRendering { pass: self.id }) }
+    pub fn end_rendering(self) -> ValueId { self.pass.module.emit(IR::EndRendering { pass: self.pass.id }) }
 }
 
 pub struct ComputePass<'a> {
-    module: &'a mut Module,
-    id: ValueId,
-    begin: ValueId,
+    pass: Pass<'a>,
+}
+
+pass_builder!(ComputePass);
+
+pub trait Count {
+    fn lower(self, module: &mut Module) -> ValueId;
+}
+
+impl Count for u32 {
+    fn lower(self, module: &mut Module) -> ValueId { module.lower_u32(self) }
+}
+
+impl Count for ValueId {
+    fn lower(self, _: &mut Module) -> ValueId { self }
 }
 
 impl ComputePass<'_> {
-    pub fn id(&self) -> ValueId { self.id }
-
-    pub fn with_name(self, name: impl Into<Arc<str>>) -> Self {
-        self.module.set_name(self.begin, name);
-        self
-    }
-
     pub fn bind_pipeline(mut self, pipeline: PipelineId) -> Self {
-        self.id = self.module.emit(IR::BindPipeline {
-            pass: self.id,
-            pipeline,
-            bind_point: vk::PipelineBindPoint::COMPUTE,
-        });
+        self.pass.bind_pipeline(pipeline, vk::PipelineBindPoint::COMPUTE);
         self
     }
 
     pub fn access(self, resource: ValueId, access: Access) -> Self {
-        let Some(IR::BeginCompute { resources, .. }) = self.module.instructions.get_mut(self.begin.0 as usize) else {
+        let begin = self.pass.begin.0 as usize;
+        let Some(IR::BeginCompute { resources, .. }) = self.pass.module.instructions.get_mut(begin) else {
             return self;
         };
 
@@ -1740,48 +1959,9 @@ impl ComputePass<'_> {
 
     pub fn read_uniform(self, buffer: ValueId) -> Self { self.access(buffer, Access::ComputeUniformRead) }
 
-    pub fn push_constants<T: Copy>(self, value: &T) -> Self { self.push_constants_at(0, value) }
-
-    pub fn push_constants_at<T: Copy>(self, offset: u32, value: &T) -> Self {
-        let bytes = unsafe { std::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) };
-        self.push_constant_bytes(offset, bytes)
-    }
-
-    /// Pushes whatever `variable` holds when the program runs, which is how a block that
-    /// changes every frame survives being compiled once.
-    pub fn push_constants_from(self, variable: ValueId) -> Self { self.push_constants_from_at(0, variable) }
-
-    pub fn push_constants_from_at(mut self, offset: u32, variable: ValueId) -> Self {
-        let Some(size) = self.module.variable_bytes_size(variable) else {
-            tracing::error!(%variable, "push constants can only come from a bytes variable");
-            return self;
-        };
-
-        self.id = self.module.emit(IR::SetState {
-            pass: self.id,
-            change: StateChange::PushConstantsFrom {
-                offset,
-                size,
-                source: variable,
-            },
-        });
-        self
-    }
-
-    pub fn push_constant_bytes(mut self, offset: u32, data: &[u8]) -> Self {
-        self.id = self.module.emit(IR::SetState {
-            pass: self.id,
-            change: StateChange::PushConstants {
-                offset,
-                data: data.to_vec(),
-            },
-        });
-        self
-    }
-
     fn dispatch_size(mut self, size: ir::DispatchSize) -> Self {
-        self.id = self.module.emit(IR::Dispatch {
-            pass: self.id,
+        self.pass.chain(IR::Dispatch {
+            pass: self.pass.id,
             size,
             pipeline: None,
             push_constants: Default::default(),
@@ -1789,19 +1969,24 @@ impl ComputePass<'_> {
         self
     }
 
-    pub fn dispatch(self, groups_x: u32, groups_y: u32, groups_z: u32) -> Self {
-        let x = self.module.lower_u32(groups_x);
-        let y = self.module.lower_u32(groups_y);
-        let z = self.module.lower_u32(groups_z);
+    /// Dispatches these group counts. Each axis is a count known now or a value holding one when
+    /// the module runs, in any mix.
+    pub fn dispatch(self, groups_x: impl Count, groups_y: impl Count, groups_z: impl Count) -> Self {
+        let x = groups_x.lower(self.pass.module);
+        let y = groups_y.lower(self.pass.module);
+        let z = groups_z.lower(self.pass.module);
         self.dispatch_size(ir::DispatchSize::Groups { x, y, z })
     }
 
     /// Dispatches at least this many invocations per axis, rounded up to whole workgroups of
-    /// whatever the bound pipeline declares.
-    pub fn dispatch_invocations(self, invocations_x: u32, invocations_y: u32, invocations_z: u32) -> Self {
-        let x = self.module.lower_u32(invocations_x);
-        let y = self.module.lower_u32(invocations_y);
-        let z = self.module.lower_u32(invocations_z);
+    /// whatever the bound pipeline declares. An axis given as a value is counted and rounded up
+    /// when the module runs rather than now.
+    pub fn dispatch_invocations(
+        self, invocations_x: impl Count, invocations_y: impl Count, invocations_z: impl Count,
+    ) -> Self {
+        let x = invocations_x.lower(self.pass.module);
+        let y = invocations_y.lower(self.pass.module);
+        let z = invocations_z.lower(self.pass.module);
         self.dispatch_size(ir::DispatchSize::Invocations { x, y, z })
     }
 
@@ -1814,23 +1999,16 @@ impl ComputePass<'_> {
     /// Dispatches [`Self::dispatch_invocations_per_pixel`] scaled per axis: above one is more
     /// invocations than pixels, below one is fewer. Rounding up to whole workgroups happens after
     /// the scaling.
-    pub fn dispatch_invocations_per_pixel_scaled(mut self, image: ValueId, scale: [f32; 3]) -> Self {
+    pub fn dispatch_invocations_per_pixel_scaled(self, image: ValueId, scale: [f32; 3]) -> Self {
         // an image sized by a variable has no extent to read here, so the count is left for
         // the interpreter to work out from whatever the image was allocated at
-        let Some(extent) = self.module.resolve_image(image).and_then(|image| image.extent) else {
-            if !self.module.is_image(image) {
+        let Some(extent) = self.pass.module.resolve_image(image).and_then(|image| image.extent) else {
+            if !self.pass.module.is_image(image) {
                 tracing::warn!(%image, "cannot infer the extent to dispatch over; the dispatch is dropped");
                 return self;
             }
 
-            let size = ir::DispatchSize::per_pixel(image, scale);
-            self.id = self.module.emit(IR::Dispatch {
-                pass: self.id,
-                size,
-                pipeline: None,
-                push_constants: PushConstants::default(),
-            });
-            return self;
+            return self.dispatch_size(ir::DispatchSize::per_pixel(image, scale));
         };
 
         self.dispatch_invocations(
@@ -1853,9 +2031,16 @@ impl ComputePass<'_> {
             return self;
         }
 
-        let Some(size) = self.module.resolve_buffer_size(buffer) else {
-            tracing::warn!(%buffer, "cannot infer the element count to dispatch over; the dispatch is dropped");
-            return self;
+        // a buffer bound to a variable has no size to read here, so the count is left for the
+        // interpreter to work out from whatever was bound, the same way a per-pixel dispatch
+        // over an image sized at run time is
+        let Some(size) = self.pass.module.resolve_buffer_size(buffer) else {
+            if !self.pass.module.is_buffer(buffer) {
+                tracing::warn!(%buffer, "cannot infer the element count to dispatch over; the dispatch is dropped");
+                return self;
+            }
+
+            return self.dispatch_size(ir::DispatchSize::per_element(buffer, element_size, scale));
         };
 
         self.dispatch_invocations(scaled(size / element_size, scale), 1, 1)
@@ -1868,7 +2053,7 @@ impl ComputePass<'_> {
         self.dispatch_size(ir::DispatchSize::Indirect { buffer, offset })
     }
 
-    pub fn end_compute(self) -> ValueId { self.module.emit(IR::EndCompute { pass: self.id }) }
+    pub fn end_compute(self) -> ValueId { self.pass.module.emit(IR::EndCompute { pass: self.pass.id }) }
 }
 
 #[cfg(test)]
@@ -1877,6 +2062,7 @@ mod tests {
     use crate::{BlendPreset, Image, PipelineState, ResolvedViewport, clear};
 
     const FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
+    const LAYOUT: vk::ImageLayout = vk::ImageLayout::READ_ONLY_OPTIMAL;
     const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
     const WIDTH: u32 = 64;
     const HEIGHT: u32 = 32;
@@ -2144,7 +2330,7 @@ mod tests {
     #[test]
     fn binding_a_vertex_buffer_makes_the_host_write_visible_to_vertex_input() {
         let (mut module, attachment) = module_with_attachment();
-        let buffer = module.import_buffer(&Buffer::default());
+        let buffer = module.import_buffer(&Buffer::default(), Access::HostWrite);
 
         let end = module
             .begin_rendering(&[attachment])
@@ -2181,6 +2367,484 @@ mod tests {
         assert_eq!(draws.len(), 1);
         assert_eq!(draws[0].0, Some(PipelineId(0)));
         assert_eq!(draws[0].1.rendering.color_formats, vec![FORMAT]);
+    }
+
+    /// Nothing declares what a transient buffer is for, so what the graph does with it is what
+    /// it has to be created for.
+    #[test]
+    fn a_transient_buffer_is_created_with_the_usage_the_graph_implies() {
+        let (mut module, attachment) = module_with_attachment();
+        let scratch = module.transient_buffer(&BufferInfo::new(
+            256,
+            vk::BufferUsageFlags::empty(),
+            MemoryLocation::GpuOnly,
+        ));
+
+        let written = module
+            .begin_compute()
+            .bind_pipeline(PipelineId(0))
+            .write(scratch)
+            .push_constant_address(0, scratch)
+            .dispatch(1, 1, 1)
+            .end_compute();
+
+        let end = module
+            .begin_rendering(&[attachment])
+            .bind_graphics_pipeline(PipelineId(0))
+            .bind_vertex_buffer(0, written)
+            .draw(3, 1)
+            .end_rendering();
+
+        let compiled = module.compile(end);
+        let usage = compiled
+            .instructions()
+            .iter()
+            .find_map(|(_, ir)| match ir {
+                IR::ConstructBuffer { buffer, usage, .. } if buffer.is_null() => Some(*usage),
+                _ => None,
+            })
+            .expect("the transient should be constructed");
+
+        assert_eq!(
+            usage,
+            vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                | vk::BufferUsageFlags::VERTEX_BUFFER
+        );
+    }
+
+    /// A buffer the graph allocates for this run has no earlier use to wait on, so its first
+    /// write is not a barrier the way an imported buffer's would be.
+    #[test]
+    fn the_first_write_to_a_transient_buffer_waits_on_nothing() {
+        let mut module = Module::default();
+        let scratch = module.transient_buffer(&BufferInfo::new(
+            256,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            MemoryLocation::GpuOnly,
+        ));
+
+        let written = module
+            .begin_compute()
+            .bind_pipeline(PipelineId(0))
+            .write(scratch)
+            .dispatch(1, 1, 1)
+            .end_compute();
+        let end = module
+            .begin_compute()
+            .bind_pipeline(PipelineId(0))
+            .read(written)
+            .dispatch(1, 1, 1)
+            .end_compute();
+
+        let compiled = module.compile(end);
+        assert_eq!(
+            memory_barriers(&module, &compiled),
+            vec![(Access::ComputeWrite, Access::ComputeRead)]
+        );
+    }
+
+    /// A transient reached only through a pushed address is still a resource the run has to
+    /// allocate, so it has to survive the walk that decides what the program contains.
+    #[test]
+    fn a_transient_reached_only_by_address_is_still_built() {
+        let mut module = Module::default();
+        let scratch = module.transient_buffer(&BufferInfo::new(
+            256,
+            vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+            MemoryLocation::GpuOnly,
+        ));
+
+        let end = module
+            .begin_compute()
+            .bind_pipeline(PipelineId(0))
+            .push_constant_address(0, scratch)
+            .dispatch(1, 1, 1)
+            .end_compute();
+
+        let compiled = module.compile(end);
+        let constructed = compiled
+            .instructions()
+            .iter()
+            .any(|(id, ir)| *id == scratch && matches!(ir, IR::ConstructBuffer { .. }));
+        assert!(constructed);
+    }
+
+    /// A slot names a resource the graph does not own, so what it stands for is a construct
+    /// like any other: one identity, which everything reaching the buffer resolves back to.
+    #[test]
+    fn a_bound_buffer_is_one_resource_the_whole_module_shares() {
+        let mut module = Module::default();
+        let instances = module.declare_buffer_var("instances", Access::HostWrite);
+
+        let written = module
+            .begin_compute()
+            .bind_pipeline(PipelineId(0))
+            .write(instances)
+            .dispatch(1, 1, 1)
+            .end_compute();
+        let end = module
+            .begin_compute()
+            .bind_pipeline(PipelineId(0))
+            .read(written)
+            .dispatch(1, 1, 1)
+            .end_compute();
+
+        let compiled = module.compile(end);
+        assert_eq!(module.resource_root(written), instances);
+        assert_eq!(module.resource_root(end), instances);
+        assert_eq!(
+            compiled
+                .instructions()
+                .iter()
+                .filter(|(_, ir)| matches!(ir, IR::ConstructBuffer { .. }))
+                .count(),
+            1,
+            "{}",
+            compiled.dump()
+        );
+    }
+
+    /// Nothing about a bound buffer is read off a handle, so the ordering the graph works out
+    /// is the same as for one it owns. Only the first barrier differs: a bound buffer rests
+    /// wherever the caller promised, and a host write has to be made visible.
+    #[test]
+    fn a_bound_buffer_waits_at_the_access_it_was_declared_to_rest_at() {
+        let mut module = Module::default();
+        let instances = module.declare_buffer_var("instances", Access::HostWrite);
+
+        let written = module
+            .begin_compute()
+            .bind_pipeline(PipelineId(0))
+            .write(instances)
+            .dispatch(1, 1, 1)
+            .end_compute();
+        let end = module
+            .begin_compute()
+            .bind_pipeline(PipelineId(0))
+            .read(written)
+            .dispatch(1, 1, 1)
+            .end_compute();
+
+        let compiled = module.compile(end);
+        assert_eq!(
+            memory_barriers(&module, &compiled),
+            vec![
+                (Access::HostWrite, Access::ComputeWrite),
+                (Access::ComputeWrite, Access::ComputeRead),
+            ]
+        );
+    }
+
+    /// The caller allocates a bound buffer, so the usage the graph works out is not acted on
+    /// here. It is still worked out, since it is what the caller had to have allocated for.
+    #[test]
+    fn a_bound_buffer_records_the_usage_the_graph_implies() {
+        let (mut module, attachment) = module_with_attachment();
+        let vertices = module.declare_buffer_var("vertices", Access::HostWrite);
+
+        let written = module
+            .begin_compute()
+            .bind_pipeline(PipelineId(0))
+            .write(vertices)
+            .push_constant_address(0, vertices)
+            .dispatch(1, 1, 1)
+            .end_compute();
+
+        let end = module
+            .begin_rendering(&[attachment])
+            .bind_graphics_pipeline(PipelineId(0))
+            .bind_vertex_buffer(0, written)
+            .draw(3, 1)
+            .end_rendering();
+
+        let compiled = module.compile(end);
+        let usage = compiled
+            .instructions()
+            .iter()
+            .find_map(|(id, ir)| match ir {
+                IR::ConstructBuffer { usage, .. } if *id == vertices => Some(*usage),
+                _ => None,
+            })
+            .expect("the bound buffer should be constructed");
+
+        assert_eq!(
+            usage,
+            vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                | vk::BufferUsageFlags::VERTEX_BUFFER
+        );
+    }
+
+    /// A pipeline outlives the run it was compiled in, and a bound image is not measured until
+    /// one is bound, so framebuffer-relative state cannot be folded into a draw.
+    #[test]
+    fn a_bound_image_leaves_the_viewport_to_be_recorded() {
+        let mut module = Module::default();
+        let target = module.declare_image_var("target", FORMAT, vk::SampleCountFlags::TYPE_1, LAYOUT);
+
+        let end = module
+            .begin_rendering(&[target])
+            .bind_graphics_pipeline(PipelineId(0))
+            .set_viewport(0, Rect2D::framebuffer())
+            .set_dynamic_state(DynamicStateFlags::None)
+            .draw(3, 1)
+            .end_rendering();
+
+        let draws = draws(&module.compile(end));
+        assert_eq!(draws.len(), 1);
+        assert!(draws[0].1.viewports.is_empty(), "{:?}", draws[0].1.viewports);
+        assert!(draws[0].1.dynamic.contains(DynamicStateFlags::Viewport));
+        assert!(draws[0].1.dynamic.contains(DynamicStateFlags::Scissor));
+    }
+
+    /// What a bound image is measured at can wait for the binding, but what it is made of
+    /// cannot: the pipelines a region compiles to are built against its format.
+    #[test]
+    fn a_bound_image_carries_the_format_its_pipelines_are_built_against() {
+        let mut module = Module::default();
+        let target = module.declare_image_var("target", FORMAT, vk::SampleCountFlags::TYPE_1, LAYOUT);
+
+        let end = module
+            .begin_rendering(&[target])
+            .bind_graphics_pipeline(PipelineId(0))
+            .draw(3, 1)
+            .end_rendering();
+
+        let compiled = module.compile(end);
+        let draws = draws(&compiled);
+        assert_eq!(draws.len(), 1);
+        assert_eq!(draws[0].1.rendering.color_formats, vec![FORMAT]);
+
+        // the layout the caller promised is what the region's first transition leaves
+        let barriers = image_barriers(&module, &compiled);
+        assert_eq!(barriers.len(), 1);
+        assert_eq!(barriers[0].resource, target);
+        assert_eq!(barriers[0].old_layout, LAYOUT);
+        assert_eq!(barriers[0].new_layout, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+    }
+
+    /// Neither a bound image's extent nor a bound buffer's size is known until one is bound, so
+    /// a dispatch measured off either is left to be counted when the program runs.
+    #[test]
+    fn a_dispatch_measured_off_a_bound_resource_is_sized_when_it_runs() {
+        let mut module = Module::default();
+        let target = module.declare_image_var("target", FORMAT, vk::SampleCountFlags::TYPE_1, LAYOUT);
+        let elements = module.declare_buffer_var("elements", Access::HostWrite);
+
+        let painted = module
+            .begin_compute()
+            .bind_pipeline(PipelineId(0))
+            .write(target)
+            .dispatch_invocations_per_pixel(target)
+            .end_compute();
+        let end = module
+            .begin_compute()
+            .bind_pipeline(PipelineId(0))
+            .write(elements)
+            .read(painted)
+            .dispatch_invocations_per_element(elements, 16)
+            .end_compute();
+
+        let compiled = module.compile(end);
+        match dispatch_sizes(&compiled).as_slice() {
+            [
+                ir::DispatchSize::InvocationsPerPixel { image, .. },
+                ir::DispatchSize::InvocationsPerElement {
+                    buffer, element_size, ..
+                },
+            ] => {
+                assert_eq!(module.resource_root(*image), target);
+                assert_eq!(module.resource_root(*buffer), elements);
+                assert_eq!(*element_size, 16);
+            },
+            sizes => panic!("expected both dispatches to keep their resource, got {sizes:?}"),
+        }
+    }
+
+    /// A bound resource is neither allocated by the graph nor handed a handle when it is
+    /// declared, so it has to read as neither in a dump.
+    #[test]
+    fn a_bound_resource_reads_as_bound() {
+        let mut module = Module::default();
+        let instances = module.declare_buffer_var("instances", Access::HostWrite);
+
+        let end = module
+            .begin_compute()
+            .bind_pipeline(PipelineId(0))
+            .write(instances)
+            .dispatch(1, 1, 1)
+            .end_compute();
+
+        let dump = module.compile(end).dump();
+        assert!(dump.contains("buffer \"instances\""), "{dump}");
+        assert!(dump.contains(" bound"), "{dump}");
+        assert!(!dump.contains("transient"), "{dump}");
+    }
+
+    /// The slot is the construct, so what binds a handle to it is the same call that writes
+    /// every other variable.
+    #[test]
+    fn a_handle_reaches_the_slot_that_named_the_resource() {
+        let mut module = Module::default();
+        let instances = module.declare_buffer_var("instances", Access::HostWrite);
+
+        let end = module
+            .begin_compute()
+            .bind_pipeline(PipelineId(0))
+            .write(instances)
+            .dispatch(1, 1, 1)
+            .end_compute();
+
+        let mut compiled = module.compile(end);
+        assert!(matches!(compiled.variables()[0].value, Value::None));
+
+        compiled.set(instances, Buffer::default());
+        assert!(matches!(compiled.variables()[0].value, Value::Buffer(_)));
+        assert_eq!(compiled.variables()[0].resource, Some(instances));
+    }
+
+    #[test]
+    #[should_panic(expected = "was given")]
+    fn binding_the_wrong_kind_to_a_resource_slot_is_rejected() {
+        let mut module = Module::default();
+        let instances = module.declare_buffer_var("instances", Access::HostWrite);
+
+        let end = module
+            .begin_compute()
+            .bind_pipeline(PipelineId(0))
+            .write(instances)
+            .dispatch(1, 1, 1)
+            .end_compute();
+
+        module.compile(end).set(instances, 3u32);
+    }
+
+    /// The formats the pipelines were built for are the graph's to keep, so an image that does
+    /// not match them is refused rather than left to mismatch when the region is recorded.
+    #[test]
+    #[should_panic(expected = "was declared")]
+    fn binding_an_image_of_another_format_is_rejected() {
+        let mut module = Module::default();
+        let target = module.declare_image_var("target", FORMAT, vk::SampleCountFlags::TYPE_1, LAYOUT);
+
+        let end = module
+            .begin_rendering(&[target])
+            .bind_graphics_pipeline(PipelineId(0))
+            .draw(3, 1)
+            .end_rendering();
+
+        let extent = vk::Extent3D::default().width(WIDTH).height(HEIGHT).depth(1);
+        let other = ImageAttachment::new(
+            Image::imported(vk::Image::null(), DEPTH_FORMAT, extent, vk::SampleCountFlags::TYPE_1),
+            DEPTH_FORMAT,
+            extent,
+            vk::SampleCountFlags::TYPE_1,
+            LAYOUT,
+        );
+
+        module.compile(end).set(target, other);
+    }
+
+    /// A module re-run over its own buffers has to wait on what the previous run left them to,
+    /// which the host write an untouched buffer rests at would not cover.
+    #[test]
+    fn an_imported_buffer_waits_at_the_access_it_was_imported_at() {
+        let mut module = Module::default();
+        let buffer = module.import_buffer(&Buffer::default(), Access::AttributeRead);
+
+        let end = module
+            .begin_compute()
+            .bind_pipeline(PipelineId(0))
+            .write(buffer)
+            .dispatch(1, 1, 1)
+            .end_compute();
+
+        let compiled = module.compile(end);
+        assert_eq!(
+            memory_barriers(&module, &compiled),
+            vec![(Access::AttributeRead, Access::ComputeWrite)]
+        );
+    }
+
+    /// Two buffers resting at the same read still share one access constant, so the barrier a
+    /// write needs is not lost to the ids comparing equal.
+    #[test]
+    fn buffers_resting_at_the_same_access_each_still_get_their_barrier() {
+        let mut module = Module::default();
+        let first = module.import_buffer(&Buffer::default(), Access::ComputeRead);
+        let second = module.import_buffer(&Buffer::default(), Access::ComputeRead);
+
+        let end = module
+            .begin_compute()
+            .bind_pipeline(PipelineId(0))
+            .write(first)
+            .write(second)
+            .dispatch(1, 1, 1)
+            .end_compute();
+
+        let compiled = module.compile(end);
+        assert_eq!(
+            memory_barriers(&module, &compiled),
+            vec![
+                (Access::ComputeRead, Access::ComputeWrite),
+                (Access::ComputeRead, Access::ComputeWrite),
+            ]
+        );
+    }
+
+    /// The counts a compiled program runs at are the variables, not what they held while it was
+    /// being recorded.
+    #[test]
+    fn a_dispatch_and_a_draw_can_read_their_counts_from_variables() {
+        let (mut module, attachment) = module_with_attachment();
+        let invocations = module.declare_u32_var("invocations", 0);
+        let vertices = module.declare_u32_var("vertices", 0);
+        let one = module.constant_u32(1);
+
+        let dispatched = module
+            .begin_compute()
+            .bind_pipeline(PipelineId(0))
+            .dispatch_invocations(invocations, one, one)
+            .end_compute();
+
+        let end = module
+            .begin_rendering(&[attachment])
+            .bind_graphics_pipeline(PipelineId(0))
+            .draw(vertices, one)
+            .end_rendering();
+
+        let compiled = module.compile_all(&[dispatched, end]);
+        let sizes = compiled
+            .instructions()
+            .iter()
+            .filter_map(|(_, ir)| match ir {
+                IR::Dispatch { size, .. } => Some(*size),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sizes,
+            vec![ir::DispatchSize::Invocations {
+                x: invocations,
+                y: one,
+                z: one,
+            }]
+        );
+
+        let counts = compiled
+            .instructions()
+            .iter()
+            .filter_map(|(_, ir)| match ir {
+                IR::Draw {
+                    vertex_count,
+                    instance_count,
+                    ..
+                } => Some((*vertex_count, *instance_count)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(counts, vec![(vertices, one)]);
     }
 
     /// A depth attachment reaches the pipeline through the region's rendering state, which is
@@ -2277,7 +2941,7 @@ mod tests {
     #[test]
     fn rebinding_the_same_vertex_buffer_does_not_repeat_the_barrier() {
         let (mut module, attachment) = module_with_attachment();
-        let buffer = module.import_buffer(&Buffer::default());
+        let buffer = module.import_buffer(&Buffer::default(), Access::HostWrite);
 
         let end = module
             .begin_rendering(&[attachment])
@@ -2295,7 +2959,7 @@ mod tests {
     #[test]
     fn binding_an_index_buffer_makes_the_host_write_visible_to_index_input() {
         let (mut module, attachment) = module_with_attachment();
-        let indices = module.import_buffer(&Buffer::default());
+        let indices = module.import_buffer(&Buffer::default(), Access::HostWrite);
 
         let end = module
             .begin_rendering(&[attachment])
@@ -2326,8 +2990,8 @@ mod tests {
     #[test]
     fn vertex_and_index_buffers_each_get_the_barrier_their_stage_needs() {
         let (mut module, attachment) = module_with_attachment();
-        let vertices = module.import_buffer(&Buffer::default());
-        let indices = module.import_buffer(&Buffer::default());
+        let vertices = module.import_buffer(&Buffer::default(), Access::HostWrite);
+        let indices = module.import_buffer(&Buffer::default(), Access::HostWrite);
 
         let end = module
             .begin_rendering(&[attachment])
@@ -2346,7 +3010,7 @@ mod tests {
     #[test]
     fn rebinding_the_same_index_buffer_does_not_repeat_the_barrier() {
         let (mut module, attachment) = module_with_attachment();
-        let indices = module.import_buffer(&Buffer::default());
+        let indices = module.import_buffer(&Buffer::default(), Access::HostWrite);
 
         let end = module
             .begin_rendering(&[attachment])
@@ -2366,7 +3030,7 @@ mod tests {
     fn an_indexed_draw_inherits_the_pipeline_and_state_in_force() {
         let (mut module, attachment) = module_with_attachment();
         let pipeline = PipelineId(0);
-        let indices = module.import_buffer(&Buffer::default());
+        let indices = module.import_buffer(&Buffer::default(), Access::HostWrite);
 
         let end = module
             .begin_rendering(&[attachment])
@@ -2845,7 +3509,7 @@ mod tests {
     #[test]
     fn a_dispatch_per_element_sizes_itself_on_the_x_axis_alone() {
         let mut module = Module::default();
-        let buffer = module.import_buffer(&Buffer::new(vk::Buffer::null(), 800, 0, None));
+        let buffer = module.import_buffer(&Buffer::new(vk::Buffer::null(), 800, 0, None), Access::HostWrite);
 
         let end = module
             .begin_compute()
@@ -2861,7 +3525,7 @@ mod tests {
     #[test]
     fn a_scaled_dispatch_per_element_scales_the_element_count() {
         let mut module = Module::default();
-        let buffer = module.import_buffer(&Buffer::new(vk::Buffer::null(), 800, 0, None));
+        let buffer = module.import_buffer(&Buffer::new(vk::Buffer::null(), 800, 0, None), Access::HostWrite);
 
         let end = module
             .begin_compute()
@@ -2880,7 +3544,7 @@ mod tests {
     fn an_indirect_dispatch_waits_for_the_buffer_of_counts() {
         let mut module = Module::default();
         let image = module.transient_image(&untyped_info());
-        let commands = module.import_buffer(&Buffer::new(vk::Buffer::null(), 12, 0, None));
+        let commands = module.import_buffer(&Buffer::new(vk::Buffer::null(), 12, 0, None), Access::HostWrite);
 
         let end = module
             .begin_compute()
@@ -2909,7 +3573,7 @@ mod tests {
     fn indirect_dispatches_out_of_one_buffer_wait_on_it_once() {
         let mut module = Module::default();
         let image = module.transient_image(&untyped_info());
-        let commands = module.import_buffer(&Buffer::new(vk::Buffer::null(), 24, 0, None));
+        let commands = module.import_buffer(&Buffer::new(vk::Buffer::null(), 24, 0, None), Access::HostWrite);
 
         let end = module
             .begin_compute()
@@ -3016,7 +3680,7 @@ mod tests {
     #[test]
     fn a_buffer_a_dispatch_wrote_is_made_visible_to_the_draw_that_reads_it() {
         let (mut module, attachment) = module_with_attachment();
-        let buffer = module.import_buffer(&Buffer::default());
+        let buffer = module.import_buffer(&Buffer::default(), Access::HostWrite);
 
         let computed = module
             .begin_compute()
@@ -3047,7 +3711,7 @@ mod tests {
     #[test]
     fn a_dispatch_the_draw_binds_the_result_of_stays_outside_the_region() {
         let (mut module, attachment) = module_with_attachment();
-        let buffer = module.import_buffer(&Buffer::default());
+        let buffer = module.import_buffer(&Buffer::default(), Access::HostWrite);
 
         let computed = module
             .begin_compute()
@@ -3091,7 +3755,7 @@ mod tests {
     #[test]
     fn a_copy_waits_for_the_host_write_and_puts_the_image_in_the_transfer_layout() {
         let mut module = Module::default();
-        let staging = module.import_buffer(&Buffer::default());
+        let staging = module.import_buffer(&Buffer::default(), Access::HostWrite);
         let texture = module.transient_image(&untyped_info());
         let end = module.copy_buffer_to_image(staging, texture);
 
@@ -3165,7 +3829,7 @@ mod tests {
     #[test]
     fn an_image_uploaded_and_then_sampled_moves_through_both_layouts_in_order() {
         let (mut module, attachment) = module_with_attachment();
-        let staging = module.import_buffer(&Buffer::default());
+        let staging = module.import_buffer(&Buffer::default(), Access::HostWrite);
         let texture = module.transient_image(&untyped_info());
         let uploaded = module.copy_buffer_to_image(staging, texture);
 
@@ -3198,7 +3862,7 @@ mod tests {
     #[test]
     fn an_uploaded_and_sampled_image_is_created_with_both_usages() {
         let (mut module, attachment) = module_with_attachment();
-        let staging = module.import_buffer(&Buffer::default());
+        let staging = module.import_buffer(&Buffer::default(), Access::HostWrite);
         let texture = module.transient_image(&untyped_info());
         let uploaded = module.copy_buffer_to_image(staging, texture);
 
@@ -3220,7 +3884,7 @@ mod tests {
     #[test]
     fn a_copy_region_overrides_the_extent_the_whole_image_would_have_used() {
         let mut module = Module::default();
-        let staging = module.import_buffer(&Buffer::default());
+        let staging = module.import_buffer(&Buffer::default(), Access::HostWrite);
         let texture = module.transient_image(&untyped_info());
 
         let whole = module.copy_buffer_to_image(staging, texture);
@@ -3235,7 +3899,9 @@ mod tests {
             .instructions()
             .iter()
             .filter_map(|(_, ir)| match ir {
-                IR::CopyBufferToImage { region, .. } => Some((region.image_offset, region.image_extent)),
+                IR::CopyBufferToImage {
+                    region: Some(region), ..
+                } => Some((region.image_offset, region.image_extent)),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -3280,15 +3946,15 @@ mod tests {
         let mut module = Module::default();
         assert_eq!(module.lower_u32(7), module.lower_u32(7));
 
-        let first = module.variable_u32("first", 7);
-        let second = module.variable_u32("second", 7);
+        let first = module.declare_u32_var("first", 7);
+        let second = module.declare_u32_var("second", 7);
         assert_ne!(first, second);
     }
 
     #[test]
     fn setting_a_variable_leaves_the_compiled_instructions_alone() {
         let (mut module, target) = module_with_attachment();
-        let color = module.variable_clear("clear color", clear::f32::BLACK);
+        let color = module.declare_clear_var("clear color", clear::f32::BLACK);
         let cleared = module.clear_from(target, color);
         let end = module.present(cleared);
 
@@ -3310,7 +3976,7 @@ mod tests {
     #[should_panic(expected = "was given")]
     fn setting_a_variable_to_the_wrong_kind_is_rejected() {
         let mut module = Module::default();
-        let color = module.variable_clear("clear color", clear::f32::BLACK);
+        let color = module.declare_clear_var("clear color", clear::f32::BLACK);
         let target = module.transient_image(&transient_info());
         let end = module.clear_from(target, color);
 
@@ -3322,8 +3988,8 @@ mod tests {
     #[test]
     fn an_image_sized_by_a_variable_leaves_the_viewport_to_be_recorded() {
         let mut module = Module::default();
-        let extent = module.variable_extent_3d("size", vk::Extent3D::default().width(8).height(8).depth(1));
-        let target = module.transient_image_sized(&transient_info(), extent);
+        let extent = vk::Extent3D::default().width(8).height(8).depth(1);
+        let target = module.transient_image(&transient_info().with_extent3d(extent));
 
         let end = module
             .begin_rendering(&[target])
@@ -3346,8 +4012,8 @@ mod tests {
     #[test]
     fn a_dispatch_per_pixel_of_a_variable_sized_image_is_sized_when_it_runs() {
         let mut module = Module::default();
-        let extent = module.variable_extent_3d("size", vk::Extent3D::default().width(8).height(8).depth(1));
-        let target = module.transient_image_sized(&transient_info(), extent);
+        let extent = vk::Extent3D::default().width(8).height(8).depth(1);
+        let target = module.transient_image(&transient_info().with_extent3d(extent));
 
         let end = module
             .begin_compute()
@@ -3372,9 +4038,9 @@ mod tests {
     fn module_with_a_conditional_clear() -> (Module, ValueId, ValueId) {
         let (mut module, destination) = module_with_attachment();
         let source = module.transient_image(&transient_info());
-        let animate = module.variable_bool("animate", true);
+        let animate = module.declare_bool_var("animate", true);
 
-        let cleared = module.if_else(animate, |m| m.clear(source, clear::f32::WHITE), |_| source);
+        let cleared = module.set_condition(animate, |m| m.clear(source, clear::f32::WHITE), |_| source);
         let end = module.blit(cleared, destination);
 
         (module, source, end)
@@ -3620,7 +4286,7 @@ mod tests {
     #[test]
     fn push_constants_from_a_variable_reach_the_draw_as_a_variable() {
         let (mut module, target) = module_with_attachment();
-        let block = module.variable_bytes("push block", 16);
+        let block = module.declare_bytes_var("push block", 16);
 
         let end = module
             .begin_rendering(&[target])
@@ -3644,12 +4310,35 @@ mod tests {
         assert_eq!(pushed.offset, 0);
     }
 
+    /// Nothing else in the graph names the block, so the state change pushing it is the only
+    /// thing keeping its variable alive; without it the program runs with an empty slot.
+    #[test]
+    fn a_pushed_block_keeps_its_variable_in_the_program() {
+        let (mut module, target) = module_with_attachment();
+        let block = module.declare_bytes_var("push block", 16);
+
+        let end = module
+            .begin_rendering(&[target])
+            .bind_graphics_pipeline(PipelineId(0))
+            .push_constants_from(block)
+            .draw(3, 1)
+            .end_rendering();
+
+        let compiled = module.compile(end);
+        let declared = compiled
+            .instructions()
+            .iter()
+            .any(|(id, ir)| *id == block && matches!(ir, IR::Variable { .. }));
+
+        assert!(declared, "{}", compiled.dump());
+    }
+
     /// A block cannot be half literal and half variable, so whichever was asked for last is
     /// the whole of it.
     #[test]
     fn writing_bytes_over_a_variable_block_replaces_it() {
         let (mut module, target) = module_with_attachment();
-        let block = module.variable_bytes("push block", 16);
+        let block = module.declare_bytes_var("push block", 16);
 
         let end = module
             .begin_rendering(&[target])
