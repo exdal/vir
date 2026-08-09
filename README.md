@@ -93,7 +93,7 @@ itself only records its pipelines, resources, and passes.
 
 ```toml
 [dependencies]
-vir = { git = "https://github.com/<you>/vir.git", package = "vir" }
+vir = { git = "https://github.com/exdal/vir.git", package = "vir" }
 ```
 
 It brings in `ash`, so you supply the instance, physical device, and logical device (see
