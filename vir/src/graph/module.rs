@@ -18,6 +18,7 @@ use crate::{
     ImageInfo,
     LabelId,
     MemoryLocation,
+    PassCallback,
     PassState,
     PipelineId,
     Program,
@@ -331,6 +332,10 @@ impl Module {
         self.declare_var(ir::VariableKind::ClearValue, name, Value::ClearValue(default))
     }
 
+    pub fn declare_callback_var(&mut self, name: &str) -> ValueId {
+        self.declare_var(ir::VariableKind::Callback, name, Value::Callback(PassCallback::empty()))
+    }
+
     pub fn declare_bytes_var(&mut self, name: &str, size: u32) -> ValueId {
         let zeroed = Value::Bytes(vec![0u8; size as usize].into());
         self.declare_var(ir::VariableKind::Bytes(size), name, zeroed)
@@ -397,6 +402,10 @@ impl Module {
 
     pub fn transient_image(&mut self, info: &ImageInfo) -> ValueId {
         let extent = self.lower_constant(ir::Constant::Extent3D(info.extent));
+        self.transient_image_sized(info, extent)
+    }
+
+    pub fn transient_image_sized(&mut self, info: &ImageInfo, extent: ValueId) -> ValueId {
         let base_level = self.lower_u32(0);
         let level_count = self.lower_u32(info.mip_levels);
         let base_layer = self.lower_u32(0);
@@ -690,10 +699,6 @@ impl Module {
                         stack.push(*access);
                         stack.push(*resource);
                     },
-                    IR::CallOpaque { args, returns, .. } => {
-                        stack.push(*returns);
-                        stack.push(*args);
-                    },
                     IR::Clear { color, attachment } => {
                         stack.push(*color);
                         stack.push(*attachment);
@@ -768,6 +773,10 @@ impl Module {
                         stack.push(*first_index);
                         stack.push(*instance_count);
                         stack.push(*index_count);
+                        stack.push(*pass);
+                    },
+                    IR::CallOpaque { pass, body, .. } => {
+                        stack.push(*body);
                         stack.push(*pass);
                     },
                     IR::EndRendering { pass } => {
@@ -1642,6 +1651,13 @@ impl Module {
                     state,
                     dynamic,
                     ..
+                }
+                | IR::CallOpaque {
+                    pass,
+                    pipeline,
+                    state,
+                    dynamic,
+                    ..
                 } => {
                     if let Some(in_force) = regions.get(pass).cloned() {
                         if in_force.pipeline.is_none() {
@@ -1918,6 +1934,17 @@ impl RenderPass<'_> {
             first_index,
             vertex_offset,
             first_instance,
+            pipeline: None,
+            state: Default::default(),
+            dynamic: Default::default(),
+        });
+        self
+    }
+
+    pub fn record_from(mut self, body: ValueId) -> Self {
+        self.pass.chain(IR::CallOpaque {
+            pass: self.pass.id,
+            body,
             pipeline: None,
             state: Default::default(),
             dynamic: Default::default(),
@@ -2218,6 +2245,119 @@ mod tests {
             Some(IR::Constant(ir::Constant::I32(v))) => *v,
             _ => panic!("{id} is not an i32 constant"),
         }
+    }
+
+    /// The state in force where the body is called is what its pipeline is compiled with, the
+    /// same as a draw's, since the callback records into a region that is already open and
+    /// cannot change any of it.
+    #[test]
+    fn an_opaque_body_is_compiled_with_the_state_in_force_where_it_is_called() {
+        let mut module = Module::default();
+        let target = module.transient_image(&transient_info());
+        let body = module.declare_callback_var("draws");
+
+        let end = module
+            .begin_rendering(&[target])
+            .bind_graphics_pipeline(PipelineId(3))
+            .set_primitive_topology(vk::PrimitiveTopology::TRIANGLE_STRIP)
+            .broadcast_color_blend(BlendPreset::AlphaBlend)
+            .record_from(body)
+            .end_rendering();
+
+        let compiled = module.compile(end);
+        let calls = compiled
+            .instructions()
+            .iter()
+            .filter_map(|(_, ir)| match ir {
+                IR::CallOpaque { pipeline, state, .. } => Some((*pipeline, state.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(calls.len(), 1, "{}", compiled.dump());
+        assert_eq!(calls[0].0, Some(PipelineId(3)));
+        assert_eq!(calls[0].1.topology, vk::PrimitiveTopology::TRIANGLE_STRIP);
+        assert_eq!(calls[0].1.rendering.color_formats, vec![FORMAT]);
+    }
+
+    /// A body records commands and nothing else, so what the region reads has to be declared
+    /// around it. The barrier that puts a sampled image in the layout the body reads it in is
+    /// the whole reason an opaque pass can be trusted.
+    #[test]
+    fn a_region_with_an_opaque_body_still_barriers_what_it_declared() {
+        let (mut module, swapchain) = module_with_attachment();
+        let sampled = module.transient_image(&transient_info());
+        let body = module.declare_callback_var("draws");
+
+        let cleared = module.clear(sampled, clear::f32::BLACK);
+        let drawn = module
+            .begin_rendering(&[swapchain])
+            .bind_graphics_pipeline(PipelineId(0))
+            .sample_image(cleared)
+            .record_from(body)
+            .end_rendering();
+        let end = module.present(drawn);
+
+        let compiled = module.compile(end);
+        let transitions = image_barriers(&module, &compiled)
+            .into_iter()
+            .filter(|barrier| module.resource_root(barrier.resource) == sampled)
+            .map(|barrier| (barrier.old_layout, barrier.new_layout, barrier.dst))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            transitions,
+            vec![
+                (
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    Access::Clear
+                ),
+                (
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    Access::FragmentSampled
+                ),
+            ],
+            "{}",
+            compiled.dump()
+        );
+    }
+
+    /// The body is a variable, which is what makes the compiled program worth keeping: binding
+    /// a different one is a write into it rather than a reason to compile it again.
+    #[test]
+    fn the_body_of_an_opaque_pass_is_a_variable_of_the_program() {
+        let mut module = Module::default();
+        let target = module.transient_image(&transient_info());
+        let body = module.declare_callback_var("draws");
+
+        let end = module
+            .begin_rendering(&[target])
+            .bind_graphics_pipeline(PipelineId(0))
+            .record_from(body)
+            .end_rendering();
+
+        let mut compiled = module.compile(end);
+        assert!(
+            compiled
+                .instructions()
+                .iter()
+                .any(|(id, ir)| *id == body && matches!(ir, IR::Variable { .. })),
+            "the callback variable should survive into the program\n{}",
+            compiled.dump()
+        );
+
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = called.clone();
+        compiled.set(
+            body,
+            PassCallback::new(move |_| flag.store(true, std::sync::atomic::Ordering::Relaxed)),
+        );
+        assert!(
+            !called.load(std::sync::atomic::Ordering::Relaxed),
+            "binding is not calling"
+        );
     }
 
     #[test]
@@ -4035,7 +4175,8 @@ mod tests {
     fn an_image_sized_by_a_variable_leaves_the_viewport_to_be_recorded() {
         let mut module = Module::default();
         let extent = vk::Extent3D::default().width(8).height(8).depth(1);
-        let target = module.transient_image(&transient_info().with_extent3d(extent));
+        let extent = module.declare_extent_3d_var("extent", extent);
+        let target = module.transient_image_sized(&transient_info(), extent);
 
         let end = module
             .begin_rendering(&[target])
@@ -4059,7 +4200,8 @@ mod tests {
     fn a_dispatch_per_pixel_of_a_variable_sized_image_is_sized_when_it_runs() {
         let mut module = Module::default();
         let extent = vk::Extent3D::default().width(8).height(8).depth(1);
-        let target = module.transient_image(&transient_info().with_extent3d(extent));
+        let extent = module.declare_extent_3d_var("extent", extent);
+        let target = module.transient_image_sized(&transient_info(), extent);
 
         let end = module
             .begin_compute()

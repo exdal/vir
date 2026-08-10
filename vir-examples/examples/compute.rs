@@ -9,37 +9,29 @@
 //! declares, the graph works out that the expand waits on the place and the draw's vertex input
 //! waits on the expand.
 //!
-//! All three are a [`Program`] built in `new` and re-run every frame. Neither buffer is in it:
-//! both are slots the graph declares and the frame binds, so the buffer a dispatch writes can be
-//! a different one, of a different length, every frame without anything being compiled again.
-//! What the graph keeps is what it needs to order them, not what they are.
+//! All three are recorded once, into the program the whole frame is compiled from, and re-run
+//! every frame after that. Neither buffer is in it: both are slots the graph declares and the
+//! frame binds, so the buffer a dispatch writes can be a different one, of a different length,
+//! every frame without anything being compiled again. What the graph keeps is what it needs to
+//! order them, not what they are.
 //!
 //! Which is also why the addresses are pushed rather than written: what is bound is not known
 //! until the frame binds it, so the block the host fills leaves those eight bytes to the graph.
 
 use ash::vk;
 use vir::{
-    Access,
-    AllocatorKind,
     BlendPreset,
     BufferInfo,
     ClearValue,
     ComputePipelineInfo,
-    DomainFlag,
-    ImageAttachment,
-    ImageInfo,
     MemoryLocation,
-    Module,
-    PersistentAllocator,
     PipelineId,
-    Program,
     RasterizationState,
     Rect2D,
-    RenderGraph,
     ValueId,
     allocator::Allocator,
 };
-use vir_examples::{Example, Frame, Setup, graphics_pipeline, read_spirv};
+use vir_examples::{Example, Frame, Recording, Setup, graphics_pipeline, read_spirv};
 
 const PLACE_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/compute.place.spv"));
 const EXPAND_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/compute.expand.spv"));
@@ -53,10 +45,6 @@ const WORKGROUP_SIZE: u32 = 64;
 
 /// The top of the slider, and so the largest either transient is ever asked for.
 const MAX_TRIANGLES: u32 = 1024;
-
-/// The frame's last use of the target is a blit onto the swapchain, so that is its resting
-/// layout.
-const RESTING_ACCESS: Access = Access::BlitRead;
 
 /// Bytes `cs_expand` writes per vertex: `float2 position` then `float3 color`, tightly packed.
 const VERTEX_SIZE: u64 = 20;
@@ -96,9 +84,8 @@ struct PushConstants {
     scale: [f32; 2],
 }
 
-/// The compiled graph and the slots the frame writes into it.
-struct Pass {
-    program: Program,
+/// The slots the frame writes into the compiled graph.
+struct Slots {
     triangles: ValueId,
     instances: ValueId,
     vertices: ValueId,
@@ -110,14 +97,53 @@ struct Compute {
     place: PipelineId,
     expand: PipelineId,
     draw: PipelineId,
-    target: Option<ImageAttachment>,
-    pass: Option<Pass>,
+    slots: Option<Slots>,
     ui: UiState,
 }
 
-impl Compute {
-    fn compile_pass(&self, target: &ImageAttachment) -> Pass {
-        let mut module = Module::default();
+struct UiState {
+    count: u32,
+    animate: bool,
+}
+
+impl Default for UiState {
+    fn default() -> Self {
+        Self {
+            count: 96,
+            animate: true,
+        }
+    }
+}
+
+/// Per-axis shrink that keeps the ring round in `target`.
+fn ring_scale(target: vk::Extent2D) -> [f32; 2] {
+    let aspect = target.width.max(1) as f32 / target.height.max(1) as f32;
+    if aspect > 1.0 {
+        [1.0 / aspect, 1.0]
+    } else {
+        [1.0, aspect]
+    }
+}
+
+impl Example for Compute {
+    const TITLE: &'static str = "vir: compute";
+
+    fn new(setup: &mut Setup) -> Result<Self, vk::Result> {
+        Ok(Self {
+            place: setup
+                .graph
+                .declare_compute_pipeline(ComputePipelineInfo::new(&read_spirv(PLACE_SPV)))?,
+            expand: setup
+                .graph
+                .declare_compute_pipeline(ComputePipelineInfo::new(&read_spirv(EXPAND_SPV)))?,
+            draw: graphics_pipeline(setup.graph, VERT_SPV, FRAG_SPV)?,
+            slots: None,
+            ui: UiState::default(),
+        })
+    }
+
+    fn record(&mut self, recording: &mut Recording) -> Result<ValueId, vk::Result> {
+        let module = &mut *recording.module;
 
         let triangles = module.declare_u32_var("triangles", 0);
         let vertex_count = module.declare_u32_var("vertex count", 0);
@@ -151,9 +177,7 @@ impl Compute {
             .dispatch_invocations(triangles, 1, 1)
             .end_compute();
 
-        let attachment = module.import_attachment(target);
-        module.set_name(attachment, "computed geometry");
-        let attachment = module.clear(attachment, BACKGROUND);
+        let attachment = module.clear(recording.swapchain_image, BACKGROUND);
 
         let drawn = module
             .begin_rendering(&[attachment])
@@ -170,101 +194,15 @@ impl Compute {
             .draw(vertex_count, 1)
             .end_rendering();
 
-        let ready = module.release(drawn, RESTING_ACCESS, DomainFlag::Graphics);
-        let program = module.compile(ready);
-        vir_examples::dump_ir("compute", &program);
-
-        Pass {
-            program,
+        self.slots = Some(Slots {
             triangles,
             instances,
             vertices,
             vertex_count,
             push,
-        }
-    }
-}
+        });
 
-struct UiState {
-    count: u32,
-    animate: bool,
-}
-
-impl Default for UiState {
-    fn default() -> Self {
-        Self {
-            count: 96,
-            animate: true,
-        }
-    }
-}
-
-/// Per-axis shrink that keeps the ring round in `target`.
-fn ring_scale(target: vk::Extent2D) -> [f32; 2] {
-    let aspect = target.width.max(1) as f32 / target.height.max(1) as f32;
-    if aspect > 1.0 {
-        [1.0 / aspect, 1.0]
-    } else {
-        [1.0, aspect]
-    }
-}
-
-impl Example for Compute {
-    const TITLE: &'static str = "vir: compute";
-
-    fn new(setup: &mut Setup) -> Result<Self, vk::Result> {
-        let mut this = Self {
-            place: setup
-                .graph
-                .declare_compute_pipeline(ComputePipelineInfo::new(&read_spirv(PLACE_SPV)))?,
-            expand: setup
-                .graph
-                .declare_compute_pipeline(ComputePipelineInfo::new(&read_spirv(EXPAND_SPV)))?,
-            draw: graphics_pipeline(setup.graph, VERT_SPV, FRAG_SPV)?,
-            target: None,
-            pass: None,
-            ui: UiState::default(),
-        };
-        this.resize(setup)?;
-
-        Ok(this)
-    }
-
-    fn resize(&mut self, setup: &mut Setup) -> Result<(), vk::Result> {
-        if let Some(previous) = self.target.take() {
-            unsafe { setup.ctx.device().device_wait_idle() }?;
-            setup.allocator.deallocate_image_view(previous.image_view());
-            setup.allocator.deallocate_image(*previous.image());
-        }
-
-        let info = ImageInfo::color_target(setup.target.extent, setup.target.format)
-            .with_usage(vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST)
-            .with_name("computed geometry");
-        let image = setup.allocator.allocate_image(&info)?;
-        let view = setup.allocator.allocate_image_view(
-            image.handle(),
-            setup.target.format,
-            vk::ImageViewType::TYPE_2D,
-            image.subresource_range(),
-        )?;
-
-        let attachment = ImageAttachment::from_image(&image, vk::ImageLayout::UNDEFINED).with_image_view(view);
-
-        // a module with only the release, enough to put a fresh image into its resting layout
-        let mut module = Module::default();
-        let target = module.import_attachment(&attachment);
-        let ready = module.release(target, RESTING_ACCESS, DomainFlag::Graphics);
-        setup.graph.execute_blocking(
-            setup.ctx,
-            &module.compile(ready),
-            &mut AllocatorKind::Persistent(setup.allocator),
-        )?;
-
-        let attachment = attachment.with_layout(RESTING_ACCESS.into());
-        self.pass = Some(self.compile_pass(&attachment));
-        self.target = Some(attachment);
-
-        Ok(())
+        Ok(drawn)
     }
 
     fn ui(&mut self, ctx: &egui::Context) {
@@ -286,9 +224,10 @@ impl Example for Compute {
             });
     }
 
-    fn render(&mut self, frame: &mut Frame) -> Result<ValueId, vk::Result> {
-        let target = self.target.as_ref().ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
-        let pass = self.pass.as_mut().ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+    fn update(&mut self, frame: &mut Frame) -> Result<(), vk::Result> {
+        let Some(slots) = self.slots.as_ref() else {
+            return Ok(());
+        };
         let count = self.ui.count.min(MAX_TRIANGLES);
 
         let instances = frame.allocator.allocate_buffer(&device_buffer(
@@ -303,12 +242,12 @@ impl Example for Compute {
         ))?;
 
         // the whole of this frame's work is writes into an already compiled program: how big the
-        // two transients have to be, how much of them the dispatches and the draw cover, and the
+        // two buffers have to be, how much of them the dispatches and the draw cover, and the
         // block both dispatches are handed, whose two addresses the graph fills in
-        pass.program.set(pass.triangles, count);
-        pass.program.set(pass.vertex_count, count * 3);
-        pass.program.set_bytes(
-            pass.push,
+        frame.program.set(slots.triangles, count);
+        frame.program.set(slots.vertex_count, count * 3);
+        frame.program.set_bytes(
+            slots.push,
             &PushConstants {
                 count,
                 time: if self.ui.animate { frame.elapsed } else { 0.0 },
@@ -316,26 +255,10 @@ impl Example for Compute {
                 ..Default::default()
             },
         );
-        pass.program.set(pass.instances, instances);
-        pass.program.set(pass.vertices, vertices);
+        frame.program.set(slots.instances, instances);
+        frame.program.set(slots.vertices, vertices);
 
-        frame
-            .graph
-            .execute(frame.ctx, &pass.program, &mut AllocatorKind::Frame(frame.allocator))?;
-
-        // the program left the target in its resting layout, which is the layout the frame's
-        // own module imports it at
-        let attachment = frame.module.import_attachment(target);
-        frame.module.set_name(attachment, "computed geometry");
-
-        Ok(frame.module.blit(attachment, frame.swapchain_image))
-    }
-
-    fn destroy(&mut self, _graph: &mut RenderGraph, allocator: &mut PersistentAllocator) {
-        if let Some(target) = self.target.take() {
-            allocator.deallocate_image_view(target.image_view());
-            allocator.deallocate_image(*target.image());
-        }
+        Ok(())
     }
 }
 
@@ -343,7 +266,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> { vir_examples::run::<Comput
 
 #[cfg(test)]
 mod tests {
-    use vir::{IR, Module, Program, VertexAttribute, VertexLayout, graph::ir, resource::shader};
+    use vir::{Access, IR, ImageInfo, Module, Program, VertexAttribute, VertexLayout, graph::ir, resource::shader};
 
     use super::*;
 

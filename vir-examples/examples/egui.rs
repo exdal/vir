@@ -7,12 +7,15 @@
 
 use ash::vk;
 use vir::{ClearValue, ValueId};
-use vir_examples::{Example, Frame, Setup, egui};
+use vir_examples::{Example, Frame, Recording, Setup, egui};
 
 struct Egui {
     background: [f32; 3],
     text: String,
     counter: i32,
+    /// The colour the compiled clear reads, which is the whole of what this example rebuilds
+    /// per frame.
+    clear_color: Option<ValueId>,
 }
 
 impl Default for Egui {
@@ -21,6 +24,7 @@ impl Default for Egui {
             background: [0.02, 0.02, 0.05],
             text: String::from("the font atlas is a sampled texture, so this text is the upload path"),
             counter: 0,
+            clear_color: None,
         }
     }
 }
@@ -57,17 +61,29 @@ impl Example for Egui {
 
                 ui.separator();
                 if ui.button("reset").clicked() {
-                    *self = Self::default();
+                    let clear_color = self.clear_color;
+                    *self = Self {
+                        clear_color,
+                        ..Self::default()
+                    };
                 }
             });
     }
 
-    fn render(&mut self, frame: &mut Frame) -> Result<ValueId, vk::Result> {
-        let [r, g, b] = self.background;
+    fn record(&mut self, recording: &mut Recording) -> Result<ValueId, vk::Result> {
+        let clear_color = recording.module.declare_clear_var("background", vir::clear::f32::BLACK);
+        self.clear_color = Some(clear_color);
 
-        Ok(frame
-            .module
-            .clear(frame.swapchain_image, ClearValue::rgba_f32(r, g, b, 1.0)))
+        Ok(recording.module.clear_from(recording.swapchain_image, clear_color))
+    }
+
+    fn update(&mut self, frame: &mut Frame) -> Result<(), vk::Result> {
+        let [r, g, b] = self.background;
+        if let Some(clear_color) = self.clear_color {
+            frame.program.set(clear_color, ClearValue::rgba_f32(r, g, b, 1.0));
+        }
+
+        Ok(())
     }
 }
 

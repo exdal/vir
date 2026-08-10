@@ -68,6 +68,7 @@ pub enum VariableKind {
     Swapchain,
     Buffer,
     ImageAttachment,
+    Callback,
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
@@ -191,11 +192,6 @@ pub enum IR {
         dst_domain: DomainFlag,
     },
 
-    CallOpaque {
-        args: ValueId,
-        returns: ValueId,
-        domain: DomainFlag,
-    },
     Clear {
         attachment: ValueId,
         color: ValueId,
@@ -259,6 +255,13 @@ pub enum IR {
         first_index: ValueId,
         vertex_offset: ValueId,
         first_instance: ValueId,
+        pipeline: Option<PipelineId>,
+        state: PipelineState,
+        dynamic: DynamicValues,
+    },
+    CallOpaque {
+        pass: ValueId,
+        body: ValueId,
         pipeline: Option<PipelineId>,
         state: PipelineState,
         dynamic: DynamicValues,
@@ -354,6 +357,7 @@ pub fn underlying_object(ir: &IR) -> UnderlyingObject {
         | IR::SampleImage { pass, .. }
         | IR::Draw { pass, .. }
         | IR::DrawIndexed { pass, .. }
+        | IR::CallOpaque { pass, .. }
         | IR::EndRendering { pass }
         | IR::Dispatch { pass, .. }
         | IR::EndCompute { pass } => UnderlyingObject::Forwards(*pass),
@@ -367,7 +371,6 @@ pub fn underlying_object(ir: &IR) -> UnderlyingObject {
         | IR::Constant(_)
         | IR::Variable { .. }
         | IR::AcquireNextImage { .. }
-        | IR::CallOpaque { .. }
         | IR::Label { .. }
         | IR::SelectionMerge { .. }
         | IR::Branch { .. }
@@ -664,7 +667,9 @@ impl IR {
 
     pub fn draw_state(&self) -> Option<String> {
         let (state, dynamic) = match self {
-            IR::Draw { state, dynamic, .. } | IR::DrawIndexed { state, dynamic, .. } => (state, dynamic),
+            IR::Draw { state, dynamic, .. }
+            | IR::DrawIndexed { state, dynamic, .. }
+            | IR::CallOpaque { state, dynamic, .. } => (state, dynamic),
             IR::Dispatch { push_constants, .. } => {
                 return (!push_constants.is_empty())
                     .then(|| format!("push_constants=[{}..{}]", push_constants.offset, push_constants.end()));
@@ -821,15 +826,6 @@ impl IR {
                 p.operand(*resource),
                 p.operand(*access),
                 fmt_flags(*dst_domain)
-            ),
-            IR::CallOpaque {
-                args, returns, domain, ..
-            } => write!(
-                f,
-                "call.opaque domain={} args={} returns={}",
-                fmt_flags(*domain),
-                p.operand(*args),
-                p.operand(*returns)
             ),
             IR::Clear { attachment, color } => {
                 write!(f, "clear {} color={}", p.operand(*attachment), p.operand(*color))
@@ -1007,6 +1003,9 @@ impl IR {
                     write!(f, " first_inst={}", p.operand(*first_instance))?;
                 }
                 write!(f, " {}", fmt_pipeline(pipeline))
+            },
+            IR::CallOpaque { body, pipeline, .. } => {
+                write!(f, "call.opaque body={} {}", p.operand(*body), fmt_pipeline(pipeline))
             },
             IR::EndRendering { .. } => write!(f, "end_rendering"),
             IR::BeginCompute { resources, name } => {

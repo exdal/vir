@@ -12,5 +12,5 @@ pub use ir::{DispatchSize, IR}; // dont export Constant, i think its ok to use i
 pub use module::{ComputePass, Count, Module, RenderPass};
 pub use pass::PassCallback;
 pub use program::Program;
-pub use render_graph::RenderGraph;
+pub use render_graph::{Recorder, RenderGraph};
 pub use value::{LabelId, Value, ValueId};

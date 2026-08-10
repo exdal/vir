@@ -25,7 +25,7 @@ use vir::{
     ValueId,
     allocator::Allocator,
 };
-use vir_examples::{Example, Frame, Setup, graphics_pipeline};
+use vir_examples::{Example, Frame, Recording, Setup, graphics_pipeline};
 
 const VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/texture.vert.spv"));
 const FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/texture.frag.spv"));
@@ -56,6 +56,7 @@ struct Texture {
     /// The image's slot in the bindless table, pushed by the draw.
     slot: TextureId,
     extent: vk::Extent2D,
+    push: Option<ValueId>,
     ui: UiState,
 }
 
@@ -153,6 +154,7 @@ impl Example for Texture {
             sampler,
             slot,
             extent,
+            push: None,
             ui: UiState::default(),
         })
     }
@@ -175,14 +177,20 @@ impl Example for Texture {
             });
     }
 
-    fn render(&mut self, frame: &mut Frame) -> Result<ValueId, vk::Result> {
-        let target = frame.module.clear(frame.swapchain_image, BACKGROUND);
+    /// The image never moves and the draw never changes shape, so the only thing the frame has
+    /// left to say is how big to draw the quad.
+    fn record(&mut self, recording: &mut Recording) -> Result<ValueId, vk::Result> {
+        let module = &mut *recording.module;
 
-        let texture = frame.module.import_attachment(&self.attachment());
-        frame.module.set_name(texture, "sample texture");
+        let push = module.declare_bytes_var("texture push block", size_of::<PushConstants>() as u32);
+        self.push = Some(push);
 
-        Ok(frame
-            .module
+        let target = module.clear(recording.swapchain_image, BACKGROUND);
+
+        let texture = module.import_attachment(&self.attachment());
+        module.set_name(texture, "sample texture");
+
+        Ok(module
             .begin_rendering(&[target])
             .with_name("textured quad")
             .bind_graphics_pipeline(self.pipeline)
@@ -195,12 +203,23 @@ impl Example for Texture {
                 ..Default::default()
             })
             .sample_image(texture)
-            .push_constants(&PushConstants {
-                scale: self.quad_scale(frame.target.extent),
-                texture_index: self.slot.0,
-            })
+            .push_constants_from(push)
             .draw(4, 1)
             .end_rendering())
+    }
+
+    fn update(&mut self, frame: &mut Frame) -> Result<(), vk::Result> {
+        if let Some(push) = self.push {
+            frame.program.set_bytes(
+                push,
+                &PushConstants {
+                    scale: self.quad_scale(frame.target.extent),
+                    texture_index: self.slot.0,
+                },
+            );
+        }
+
+        Ok(())
     }
 
     fn destroy(&mut self, graph: &mut RenderGraph, allocator: &mut PersistentAllocator) {

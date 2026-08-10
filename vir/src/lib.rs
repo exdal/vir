@@ -23,6 +23,7 @@ pub use graph::{
     Module,
     PassCallback,
     Program,
+    Recorder,
     RenderGraph,
     RenderPass,
     Value,

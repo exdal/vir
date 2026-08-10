@@ -3,6 +3,10 @@
 //! The quad is uploaded once to a persistent buffer and drawn indexed each frame. The spinning
 //! triangle is rebuilt on the CPU every frame in a frame-allocator buffer, recycled once the
 //! frame retires.
+//!
+//! Which is the difference the compiled pass turns on: the quad is in it, since the buffer the
+//! draw binds never changes, and the spinning triangle is a slot the frame binds, since it is a
+//! different buffer every time.
 
 use ash::vk;
 use vir::{
@@ -19,7 +23,7 @@ use vir::{
     ValueId,
     allocator::Allocator,
 };
-use vir_examples::{Example, Frame, Setup, graphics_pipeline};
+use vir_examples::{Example, Frame, Recording, Setup, graphics_pipeline};
 
 const VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/vertex_buffer.vert.spv"));
 const FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/vertex_buffer.frag.spv"));
@@ -83,10 +87,17 @@ fn spinning_triangle(angle: f32) -> [Vertex; 3] {
     })
 }
 
+/// The slots the compiled pass reads.
+struct Slots {
+    spinning: ValueId,
+    tint: ValueId,
+}
+
 struct VertexBuffer {
     pipeline: PipelineId,
     quad: Buffer,
     quad_indices: Buffer,
+    slots: Option<Slots>,
     ui: UiState,
 }
 
@@ -124,6 +135,7 @@ impl Example for VertexBuffer {
             pipeline,
             quad,
             quad_indices,
+            slots: None,
             ui: UiState::default(),
         })
     }
@@ -133,7 +145,10 @@ impl Example for VertexBuffer {
             .default_pos([24.0, 24.0])
             .default_size([280.0, 160.0])
             .show(ctx, |ui| {
-                ui.label("Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.");
+                ui.label(
+                    "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut \
+                     labore et dolore magna aliqua.",
+                );
                 ui.checkbox(&mut self.ui.spin, "spin");
                 ui.add(egui::Slider::new(&mut self.ui.tint, 0.0..=1.0).text("tint"));
                 ui.separator();
@@ -143,25 +158,21 @@ impl Example for VertexBuffer {
             });
     }
 
-    fn render(&mut self, frame: &mut Frame) -> Result<ValueId, vk::Result> {
-        let spinning = spinning_triangle(if self.ui.spin { frame.elapsed } else { 0.0 });
-        let mut spinning_buffer = frame
-            .allocator
-            .allocate_buffer(&BufferInfo::vertex(size_of_val(&spinning) as u64).with_name("spinning triangle"))?;
-        spinning_buffer.write(0, &spinning)?;
+    fn record(&mut self, recording: &mut Recording) -> Result<ValueId, vk::Result> {
+        let module = &mut *recording.module;
 
-        let target = frame.module.clear(frame.swapchain_image, BACKGROUND);
+        let spinning = module.declare_buffer_var("spinning triangle", vir::Access::HostWrite);
+        let tint = module.declare_bytes_var("tint", size_of::<f32>() as u32);
 
-        let quad = frame.module.import_buffer(&self.quad, vir::Access::HostWrite);
-        let quad_indices = frame.module.import_buffer(&self.quad_indices, vir::Access::HostWrite);
-        let spinning = frame.module.import_buffer(&spinning_buffer, vir::Access::HostWrite);
-        frame.module.set_name(quad, "quad vertices");
-        frame.module.set_name(quad_indices, "quad indices");
-        frame.module.set_name(spinning, "spinning triangle");
+        let target = module.clear(recording.swapchain_image, BACKGROUND);
+
+        let quad = module.import_buffer(&self.quad, vir::Access::HostWrite);
+        let quad_indices = module.import_buffer(&self.quad_indices, vir::Access::HostWrite);
+        module.set_name(quad, "quad vertices");
+        module.set_name(quad_indices, "quad indices");
 
         // one pass, two draws: only the bound buffer and the tail of the block change
-        Ok(frame
-            .module
+        let drawn = module
             .begin_rendering(&[target])
             .with_name("buffer geometry")
             .bind_graphics_pipeline(self.pipeline)
@@ -179,10 +190,31 @@ impl Example for VertexBuffer {
             .bind_vertex_buffer(0, quad)
             .bind_index_buffer(quad_indices, vk::IndexType::UINT32)
             .draw_indexed(QUAD_INDICES.len() as u32, 1)
-            .push_constants_at(TINT_OFFSET, &self.ui.tint)
+            .push_constants_from_at(TINT_OFFSET, tint)
             .bind_vertex_buffer(0, spinning)
             .draw(3, 1)
-            .end_rendering())
+            .end_rendering();
+
+        self.slots = Some(Slots { spinning, tint });
+
+        Ok(drawn)
+    }
+
+    fn update(&mut self, frame: &mut Frame) -> Result<(), vk::Result> {
+        let Some(slots) = self.slots.as_ref() else {
+            return Ok(());
+        };
+
+        let spinning = spinning_triangle(if self.ui.spin { frame.elapsed } else { 0.0 });
+        let mut buffer = frame
+            .allocator
+            .allocate_buffer(&BufferInfo::vertex(size_of_val(&spinning) as u64).with_name("spinning triangle"))?;
+        buffer.write(0, &spinning)?;
+
+        frame.program.set(slots.spinning, buffer);
+        frame.program.set_bytes(slots.tint, &self.ui.tint);
+
+        Ok(())
     }
 
     fn destroy(&mut self, _graph: &mut RenderGraph, allocator: &mut PersistentAllocator) {

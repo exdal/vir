@@ -2,7 +2,7 @@ use std::{fmt, sync::Arc};
 
 use ash::vk;
 
-use crate::{Access, Buffer, ClearValue, ImageAttachment, SwapchainBinding, graph::ir::VariableKind};
+use crate::{Access, Buffer, ClearValue, ImageAttachment, PassCallback, SwapchainBinding, graph::ir::VariableKind};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ValueId(pub u32);
@@ -41,6 +41,7 @@ pub enum Value {
     Reference(ValueId),
     Access(Access),
     ClearValue(ClearValue),
+    Callback(PassCallback),
 }
 
 impl Value {
@@ -56,6 +57,7 @@ impl Value {
             Value::Swapchain(_) => Some(VariableKind::Swapchain),
             Value::Buffer(_) => Some(VariableKind::Buffer),
             Value::ImageAttachment(_) => Some(VariableKind::ImageAttachment),
+            Value::Callback(_) => Some(VariableKind::Callback),
             _ => None,
         }
     }
@@ -99,6 +101,9 @@ impl From<ImageAttachment> for Value {
 }
 impl From<&ImageAttachment> for Value {
     fn from(v: &ImageAttachment) -> Self { Value::ImageAttachment(v.clone()) }
+}
+impl From<PassCallback> for Value {
+    fn from(v: PassCallback) -> Self { Value::Callback(v) }
 }
 
 pub trait FromValue {
@@ -182,6 +187,15 @@ impl FromValue for ImageAttachment {
         match value {
             Value::ImageAttachment(v) => v.clone(),
             _ => panic!("expected ImageAttachment, got {:?}", value),
+        }
+    }
+}
+
+impl FromValue for PassCallback {
+    fn from_value(value: &Value) -> Self {
+        match value {
+            Value::Callback(v) => v.clone(),
+            _ => panic!("expected Callback, got {:?}", value),
         }
     }
 }

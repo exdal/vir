@@ -3,8 +3,13 @@
 //! An example is a type that implements [`Example`] and a `main` that hands it to [`run`]. The
 //! harness owns everything that is not the point of any one example: the window, the instance
 //! and device, the swapchain and its allocators, the render graph, and the egui overlay that
-//! every example draws its controls into. What an example writes is its pipelines, its
-//! resources, and the passes it records into the frame's module.
+//! every example draws its controls into.
+//!
+//! A frame is one program, compiled by [`compile_example`] and re-run until the swapchain
+//! changes. The example records its passes into it, the egui pass records the UI over them, and
+//! the present closes it, so the graph is handed the whole frame at once and works out every
+//! barrier in it. What an example does per frame is write into the slots it declared while
+//! recording, and nothing it does there reaches the graph at all.
 
 pub mod device_builder;
 pub mod egui_pass;
@@ -32,6 +37,7 @@ use vir::{
     Module,
     PersistentAllocator,
     PipelineId,
+    Program,
     RenderGraph,
     SuperFrameAllocator,
     SwapChain,
@@ -48,7 +54,7 @@ use winit::{
 pub use crate::window::Window;
 use crate::{
     device_builder::{DeviceBuilder, InstanceBuilder, PhysicalDeviceSelector, SwapChainBuilder},
-    egui_pass::EguiPass,
+    egui_pass::{EguiPass, EguiSlots},
     window::{create_surface, surface_extension},
 };
 
@@ -70,9 +76,8 @@ pub fn graphics_pipeline(graph: &mut RenderGraph, vertex: &[u8], fragment: &[u8]
     )
 }
 
-/// Prints `program` under `VIR_DUMP_IR`, once per `name`. The harness dumps the frame's own
-/// module, which holds nothing an example compiled ahead of time and runs itself: such a program
-/// is dumped by asking for it here.
+/// Prints `program` under `VIR_DUMP_IR`, once per `name`. The harness dumps the frame it
+/// compiled; a module an example builds and runs itself is dumped by asking for it here.
 pub fn dump_ir(name: &str, program: &vir::Program) {
     static DUMPED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Mutex::default);
 
@@ -95,7 +100,7 @@ pub struct Target {
     pub format: vk::Format,
 }
 
-/// What an example gets to build itself out of, both at startup and after every resize.
+/// What an example is built out of at startup, before there is a frame to record.
 pub struct Setup<'a> {
     pub ctx: &'a Context,
     pub graph: &'a mut RenderGraph,
@@ -103,27 +108,35 @@ pub struct Setup<'a> {
     pub target: Target,
 }
 
-/// One frame in flight. The example records into `module` and hands back the value the harness
-/// should present, after it has drawn the UI over it.
-pub struct Frame<'a> {
+/// The module the whole frame is compiled from.
+///
+/// An example records its passes here once and reaches them afterwards through the variables
+/// it declared alongside them, so nothing about a frame is rebuilt until the swapchain is.
+/// Anything sized to the window belongs here too, since this is the one place that runs again
+/// when the window changes size.
+pub struct Recording<'a> {
     pub ctx: &'a Context,
     pub graph: &'a mut RenderGraph,
     pub module: &'a mut Module,
+    /// The device is idle here, so whatever the last program was built around can be handed
+    /// back before the replacement is taken.
+    pub allocator: &'a mut PersistentAllocator,
+    /// The image this run acquires, which is what the example draws into or blits onto.
+    pub swapchain_image: ValueId,
+    pub target: Target,
+}
+
+/// One frame in flight. What an example does here is write into the program it recorded, which
+/// is why none of this reaches the graph.
+pub struct Frame<'a> {
+    pub ctx: &'a Context,
+    pub program: &'a mut Program,
     /// Whatever this frame allocates out of is recycled once the frame retires, so it is where
     /// geometry rebuilt every frame belongs.
     pub allocator: &'a mut FrameAllocator,
-    /// The acquired swapchain image, already imported into `module`.
-    pub swapchain_image: ValueId,
     pub target: Target,
     /// Seconds since the example started, for anything that animates.
     pub elapsed: f32,
-    roots: Vec<ValueId>,
-}
-
-impl Frame<'_> {
-    /// Marks `value` as something the frame has to produce even though presenting does not
-    /// depend on it, which is how a resource handed back to the example outlives the frame.
-    pub fn add_root(&mut self, value: ValueId) { self.roots.push(value); }
 }
 
 pub trait Example: Sized {
@@ -132,18 +145,56 @@ pub trait Example: Sized {
 
     fn new(setup: &mut Setup) -> Result<Self, vk::Result>;
 
-    /// Called after every swapchain creation, including the first, for targets that have to
-    /// track the window size.
-    fn resize(&mut self, _setup: &mut Setup) -> Result<(), vk::Result> { Ok(()) }
+    /// Records the example's passes and hands back the image to present. Called once per
+    /// swapchain rather than once per frame, so what it returns is a graph, not a picture.
+    fn record(&mut self, recording: &mut Recording) -> Result<ValueId, vk::Result>;
+
+    /// Writes this frame into the slots [`Example::record`] declared.
+    fn update(&mut self, _frame: &mut Frame) -> Result<(), vk::Result> { Ok(()) }
 
     /// The panel the harness draws over whatever the example rendered.
     fn ui(&mut self, _ctx: &egui::Context) {}
 
-    /// Records this frame and returns the image to present.
-    fn render(&mut self, frame: &mut Frame) -> Result<ValueId, vk::Result>;
-
     /// Hands back anything taken from the persistent allocator. The device is already idle.
     fn destroy(&mut self, _graph: &mut RenderGraph, _allocator: &mut PersistentAllocator) {}
+}
+
+/// The one program a frame is: the example's passes, the UI over them, and the present.
+pub struct CompiledFrame {
+    pub program: Program,
+    egui: EguiSlots,
+}
+
+/// Compiles that program.
+///
+/// The example records first and hands back what it drew, the egui pass goes over it, and the
+/// present closes it. Keeping the UI in the same module as the passes under it is what leaves
+/// the graph a single frame to order: the layout the UI wants its target in is one the barrier
+/// pass works out, rather than something the example has to leave it in for a second run.
+pub fn compile_example<E: Example>(
+    example: &mut E, egui_pass: &EguiPass, ctx: &Context, graph: &mut RenderGraph, allocator: &mut PersistentAllocator,
+    swapchain: &SwapChain, target: Target,
+) -> Result<CompiledFrame, vk::Result> {
+    let mut module = Module::default();
+    let swapchain_image = module.acquire_next_image(swapchain);
+
+    let mut recording = Recording {
+        ctx,
+        graph,
+        module: &mut module,
+        allocator,
+        swapchain_image,
+        target,
+    };
+    let drawn = example.record(&mut recording)?;
+
+    let (drawn, egui) = egui_pass.record(&mut module, drawn);
+    let present = module.present(drawn);
+
+    let program = module.compile(present);
+    dump_ir("frame", &program);
+
+    Ok(CompiledFrame { program, egui })
 }
 
 /// Runs `E` until the window closes.
@@ -324,8 +375,8 @@ struct App<E: Example> {
     egui_state: egui_winit::State,
     egui_pass: EguiPass,
     example: E,
+    frame: Option<CompiledFrame>,
     start_time: Instant,
-    dumped_ir: bool,
 }
 
 impl<E: Example> App<E> {
@@ -347,31 +398,60 @@ impl<E: Example> App<E> {
             None,
         );
 
-        // the example is built against a live swapchain, so `new` can lean on the same
-        // size-dependent setup `resize` does
+        // the example is built against a live swapchain, since everything it records is sized
+        // to one
         renderer.recreate_swapchain()?;
         let example = E::new(&mut renderer.setup())?;
 
-        Ok(Self {
+        let mut app = Self {
             renderer,
             egui_ctx,
             egui_state,
             egui_pass,
             example,
+            frame: None,
             start_time: Instant::now(),
-            dumped_ir: false,
-        })
+        };
+        app.compile()?;
+
+        Ok(app)
+    }
+
+    /// Rebuilds the frame's program, which is the only thing a resize costs: the example gets
+    /// to hand back whatever it sized to the old swapchain and record against the new one.
+    fn compile(&mut self) -> Result<(), vk::Result> {
+        let renderer = &mut self.renderer;
+        let Some(ref swapchain) = renderer.swapchain else {
+            return Err(vk::Result::ERROR_SURFACE_LOST_KHR);
+        };
+
+        // the program being replaced may still be in flight, and it is what holds every
+        // resource the example is about to hand back
+        unsafe { renderer.ctx.device().device_wait_idle() }?;
+        self.frame = None;
+
+        self.frame = Some(compile_example(
+            &mut self.example,
+            &self.egui_pass,
+            &renderer.ctx,
+            &mut renderer.graph,
+            &mut renderer.persistent_allocator,
+            swapchain,
+            renderer.target,
+        )?);
+
+        Ok(())
     }
 
     fn recreate_swapchain(&mut self) -> Result<(), vk::Result> {
         self.renderer.recreate_swapchain()?;
-        self.example.resize(&mut self.renderer.setup())
+        self.compile()
     }
 
     fn render(&mut self) -> Result<(), vk::Result> {
         let renderer = &mut self.renderer;
-        let Some(ref swapchain) = renderer.swapchain else {
-            return Err(vk::Result::ERROR_SURFACE_LOST_KHR);
+        let Some(frame) = self.frame.as_mut() else {
+            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
         };
         let target = renderer.target;
 
@@ -408,37 +488,19 @@ impl<E: Example> App<E> {
             "egui frame"
         );
 
-        let mut module = Module::default();
-        let swapchain_image = module.acquire_next_image(swapchain);
-
-        let mut frame = Frame {
+        // the whole of a frame is writes into an already compiled program
+        self.example.update(&mut Frame {
             ctx: &renderer.ctx,
-            graph: &mut renderer.graph,
-            module: &mut module,
+            program: &mut frame.program,
             allocator: &mut *next_frame,
-            swapchain_image,
             target,
             elapsed: self.start_time.elapsed().as_secs_f32(),
-            roots: Vec::new(),
-        };
-        let drawn = self.example.render(&mut frame)?;
-        let mut roots = std::mem::take(&mut frame.roots);
-        drop(frame);
-
-        let drawn = self.egui_pass.record(&mut module, drawn, &egui_frame);
-        roots.insert(0, module.present(drawn));
-        let executable = module.compile_all(&roots);
-
-        // the first frame egui produces is the font atlas upload with nothing drawn yet, which
-        // is not the one worth looking at
-        if !self.dumped_ir && egui_frame.draw_count() > 0 {
-            dump_ir("frame", &executable);
-            self.dumped_ir = true;
-        }
+        })?;
+        self.egui_pass.bind(&mut frame.program, &frame.egui, &egui_frame);
 
         renderer
             .graph
-            .execute(&renderer.ctx, &executable, &mut AllocatorKind::Frame(next_frame))
+            .execute(&renderer.ctx, &frame.program, &mut AllocatorKind::Frame(next_frame))
     }
 }
 

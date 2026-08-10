@@ -44,7 +44,7 @@ use vir::{
     ValueId,
     allocator::Allocator,
 };
-use vir_examples::{Example, Frame, Setup, graphics_pipeline};
+use vir_examples::{Example, Frame, Recording, Setup, graphics_pipeline};
 
 const GEOMETRY_VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/deferred_geometry.vert.spv"));
 const GEOMETRY_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/deferred_geometry.frag.spv"));
@@ -61,10 +61,6 @@ const NORMAL_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 const POSITION_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
 
-/// The frame's last use of a G-buffer target is the lighting pass sampling it.
-const GBUFFER_RESTING: Access = Access::FragmentSampled;
-/// Nothing reads depth after the geometry pass, so it rests as the attachment it was.
-const DEPTH_RESTING: Access = Access::DepthStencilRW;
 /// A material texture is written once at startup and only ever sampled after that.
 const TEXTURE_RESTING: Access = Access::FragmentSampled;
 
@@ -188,8 +184,10 @@ struct GTarget {
 }
 
 impl GTarget {
+    /// Every run clears it before anything reads it, so what the last one left in it is not
+    /// worth a transition.
     fn attachment(&self) -> ImageAttachment {
-        ImageAttachment::from_image(&self.image, GBUFFER_RESTING.into()).with_image_view(self.view)
+        ImageAttachment::from_image(&self.image, vk::ImageLayout::UNDEFINED).with_image_view(self.view)
     }
 }
 
@@ -204,7 +202,7 @@ struct GBuffer {
 
 impl GBuffer {
     fn depth_attachment(&self) -> ImageAttachment {
-        ImageAttachment::from_image(&self.depth, DEPTH_RESTING.into()).with_image_view(self.depth_view)
+        ImageAttachment::from_image(&self.depth, vk::ImageLayout::UNDEFINED).with_image_view(self.depth_view)
     }
 
     fn targets(&self) -> [&GTarget; 3] { [&self.albedo, &self.normal, &self.position] }
@@ -276,6 +274,15 @@ impl Default for UiState {
     }
 }
 
+/// The slots the frame writes into the compiled passes.
+struct Slots {
+    /// One block per mesh, since what the camera decided and what the material decided share
+    /// it.
+    geometry: Vec<ValueId>,
+    lighting: ValueId,
+    cull_backfaces: ValueId,
+}
+
 struct Deferred {
     geometry_pipeline: PipelineId,
     lighting_pipeline: PipelineId,
@@ -286,6 +293,7 @@ struct Deferred {
     /// Samples material textures, which are read at whatever rate the model's UVs ask for.
     texture_sampler: vk::Sampler,
     gbuffer: Option<GBuffer>,
+    slots: Option<Slots>,
     bounds: Bounds,
     /// What the scene was built from, which the panel names.
     source: String,
@@ -344,23 +352,51 @@ impl Deferred {
 
     /// One color target, registered into the bindless table the lighting pass samples through.
     fn create_target(
-        setup: &mut Setup, format: vk::Format, sampler: vk::Sampler, name: &str,
+        recording: &mut Recording, format: vk::Format, sampler: vk::Sampler, name: &str,
     ) -> Result<GTarget, vk::Result> {
-        let info = ImageInfo::color_target(setup.target.extent, format)
+        let info = ImageInfo::color_target(recording.target.extent, format)
             // sampled by the lighting pass, cleared by a transfer at the top of the frame
             .with_usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
             .with_name(name);
 
-        let image = setup.allocator.allocate_image(&info)?;
-        let view = setup.allocator.allocate_image_view(
+        let image = recording.allocator.allocate_image(&info)?;
+        let view = recording.allocator.allocate_image_view(
             image.handle(),
             format,
             vk::ImageViewType::TYPE_2D,
             image.subresource_range(),
         )?;
-        let slot = setup.graph.register_texture(view, sampler);
+        let slot = recording.graph.register_texture(view, sampler);
 
         Ok(GTarget { image, view, slot })
+    }
+
+    /// The whole G-buffer matches the swapchain, so it is thrown away and remade with it.
+    fn create_gbuffer(&mut self, recording: &mut Recording) -> Result<GBuffer, vk::Result> {
+        self.release_gbuffer(recording.graph, recording.allocator);
+
+        let albedo = Self::create_target(recording, ALBEDO_FORMAT, self.sampler, "g-buffer albedo")?;
+        let normal = Self::create_target(recording, NORMAL_FORMAT, self.sampler, "g-buffer normal")?;
+        let position = Self::create_target(recording, POSITION_FORMAT, self.sampler, "g-buffer position")?;
+
+        let depth_info = ImageInfo::depth_target(recording.target.extent, DEPTH_FORMAT)
+            .with_usage(vk::ImageUsageFlags::TRANSFER_DST)
+            .with_name("g-buffer depth");
+        let depth = recording.allocator.allocate_image(&depth_info)?;
+        let depth_view = recording.allocator.allocate_image_view(
+            depth.handle(),
+            DEPTH_FORMAT,
+            vk::ImageViewType::TYPE_2D,
+            depth.subresource_range(),
+        )?;
+
+        Ok(GBuffer {
+            albedo,
+            normal,
+            position,
+            depth,
+            depth_view,
+        })
     }
 
     /// Uploads every material image in one go: a staging buffer and a copy each, then a single
@@ -502,7 +538,7 @@ impl Example for Deferred {
 
         let textures = Self::upload_textures(setup, &scene.images, texture_sampler)?;
 
-        let mut this = Self {
+        Ok(Self {
             geometry_pipeline: graphics_pipeline(setup.graph, GEOMETRY_VERT_SPV, GEOMETRY_FRAG_SPV)?,
             lighting_pipeline: graphics_pipeline(setup.graph, LIGHTING_VERT_SPV, LIGHTING_FRAG_SPV)?,
             meshes: scene
@@ -514,69 +550,12 @@ impl Example for Deferred {
             sampler,
             texture_sampler,
             gbuffer: None,
+            slots: None,
             bounds,
             source,
             triangles,
             ui: UiState::default(),
-        };
-        this.resize(setup)?;
-
-        Ok(this)
-    }
-
-    /// The whole G-buffer matches the swapchain, so it is thrown away and remade with it.
-    fn resize(&mut self, setup: &mut Setup) -> Result<(), vk::Result> {
-        if self.gbuffer.is_some() {
-            unsafe { setup.ctx.device().device_wait_idle() }?;
-            let Setup { graph, allocator, .. } = setup;
-            self.release_gbuffer(graph, allocator);
-        }
-
-        let albedo = Self::create_target(setup, ALBEDO_FORMAT, self.sampler, "g-buffer albedo")?;
-        let normal = Self::create_target(setup, NORMAL_FORMAT, self.sampler, "g-buffer normal")?;
-        let position = Self::create_target(setup, POSITION_FORMAT, self.sampler, "g-buffer position")?;
-
-        let depth_info = ImageInfo::depth_target(setup.target.extent, DEPTH_FORMAT)
-            .with_usage(vk::ImageUsageFlags::TRANSFER_DST)
-            .with_name("g-buffer depth");
-        let depth = setup.allocator.allocate_image(&depth_info)?;
-        let depth_view = setup.allocator.allocate_image_view(
-            depth.handle(),
-            DEPTH_FORMAT,
-            vk::ImageViewType::TYPE_2D,
-            depth.subresource_range(),
-        )?;
-
-        // a module with only the releases, enough to put every fresh image into the layout the
-        // frame goes on to claim it is already in
-        let mut module = vir::Module::default();
-        let mut roots = Vec::new();
-        for target in [&albedo, &normal, &position] {
-            let imported = module.import_attachment(
-                &ImageAttachment::from_image(&target.image, vk::ImageLayout::UNDEFINED).with_image_view(target.view),
-            );
-            roots.push(module.release(imported, GBUFFER_RESTING, DomainFlag::Graphics));
-        }
-        let imported = module.import_attachment(
-            &ImageAttachment::from_image(&depth, vk::ImageLayout::UNDEFINED).with_image_view(depth_view),
-        );
-        roots.push(module.release(imported, DEPTH_RESTING, DomainFlag::Graphics));
-
-        setup.graph.execute_blocking(
-            setup.ctx,
-            &module.compile_all(&roots),
-            &mut AllocatorKind::Persistent(setup.allocator),
-        )?;
-
-        self.gbuffer = Some(GBuffer {
-            albedo,
-            normal,
-            position,
-            depth,
-            depth_view,
-        });
-
-        Ok(())
+        })
     }
 
     fn ui(&mut self, ctx: &egui::Context) {
@@ -622,24 +601,30 @@ impl Example for Deferred {
             });
     }
 
-    fn render(&mut self, frame: &mut Frame) -> Result<ValueId, vk::Result> {
-        let gbuffer = self.gbuffer.as_ref().ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+    fn record(&mut self, recording: &mut Recording) -> Result<ValueId, vk::Result> {
+        let gbuffer = self.create_gbuffer(recording)?;
+        let module = &mut *recording.module;
 
-        let eye = self.camera_position(frame.elapsed);
-        let view_proj = self.view_projection(eye, frame.target.extent);
+        // a block is either bytes or a variable, never both, so what changes every frame and
+        // what was decided when the model loaded go into one block per mesh
+        let geometry_push = (0..self.meshes.len())
+            .map(|index| module.declare_bytes_var(&format!("mesh {index} block"), size_of::<GeometryPush>() as u32))
+            .collect::<Vec<_>>();
+        let lighting_push = module.declare_bytes_var("lighting block", size_of::<LightingPush>() as u32);
+        let cull_backfaces = module.declare_bool_var("cull backfaces", false);
 
         // every buffer the region draws from has to be imported before the pass borrows the
         // module, so the geometry is gathered up front
         let meshes = self
             .meshes
             .iter()
-            .map(|mesh| {
+            .zip(&geometry_push)
+            .map(|(mesh, push)| {
                 (
-                    frame.module.import_buffer(&mesh.vertices, vir::Access::HostWrite),
-                    frame.module.import_buffer(&mesh.indices, vir::Access::HostWrite),
+                    module.import_buffer(&mesh.vertices, vir::Access::HostWrite),
+                    module.import_buffer(&mesh.indices, vir::Access::HostWrite),
                     mesh.index_count,
-                    mesh.base_color,
-                    mesh.base_color_texture,
+                    *push,
                 )
             })
             .collect::<Vec<_>>();
@@ -649,64 +634,64 @@ impl Example for Deferred {
         let material_textures = self
             .textures
             .iter()
-            .map(|texture| frame.module.import_attachment(&texture.attachment()))
+            .map(|texture| module.import_attachment(&texture.attachment()))
             .collect::<Vec<_>>();
 
-        let albedo = frame.module.import_attachment(&gbuffer.albedo.attachment());
-        let normal = frame.module.import_attachment(&gbuffer.normal.attachment());
-        let position = frame.module.import_attachment(&gbuffer.position.attachment());
-        let depth = frame.module.import_attachment(&gbuffer.depth_attachment());
-        frame.module.set_name(albedo, "g-buffer albedo");
-        frame.module.set_name(normal, "g-buffer normal");
-        frame.module.set_name(position, "g-buffer position");
-        frame.module.set_name(depth, "g-buffer depth");
+        let albedo = module.import_attachment(&gbuffer.albedo.attachment());
+        let normal = module.import_attachment(&gbuffer.normal.attachment());
+        let position = module.import_attachment(&gbuffer.position.attachment());
+        let depth = module.import_attachment(&gbuffer.depth_attachment());
+        module.set_name(albedo, "g-buffer albedo");
+        module.set_name(normal, "g-buffer normal");
+        module.set_name(position, "g-buffer position");
+        module.set_name(depth, "g-buffer depth");
 
-        let albedo = frame.module.clear(albedo, CLEAR_UNCOVERED);
-        let normal = frame.module.clear(normal, CLEAR_UNCOVERED);
-        let position = frame.module.clear(position, CLEAR_UNCOVERED);
-        let depth = frame.module.clear(depth, CLEAR_DEPTH);
+        let albedo = module.clear(albedo, CLEAR_UNCOVERED);
+        let normal = module.clear(normal, CLEAR_UNCOVERED);
+        let position = module.clear(position, CLEAR_UNCOVERED);
+        let depth = module.clear(depth, CLEAR_DEPTH);
 
-        let mut pass = frame
-            .module
-            .begin_rendering_depth(&[albedo, normal, position], depth)
-            .with_name("g-buffer")
-            .bind_graphics_pipeline(self.geometry_pipeline)
-            .set_viewport(0, Rect2D::framebuffer())
-            .set_scissor(0, Rect2D::framebuffer())
-            .broadcast_color_blend(BlendPreset::Off)
-            .set_depth(DepthState::less())
-            .set_rasterization(RasterizationState {
-                cull_mode: match self.ui.cull_backfaces {
-                    true => vk::CullModeFlags::BACK,
-                    false => vk::CullModeFlags::NONE,
-                },
-                front_face: FRONT_FACE,
-                ..Default::default()
-            });
+        // which way the geometry pass culls is a branch, since a cull mode is baked into a
+        // pipeline and both of them are worth having compiled
+        let geometry = |m: &mut vir::Module, cull_mode| {
+            let mut pass = m
+                .begin_rendering_depth(&[albedo, normal, position], depth)
+                .with_name("g-buffer")
+                .bind_graphics_pipeline(self.geometry_pipeline)
+                .set_viewport(0, Rect2D::framebuffer())
+                .set_scissor(0, Rect2D::framebuffer())
+                .broadcast_color_blend(BlendPreset::Off)
+                .set_depth(DepthState::less())
+                .set_rasterization(RasterizationState {
+                    cull_mode,
+                    front_face: FRONT_FACE,
+                    ..Default::default()
+                });
 
-        for texture in material_textures {
-            pass = pass.sample_image(texture);
-        }
+            for texture in &material_textures {
+                pass = pass.sample_image(*texture);
+            }
 
-        for (vertices, indices, index_count, base_color, base_color_texture) in meshes {
-            pass = pass
-                .push_constants(&GeometryPush {
-                    view_proj: row_major(view_proj),
-                    base_color,
-                    base_color_texture,
-                })
-                .bind_vertex_buffer(0, vertices)
-                .bind_index_buffer(indices, vk::IndexType::UINT32)
-                .draw_indexed(index_count, 1);
-        }
-        let filled = pass.end_rendering();
+            for (vertices, indices, index_count, push) in &meshes {
+                pass = pass
+                    .push_constants_from(*push)
+                    .bind_vertex_buffer(0, *vertices)
+                    .bind_index_buffer(*indices, vk::IndexType::UINT32)
+                    .draw_indexed(*index_count, 1);
+            }
+
+            pass.end_rendering()
+        };
+        let filled = module.set_condition(
+            cull_backfaces,
+            |m| geometry(m, vk::CullModeFlags::BACK),
+            |m| geometry(m, vk::CullModeFlags::NONE),
+        );
 
         // `filled` carries the albedo target out of the region; the other two are the same
         // region's writes, so naming them by the value that went in is what orders the sample
-        let light_direction = self.light_direction();
-        let shaded = frame
-            .module
-            .begin_rendering(&[frame.swapchain_image])
+        let shaded = module
+            .begin_rendering(&[recording.swapchain_image])
             .with_name("deferred lighting")
             .bind_graphics_pipeline(self.lighting_pipeline)
             .set_viewport(0, Rect2D::framebuffer())
@@ -719,7 +704,43 @@ impl Example for Deferred {
             .sample_image(filled)
             .sample_image(normal)
             .sample_image(position)
-            .push_constants(&LightingPush {
+            .push_constants_from(lighting_push)
+            .draw(3, 1)
+            .end_rendering();
+
+        self.slots = Some(Slots {
+            geometry: geometry_push,
+            lighting: lighting_push,
+            cull_backfaces,
+        });
+        self.gbuffer = Some(gbuffer);
+
+        Ok(shaded)
+    }
+
+    fn update(&mut self, frame: &mut Frame) -> Result<(), vk::Result> {
+        let (Some(slots), Some(gbuffer)) = (self.slots.as_ref(), self.gbuffer.as_ref()) else {
+            return Ok(());
+        };
+
+        let eye = self.camera_position(frame.elapsed);
+        let view_proj = row_major(self.view_projection(eye, frame.target.extent));
+
+        for (mesh, push) in self.meshes.iter().zip(&slots.geometry) {
+            frame.program.set_bytes(
+                *push,
+                &GeometryPush {
+                    view_proj,
+                    base_color: mesh.base_color,
+                    base_color_texture: mesh.base_color_texture,
+                },
+            );
+        }
+
+        let light_direction = self.light_direction();
+        frame.program.set_bytes(
+            slots.lighting,
+            &LightingPush {
                 camera_position: eye.to_array(),
                 ambient: self.ui.ambient,
                 light_direction: light_direction.to_array(),
@@ -730,23 +751,11 @@ impl Example for Deferred {
                 normal_index: gbuffer.normal.slot.0,
                 position_index: gbuffer.position.slot.0,
                 mode: self.ui.mode as u32,
-            })
-            .draw(3, 1)
-            .end_rendering();
+            },
+        );
+        frame.program.set(slots.cull_backfaces, self.ui.cull_backfaces);
 
-        // presenting does not depend on where the G-buffer ends up, so each release is a root
-        // of its own, exactly as the layouts the next frame claims require
-        for (attachment, access) in [
-            (filled, GBUFFER_RESTING),
-            (normal, GBUFFER_RESTING),
-            (position, GBUFFER_RESTING),
-            (depth, DEPTH_RESTING),
-        ] {
-            let resting = frame.module.release(attachment, access, DomainFlag::Graphics);
-            frame.add_root(resting);
-        }
-
-        Ok(shaded)
+        Ok(())
     }
 
     fn destroy(&mut self, graph: &mut RenderGraph, allocator: &mut PersistentAllocator) {
@@ -1089,16 +1098,13 @@ mod tests {
         }
     }
 
-    /// The frame leaves each resource in the layout the next frame claims it is already in.
+    /// A material texture is uploaded once and read from then on, so the layout it is left in
+    /// has to be the one a sample wants.
     #[test]
-    fn the_resting_accesses_are_the_layouts_the_frame_leaves_behind() {
+    fn the_texture_resting_access_is_the_layout_a_sample_wants() {
         assert_eq!(
-            vk::ImageLayout::from(GBUFFER_RESTING),
+            vk::ImageLayout::from(TEXTURE_RESTING),
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
-        );
-        assert_eq!(
-            vk::ImageLayout::from(DEPTH_RESTING),
-            vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL
         );
     }
 

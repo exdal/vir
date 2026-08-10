@@ -24,17 +24,20 @@ use crate::{
     ImageAttachment,
     ImageInfo,
     MemoryLocation,
+    PassCallback,
     PipelineId,
     PipelineLayout,
     PipelineState,
     Program,
     PushConstants,
+    Rect2D,
     ResolvedViewport,
     SwapchainBinding,
     TextureId,
     Value,
     ValueId,
     VertexLayout,
+    Viewport,
     core::ScopedStack,
     graph::{
         ir::{self, scaled},
@@ -182,6 +185,94 @@ struct Texture {
 }
 
 pub const DEFAULT_VARIABLE_DESCRIPTOR_COUNT: u32 = 1024;
+
+pub struct Recorder<'a> {
+    graph: &'a mut RenderGraph,
+    pipeline: PipelineId,
+    result: Result<(), vk::Result>,
+}
+
+impl Recorder<'_> {
+    pub fn render_area(&self) -> vk::Rect2D { self.graph.render_area }
+
+    pub fn set_viewport(&mut self, index: u32, viewport: impl Into<Viewport>) -> &mut Self {
+        let resolved = viewport.into().resolve(self.graph.render_area);
+        self.record(|graph| {
+            graph.batch()?.set_viewport(index, &[resolved.into()]);
+            graph.recorded_viewports.clear();
+            Ok(())
+        })
+    }
+
+    pub fn set_scissor(&mut self, index: u32, rect: Rect2D) -> &mut Self {
+        let resolved = rect.resolve(self.graph.render_area);
+        self.record(|graph| {
+            graph.batch()?.set_scissor(index, &[resolved]);
+            graph.recorded_scissors.clear();
+            Ok(())
+        })
+    }
+
+    pub fn push_constants<T: Copy>(&mut self, value: &T) -> &mut Self { self.push_constants_at(0, value) }
+
+    pub fn push_constants_at<T: Copy>(&mut self, offset: u32, value: &T) -> &mut Self {
+        let bytes = unsafe { std::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) };
+        self.push_constant_bytes(offset, bytes)
+    }
+
+    pub fn push_constant_bytes(&mut self, offset: u32, data: &[u8]) -> &mut Self {
+        let push = PushConstants {
+            offset,
+            data: data.to_vec(),
+            source: None,
+            addresses: Vec::new(),
+        };
+
+        let pipeline = self.pipeline;
+        self.record(move |graph| graph.record_push_constants(pipeline, &push))
+    }
+
+    pub fn draw(&mut self, vertex_count: u32, instance_count: u32) -> &mut Self {
+        self.draw_range(vertex_count, instance_count, 0, 0)
+    }
+
+    pub fn draw_range(
+        &mut self, vertex_count: u32, instance_count: u32, first_vertex: u32, first_instance: u32,
+    ) -> &mut Self {
+        self.record(|graph| {
+            graph
+                .batch()?
+                .draw(vertex_count, instance_count, first_vertex, first_instance);
+            Ok(())
+        })
+    }
+
+    pub fn draw_indexed(&mut self, index_count: u32, instance_count: u32) -> &mut Self {
+        self.draw_indexed_range(index_count, instance_count, 0, 0, 0)
+    }
+
+    pub fn draw_indexed_range(
+        &mut self, index_count: u32, instance_count: u32, first_index: u32, vertex_offset: i32, first_instance: u32,
+    ) -> &mut Self {
+        self.record(|graph| {
+            graph
+                .batch()?
+                .draw_indexed(index_count, instance_count, first_index, vertex_offset, first_instance);
+            Ok(())
+        })
+    }
+
+    pub fn buffer(&self, id: ValueId) -> Buffer { self.graph.get::<Buffer>(&id) }
+
+    pub fn image(&self, id: ValueId) -> ImageAttachment { self.graph.get::<ImageAttachment>(&id) }
+
+    fn record(&mut self, action: impl FnOnce(&mut RenderGraph) -> Result<(), vk::Result>) -> &mut Self {
+        if self.result.is_ok() {
+            self.result = action(self.graph);
+        }
+        self
+    }
+}
 
 pub struct RenderGraph {
     device: NonNull<ash::Device>,
@@ -382,9 +473,10 @@ impl RenderGraph {
 
         for (value_id, ir) in instructions {
             let pipeline = match ir {
-                IR::Draw { pipeline, .. } | IR::DrawIndexed { pipeline, .. } | IR::Dispatch { pipeline, .. } => {
-                    pipeline
-                },
+                IR::Draw { pipeline, .. }
+                | IR::DrawIndexed { pipeline, .. }
+                | IR::CallOpaque { pipeline, .. }
+                | IR::Dispatch { pipeline, .. } => pipeline,
                 _ => continue,
             };
 
@@ -399,7 +491,10 @@ impl RenderGraph {
             };
 
             match (ir, &declared.kind) {
-                (IR::Draw { state, .. } | IR::DrawIndexed { state, .. }, PipelineKind::Graphics { variants, .. }) => {
+                (
+                    IR::Draw { state, .. } | IR::DrawIndexed { state, .. } | IR::CallOpaque { state, .. },
+                    PipelineKind::Graphics { variants, .. },
+                ) => {
                     if variants.contains_key(state) {
                         continue;
                     }
@@ -1088,7 +1183,6 @@ impl RenderGraph {
                     self.flush_submit(None)?;
                 }
             },
-            IR::CallOpaque { .. } => todo!(),
             IR::Clear { attachment, color } => {
                 self.ensure_batch(ctx, allocator)?;
                 self.set_value(value_id, Value::Reference(*attachment));
@@ -1282,6 +1376,34 @@ impl RenderGraph {
                 let first_instance = self.get::<u32>(first_instance);
                 self.batch()?
                     .draw_indexed(index_count, instance_count, first_index, vertex_offset, first_instance);
+            },
+            IR::CallOpaque {
+                pass,
+                body,
+                pipeline,
+                state,
+                dynamic,
+            } => {
+                self.set_value(value_id, Value::Reference(*pass));
+                self.prepare_draw(*pipeline, state, dynamic)?;
+
+                let body = self.get::<PassCallback>(body);
+                let pipeline = pipeline.ok_or(vk::Result::ERROR_UNKNOWN)?;
+                let mut recorder = Recorder {
+                    graph: self,
+                    pipeline,
+                    result: Ok(()),
+                };
+                body.call(&mut recorder);
+                let result = recorder.result;
+
+                self.bound_pipeline = None;
+                self.bound_layout = None;
+                self.recorded_viewports.clear();
+                self.recorded_scissors.clear();
+                self.recorded_push_constants = None;
+
+                result?;
             },
             IR::EndRendering { pass } => {
                 self.set_value(value_id, Value::Reference(*pass));
