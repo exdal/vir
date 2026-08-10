@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    io::IsTerminal,
     ptr::NonNull,
     sync::Arc,
 };
@@ -1021,8 +1022,11 @@ impl RenderGraph {
         self.record_push_constants(pipeline, push_constants)
     }
 
+    /// Prints the program, highlighted when stdout is a terminal that has not opted out with
+    /// `NO_COLOR`.
     pub fn dump(program: &Program) {
-        println!("{}", program.dump());
+        let highlight = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+        println!("{}", program.dump_with(highlight));
     }
 
     fn execute_one(

@@ -236,12 +236,19 @@ impl Module {
     }
 
     fn declare_var(&mut self, kind: ir::VariableKind, name: &str, value: Value) -> ValueId {
+        self.declare_var_at(kind, name, value, ir::SourceLocation::NONE)
+    }
+
+    fn declare_var_at(
+        &mut self, kind: ir::VariableKind, name: &str, value: Value, location: ir::SourceLocation,
+    ) -> ValueId {
         let slot = self.variables.len() as u32;
         let name: ir::Name = Some(Arc::from(name));
         let id = self.emit(IR::Variable {
             slot,
             kind,
             name: name.clone(),
+            location,
         });
         self.variables.push(Variable {
             kind,
@@ -332,8 +339,14 @@ impl Module {
         self.declare_var(ir::VariableKind::ClearValue, name, Value::ClearValue(default))
     }
 
+    #[track_caller]
     pub fn declare_callback_var(&mut self, name: &str) -> ValueId {
-        self.declare_var(ir::VariableKind::Callback, name, Value::Callback(PassCallback::empty()))
+        self.declare_var_at(
+            ir::VariableKind::Callback,
+            name,
+            Value::Callback(PassCallback::empty()),
+            ir::SourceLocation::caller(),
+        )
     }
 
     pub fn declare_bytes_var(&mut self, name: &str, size: u32) -> ValueId {

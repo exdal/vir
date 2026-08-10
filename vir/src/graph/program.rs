@@ -132,4 +132,9 @@ impl Program {
     }
 
     pub fn dump(&self) -> String { dump::dump(&self.instructions, self.bound.keys().copied()) }
+
+    /// The dump with ANSI syntax highlighting, for printing into a terminal.
+    pub fn dump_with(&self, syntax_highlighting: bool) -> String {
+        dump::dump_with(&self.instructions, self.bound.keys().copied(), syntax_highlighting)
+    }
 }

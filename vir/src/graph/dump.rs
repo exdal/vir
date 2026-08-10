@@ -6,6 +6,12 @@ use crate::{
 };
 
 pub fn dump(instructions: &[Instr], bound: impl IntoIterator<Item = ValueId>) -> String {
+    dump_with(instructions, bound, false)
+}
+
+pub fn dump_with(
+    instructions: &[Instr], bound: impl IntoIterator<Item = ValueId>, syntax_highlighting: bool,
+) -> String {
     let program = Symbols::with_bound(instructions, bound);
     let width = instructions
         .iter()
@@ -65,7 +71,133 @@ pub fn dump(instructions: &[Instr], bound: impl IntoIterator<Item = ValueId>) ->
         }
     }
 
+    match syntax_highlighting {
+        true => highlight(&out),
+        false => out,
+    }
+}
+
+mod color {
+    pub const RESET: &str = "\x1b[0m";
+    pub const COMMENT: &str = "\x1b[90m";
+    pub const OPCODE: &str = "\x1b[1;34m";
+    pub const ID: &str = "\x1b[36m";
+    pub const VARIABLE: &str = "\x1b[35m";
+    pub const STRING: &str = "\x1b[32m";
+    pub const NUMBER: &str = "\x1b[33m";
+    pub const KEY: &str = "\x1b[37m";
+}
+
+fn highlight(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() * 2);
+    for line in text.lines() {
+        highlight_line(&mut out, line);
+        out.push('\n');
+    }
     out
+}
+
+fn highlight_line(out: &mut String, line: &str) {
+    if line.trim_start().starts_with(';') {
+        out.push_str(color::COMMENT);
+        highlight_operands(out, line, color::COMMENT);
+        out.push_str(color::RESET);
+        return;
+    }
+
+    let Some((id, body)) = line.split_once(" = ") else {
+        highlight_operands(out, line, "");
+        return;
+    };
+
+    let padding = id.len() - id.trim_start().len();
+    out.push_str(&id[..padding]);
+    token(out, color::ID, id.trim_start(), "");
+    out.push_str(" = ");
+
+    let indent = body.len() - body.trim_start().len();
+    let opcode = body[indent..]
+        .find(|c: char| !c.is_alphanumeric() && c != '_')
+        .map_or(body.len(), |end| indent + end);
+    out.push_str(&body[..indent]);
+    token(out, color::OPCODE, &body[indent..opcode], "");
+    highlight_operands(out, &body[opcode..], "");
+}
+
+fn highlight_operands(out: &mut String, text: &str, base: &str) {
+    // a comment is one flat color, so a key inside one is not lifted out of it
+    let key = match base {
+        color::COMMENT => color::COMMENT,
+        _ => color::KEY,
+    };
+
+    let mut rest = text;
+    while let Some(head) = rest.chars().next() {
+        let taken = match head {
+            '"' => {
+                let end = rest[1..].find('"').map_or(rest.len(), |end| end + 2);
+                token(out, color::STRING, &rest[..end], base);
+                end
+            },
+            '%' | '$' | '#' => {
+                let end = word_end(&rest[1..]) + 1;
+                let color = match head {
+                    '$' => color::VARIABLE,
+                    '#' => color::NUMBER,
+                    _ => color::ID,
+                };
+                token(out, color, &rest[..end], base);
+                end
+            },
+            _ if head.is_ascii_digit() => {
+                let end = number_end(rest);
+                token(out, color::NUMBER, &rest[..end], base);
+                end
+            },
+            _ if head.is_alphabetic() || head == '_' => {
+                let end = word_end(rest);
+                match rest[end..].starts_with('=') {
+                    true => token(out, key, &rest[..end], base),
+                    false => out.push_str(&rest[..end]),
+                }
+                end
+            },
+            _ => {
+                out.push(head);
+                head.len_utf8()
+            },
+        };
+        rest = &rest[taken..];
+    }
+}
+
+fn word_end(text: &str) -> usize {
+    text.find(|c: char| !c.is_alphanumeric() && c != '_')
+        .unwrap_or(text.len())
+}
+
+fn number_end(text: &str) -> usize {
+    let mut end = 0;
+    for (index, c) in text.char_indices() {
+        let digits = || text[index + 1..].starts_with(|next: char| next.is_ascii_digit());
+        if !(c.is_ascii_digit() || c == '.' || (c == 'x' && digits())) {
+            break;
+        }
+        end = index + c.len_utf8();
+    }
+    end
+}
+
+fn token(out: &mut String, color: &str, text: &str, base: &str) {
+    if color == base {
+        out.push_str(text);
+        return;
+    }
+
+    out.push_str(color);
+    out.push_str(text);
+    out.push_str(color::RESET);
+    out.push_str(base);
 }
 
 fn indent(depth: usize) -> String { "  ".repeat(depth) }
@@ -118,7 +250,21 @@ mod tests {
 
     const FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
 
-    fn dump_of_one_pass() -> String {
+    fn strip_ansi(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(start) = rest.find('\x1b') {
+            out.push_str(&rest[..start]);
+            let end = rest[start..].find('m').expect("an escape should end in m");
+            rest = &rest[start + end + 1..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    fn dump_of_one_pass() -> String { dump_of_one_pass_with(false) }
+
+    fn dump_of_one_pass_with(syntax_highlighting: bool) -> String {
         let extent = vk::Extent3D::default().width(64).height(32).depth(1);
         let attachment = ImageAttachment::new(
             Image::imported(vk::Image::null(), FORMAT, extent, vk::SampleCountFlags::TYPE_1),
@@ -141,7 +287,7 @@ mod tests {
             .draw(3, 1)
             .end_rendering();
 
-        module.compile(rendered).dump()
+        module.compile(rendered).dump_with(syntax_highlighting)
     }
 
     /// A program that never branches is still a program with a block: the entry one, which
@@ -209,6 +355,67 @@ mod tests {
         let dump = dump_of_one_pass();
         assert!(dump.contains("draw verts=3 insts=1"), "{dump}");
         assert!(!dump.contains("= const"), "{dump}");
+    }
+
+    /// A callback is the one variable whose value the dump cannot show, so a debug build prints
+    /// where it was declared instead. A release build carries no location at all.
+    #[test]
+    fn a_callback_variable_prints_where_it_was_declared() {
+        let extent = vk::Extent3D::default().width(64).height(32).depth(1);
+        let mut module = Module::default();
+        let target = module.transient_image(&crate::ImageInfo {
+            extent,
+            format: FORMAT,
+            ..Default::default()
+        });
+
+        let line = line!() + 1;
+        let body = module.declare_callback_var("draws");
+        let end = module
+            .begin_rendering(&[target])
+            .bind_graphics_pipeline(PipelineId(0))
+            .record_from(body)
+            .end_rendering();
+
+        let dump = module.compile(end).dump();
+        let expected = match cfg!(debug_assertions) {
+            true => format!("var \"draws\" Callback({}:{line}) slot=", file!()),
+            false => "var \"draws\" Callback slot=".to_string(),
+        };
+        assert!(dump.contains(&expected), "{expected}\n{dump}");
+    }
+
+    /// Highlighting only paints what the plain dump already says, so taking the escapes back
+    /// out has to leave the two identical.
+    #[test]
+    fn highlighting_changes_nothing_but_the_color() {
+        let colored = dump_of_one_pass_with(true);
+        assert!(colored.contains('\x1b'), "{colored}");
+        assert_eq!(strip_ansi(&colored), dump_of_one_pass());
+    }
+
+    #[test]
+    fn highlighting_paints_ids_opcodes_and_operands() {
+        let colored = dump_of_one_pass_with(true);
+        assert!(colored.contains("\x1b[36m%3\x1b[0m = "), "{colored}");
+        assert!(colored.contains("\x1b[33m64x32\x1b[0m"), "{colored}");
+        assert!(colored.contains("\x1b[1;34mdraw\x1b[0m"), "{colored}");
+        assert!(colored.contains("\x1b[32m\"target\"\x1b[0m"), "{colored}");
+        assert!(colored.contains("\x1b[37mverts\x1b[0m=\x1b[33m3\x1b[0m"), "{colored}");
+        assert!(colored.lines().any(|line| line.starts_with("\x1b[90m;")), "{colored}");
+    }
+
+    /// A comment is one color from end to end, so an operand painted inside it has to hand the
+    /// comment's color back rather than reset to the terminal's default.
+    #[test]
+    fn a_highlighted_comment_stays_a_comment_after_an_operand() {
+        let colored = dump_of_one_pass_with(true);
+        let header = colored
+            .lines()
+            .find(|line| line.contains("Pass "))
+            .expect("the pass header should be dumped");
+        assert!(header.contains("\x1b[32m\"triangle\"\x1b[0m\x1b[90m"), "{header}");
+        assert!(header.ends_with("\x1b[0m"), "{header}");
     }
 
     /// A variable has no value to fold in, so it prints as the name it was given wherever it

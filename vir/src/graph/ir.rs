@@ -36,6 +36,40 @@ pub type Name = Option<Arc<str>>;
 
 pub const MAX_RESOLVE_DEPTH: usize = 256;
 
+#[derive(Clone, Copy, Default, Hash, PartialEq, Eq)]
+pub struct SourceLocation {
+    #[cfg(debug_assertions)]
+    caller: Option<&'static std::panic::Location<'static>>,
+}
+
+impl SourceLocation {
+    pub const NONE: Self = Self {
+        #[cfg(debug_assertions)]
+        caller: None,
+    };
+
+    #[track_caller]
+    pub fn caller() -> Self {
+        Self {
+            #[cfg(debug_assertions)]
+            caller: Some(std::panic::Location::caller()),
+        }
+    }
+}
+
+impl fmt::Display for SourceLocation {
+    #[cfg(debug_assertions)]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.caller {
+            Some(caller) => write!(f, "({}:{})", caller.file(), caller.line()),
+            None => Ok(()),
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn fmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result { Ok(()) }
+}
+
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub enum Type {
     Image {
@@ -139,6 +173,7 @@ pub enum IR {
         slot: u32,
         kind: VariableKind,
         name: Name,
+        location: SourceLocation,
     },
     Array {
         ty: ValueId,
@@ -718,7 +753,12 @@ impl IR {
                 Type::Buffer => write!(f, "type buffer"),
             },
             IR::Constant(constant) => write!(f, "const {constant}"),
-            IR::Variable { slot, kind, name } => write!(f, "var{} {kind:?} slot={slot}", fmt_name(name)),
+            IR::Variable {
+                slot,
+                kind,
+                name,
+                location,
+            } => write!(f, "var{} {kind:?}{location} slot={slot}", fmt_name(name)),
             IR::Array { ty: _, elements } => {
                 write!(f, "array [{}]", fmt_list(elements, |id| p.operand(*id).to_string()))
             },
