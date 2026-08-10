@@ -27,7 +27,7 @@ pub fn dump(instructions: &[Instr], bound: impl IntoIterator<Item = ValueId>) ->
     );
 
     // a block is a level of its own, so a pass inside one indents from the block rather than
-    // from the margin the hoisted instructions sit at
+    // from the margin the globals sit at
     let mut block = 0usize;
     let mut region = 0usize;
     for (id, ir) in instructions {

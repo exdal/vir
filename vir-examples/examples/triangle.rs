@@ -59,7 +59,7 @@ impl Triangle {
         let push = module.declare_bytes_var("push constants", size_of::<PushConstants>() as u32);
 
         let attachment = module.import_attachment(target);
-        module.set_name(attachment, "computed geometry");
+        module.set_name(attachment, "triangles");
         let attachment = module.clear(attachment, BACKGROUND);
 
         let sliding_tri = module
@@ -150,7 +150,7 @@ impl Example for Triangle {
 
         let info = vir::ImageInfo::color_target(setup.target.extent, setup.target.format)
             .with_usage(vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST)
-            .with_name("computed geometry");
+            .with_name("triangles");
         let image = setup.allocator.allocate_image(&info)?;
         let view = setup.allocator.allocate_image_view(
             image.handle(),
@@ -220,7 +220,7 @@ impl Example for Triangle {
         )?;
 
                 let attachment = frame.module.import_attachment(target);
-        frame.module.set_name(attachment, "computed geometry");
+        frame.module.set_name(attachment, "triangles");
 
         Ok(frame.module.blit(attachment, frame.swapchain_image))
     }

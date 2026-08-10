@@ -43,32 +43,31 @@ struct ResourceState {
     access: Access,
 }
 
+#[derive(Clone, Copy)]
+struct BufferState {
+    last_access: ValueId,
+    access: Access,
+}
+
 struct Construct {
     merge: LabelId,
     entry_states: HashMap<ValueId, ResourceState>,
-    entry_buffers: HashMap<ValueId, ValueId>,
+    entry_buffers: HashMap<ValueId, BufferState>,
     arms: Vec<Arm>,
 }
 
 struct Arm {
     at: usize,
     states: HashMap<ValueId, ResourceState>,
-    buffers: HashMap<ValueId, ValueId>,
+    buffers: HashMap<ValueId, BufferState>,
 }
 
-/// Moves types and constants to the front of the program.
-///
-/// The barrier pass emits an access constant where it first needs one and then shares it
-/// with every later barrier that waits on the same access. Left where it was emitted that
-/// constant could sit inside one arm of a selection while the other arm's barrier names it,
-/// and the arm that did not run would leave it with no value at all. They depend on nothing,
-/// so the simplest place for all of them is before anything can branch.
-fn hoist_pure(nodes: Vec<ir::Instr>) -> Vec<ir::Instr> {
-    let (mut pure, rest): (Vec<_>, Vec<_>) = nodes
+fn globals_first(nodes: Vec<ir::Instr>) -> Vec<ir::Instr> {
+    let (mut globals, rest): (Vec<_>, Vec<_>) = nodes
         .into_iter()
         .partition(|(_, ir)| matches!(ir, IR::Type(_) | IR::Constant(_)));
-    pure.extend(rest);
-    pure
+    globals.extend(rest);
+    globals
 }
 
 fn alloc_id(next_id: &mut u32) -> ValueId {
@@ -106,12 +105,7 @@ struct Block {
     terminator: Terminator,
 }
 
-/// Whether an instruction can be moved out of the block it was recorded in.
-///
-/// Constants and resources have no place in the control flow: hoisting them keeps a
-/// resource's identity the same on every path, which is what lets the barrier pass reason
-/// about one image rather than one per branch.
-fn is_hoistable(ir: &IR) -> bool {
+fn is_global(ir: &IR) -> bool {
     matches!(
         ir,
         IR::Type(_)
@@ -625,7 +619,7 @@ impl Module {
 
         let mut next_id = self.instructions.len() as u32;
         let linearized = self.layout_blocks(self.topo_sort(&roots), &mut next_id);
-        let mut synced = hoist_pure(self.sync(linearized, &mut next_id));
+        let mut synced = globals_first(self.sync(linearized, &mut next_id));
         self.infer_usage(&mut synced);
 
         let slots: HashMap<ValueId, u32> = self
@@ -831,21 +825,18 @@ impl Module {
     }
 
     fn layout_blocks(&self, nodes: Vec<ir::Instr>, next_id: &mut u32) -> Vec<ir::Instr> {
-        // hoisted instructions go ahead of every block: a block ends in a branch, and nothing
-        // past that terminator runs. They only depend on each other, so dependency order is
-        // enough to keep them consistent.
-        let mut hoisted = Vec::with_capacity(nodes.len());
+        let mut globals = Vec::with_capacity(nodes.len());
         let mut recorded: HashMap<LabelId, Vec<ir::Instr>> = HashMap::new();
 
         for (id, ir) in nodes {
             match self.block_of(id) {
-                _ if is_hoistable(&ir) => hoisted.push((id, ir)),
+                _ if is_global(&ir) => globals.push((id, ir)),
                 Some(label) => recorded.entry(label).or_default().push((id, ir)),
-                None => hoisted.push((id, ir)),
+                None => globals.push((id, ir)),
             }
         }
 
-        let mut result = hoisted;
+        let mut result = globals;
         for block in &self.blocks {
             result.push((alloc_id(next_id), IR::Label { label: block.label }));
             result.extend(recorded.remove(&block.label).unwrap_or_default());
@@ -889,10 +880,10 @@ impl Module {
             .collect()
     }
 
-    fn reconcile(
+    fn join_arms(
         &self, construct: Construct, predecessors: usize, result: &mut Vec<ir::Instr>, next_id: &mut u32,
         undefined: ResourceState,
-    ) -> (HashMap<ValueId, ResourceState>, HashMap<ValueId, ValueId>) {
+    ) -> (HashMap<ValueId, ResourceState>, HashMap<ValueId, BufferState>) {
         let Construct {
             entry_states,
             entry_buffers,
@@ -924,7 +915,7 @@ impl Module {
                     .or_else(|| entry_states.get(*resource))
                     .copied()
                     .unwrap_or(undefined);
-                if current.layout == target.layout && current.last_access == target.last_access {
+                if current.layout == target.layout && current.access == target.access {
                     continue;
                 }
 
@@ -941,18 +932,27 @@ impl Module {
                 ));
             }
 
+            let mut emitted: Vec<(Access, Access)> = Vec::new();
             for (buffer, target) in &buffers {
-                let current = arm.buffers.get(*buffer).copied();
-                if current == Some(**target) {
+                let current = arm.buffers.get(*buffer).copied().unwrap_or(BufferState {
+                    last_access: undefined.last_access,
+                    access: Access::None,
+                });
+
+                if current.access == target.access || current.access == Access::None {
                     continue;
                 }
+                if emitted.contains(&(current.access, target.access)) {
+                    continue;
+                }
+                emitted.push((current.access, target.access));
 
                 let id = alloc_id(next_id);
                 barriers.push((
                     id,
                     IR::MemoryBarrier {
-                        src_access: current.unwrap_or(undefined.last_access),
-                        dst_access: **target,
+                        src_access: current.last_access,
+                        dst_access: target.last_access,
                     },
                 ));
             }
@@ -966,7 +966,7 @@ impl Module {
     fn sync(&self, nodes: Vec<ir::Instr>, next_id: &mut u32) -> Vec<ir::Instr> {
         let mut result = Vec::with_capacity(nodes.len() * 2);
         let mut states: HashMap<ValueId, ResourceState> = HashMap::new();
-        let mut buffer_states: HashMap<ValueId, ValueId> = HashMap::new();
+        let mut buffer_states: HashMap<ValueId, BufferState> = HashMap::new();
 
         // how many ways there are into each block, which decides whether the state one arm
         // ends in can stand as the join or whether control can also fall straight through
@@ -1039,16 +1039,21 @@ impl Module {
                 id
             }};
         }
+        let mut emitted_memory: Vec<(Access, Access)> = Vec::new();
         macro_rules! emit_memory_barrier {
             ($src:expr, $dst:expr) => {{
-                let id = alloc!();
-                result.push((
-                    id,
-                    IR::MemoryBarrier {
-                        src_access: $src,
-                        dst_access: $dst,
-                    },
-                ));
+                let (src, dst): (BufferState, BufferState) = ($src, $dst);
+                if !emitted_memory.contains(&(src.access, dst.access)) {
+                    emitted_memory.push((src.access, dst.access));
+                    let id = alloc!();
+                    result.push((
+                        id,
+                        IR::MemoryBarrier {
+                            src_access: src.last_access,
+                            dst_access: dst.last_access,
+                        },
+                    ));
+                }
             }};
         }
         macro_rules! emit_barrier {
@@ -1124,22 +1129,26 @@ impl Module {
                 let buffer = $buffer;
                 let access: Access = $access;
                 let last = match buffer_states.get(&buffer).copied() {
-                    Some(id) => id,
-                    None => host_write!(),
+                    Some(state) => state,
+                    None => BufferState {
+                        last_access: host_write!(),
+                        access: Access::HostWrite,
+                    },
                 };
 
                 // a write is never shared, so it always ends up with a barrier of its own
-                let next_id = match access.writes() {
-                    true => emit_access!(access),
-                    false => read_access!(access),
+                let next = BufferState {
+                    last_access: match access.writes() {
+                        true => emit_access!(access),
+                        false => read_access!(access),
+                    },
+                    access,
                 };
-                if last != next_id {
-                    // nothing rests at no access, so there is nothing for the first use of a
-                    // buffer the graph just allocated to wait on
-                    if last != no_access_id {
-                        emit_memory_barrier!(last, next_id);
+                if last.last_access != next.last_access {
+                    if last.access != Access::None {
+                        emit_memory_barrier!(last, next);
                     }
-                    buffer_states.insert(buffer, next_id);
+                    buffer_states.insert(buffer, next);
                 }
             }};
         }
@@ -1189,6 +1198,8 @@ impl Module {
         let mut constructs: Vec<Construct> = Vec::new();
 
         for (value_id, ir) in nodes {
+            emitted_memory.clear();
+
             match &ir {
                 IR::SelectionMerge { merge, .. } => {
                     constructs.push(Construct {
@@ -1211,7 +1222,7 @@ impl Module {
                 IR::Label { label } if constructs.last().is_some_and(|c| c.merge == *label) => {
                     let construct = constructs.pop().expect("just matched on the top construct");
                     let ways_in = predecessors.get(label).copied().unwrap_or_default();
-                    let joined = self.reconcile(construct, ways_in, &mut result, next_id, undefined);
+                    let joined = self.join_arms(construct, ways_in, &mut result, next_id, undefined);
                     states = joined.0;
                     buffer_states = joined.1;
                 },
@@ -1228,8 +1239,14 @@ impl Module {
                 },
 
                 IR::ConstructBuffer { initial_access, .. } => {
-                    let id = resting_access!(*initial_access);
-                    buffer_states.insert(value_id, id);
+                    let last_access = resting_access!(*initial_access);
+                    buffer_states.insert(
+                        value_id,
+                        BufferState {
+                            last_access,
+                            access: *initial_access,
+                        },
+                    );
                 },
 
                 IR::Acquire { resource, access } => {
@@ -2767,10 +2784,12 @@ mod tests {
         );
     }
 
-    /// Two buffers resting at the same read still share one access constant, so the barrier a
-    /// write needs is not lost to the ids comparing equal.
+    /// A memory barrier names no buffer, so two buffers waiting on the same pair are both
+    /// covered by the one the first of them asks for. Emitting it at all is the part worth
+    /// pinning: the two share their resting constant, and the barrier the write needs would
+    /// be the thing lost to their states comparing equal.
     #[test]
-    fn buffers_resting_at_the_same_access_each_still_get_their_barrier() {
+    fn buffers_waiting_on_the_same_pair_share_one_barrier() {
         let mut module = Module::default();
         let first = module.import_buffer(&Buffer::default(), Access::ComputeRead);
         let second = module.import_buffer(&Buffer::default(), Access::ComputeRead);
@@ -2786,9 +2805,36 @@ mod tests {
         let compiled = module.compile(end);
         assert_eq!(
             memory_barriers(&module, &compiled),
+            vec![(Access::ComputeRead, Access::ComputeWrite)]
+        );
+    }
+
+    /// The run a barrier is shared across is one instruction's worth. A second pass reaching
+    /// the same buffer at the same access is a use in its own right, and has to wait again.
+    #[test]
+    fn a_later_pass_waiting_on_the_same_pair_gets_its_own_barrier() {
+        let mut module = Module::default();
+        let buffer = module.import_buffer(&Buffer::default(), Access::ComputeRead);
+
+        let written = module
+            .begin_compute()
+            .bind_pipeline(PipelineId(0))
+            .write(buffer)
+            .dispatch(1, 1, 1)
+            .end_compute();
+        let end = module
+            .begin_compute()
+            .bind_pipeline(PipelineId(1))
+            .read(written)
+            .dispatch(1, 1, 1)
+            .end_compute();
+
+        let compiled = module.compile(end);
+        assert_eq!(
+            memory_barriers(&module, &compiled),
             vec![
                 (Access::ComputeRead, Access::ComputeWrite),
-                (Access::ComputeRead, Access::ComputeWrite),
+                (Access::ComputeWrite, Access::ComputeRead),
             ]
         );
     }
@@ -4097,8 +4143,8 @@ mod tests {
             )
         };
 
-        // the hoisted instructions sit ahead of the first label, so only a label that follows
-        // another one closes a block
+        // the globals sit ahead of the first label, so only a label that follows another one
+        // closes a block
         let mut blocks = 0;
         for (index, (_, ir)) in instructions.iter().enumerate() {
             if !matches!(ir, IR::Label { .. }) {
@@ -4123,10 +4169,10 @@ mod tests {
     }
 
     /// A block ends in a branch, and nothing after that terminator runs. Resources and
-    /// variables are hoisted out of the blocks, so they have to land ahead of the first
-    /// branch rather than merely inside the entry block.
+    /// variables are global, so they have to land ahead of the first branch rather than
+    /// merely inside the entry block.
     #[test]
-    fn everything_hoisted_out_of_a_block_lands_before_the_first_branch() {
+    fn every_global_lands_before_the_first_branch() {
         let (module, _, end) = module_with_a_conditional_clear();
         let compiled = module.compile(end);
 
@@ -4138,8 +4184,8 @@ mod tests {
 
         for (index, (id, ir)) in compiled.instructions().iter().enumerate() {
             assert!(
-                !is_hoistable(ir) || index < first_branch,
-                "{id} is hoisted but sits past the branch at {first_branch}\n{}",
+                !is_global(ir) || index < first_branch,
+                "{id} is global but sits past the branch at {first_branch}\n{}",
                 compiled.dump()
             );
         }
@@ -4195,7 +4241,7 @@ mod tests {
             match ir {
                 IR::Label { label, .. } => open = Some(*label),
                 _ => assert!(
-                    is_hoistable(ir) || module.block_of(*id).is_none_or(|block| Some(block) == open),
+                    is_global(ir) || module.block_of(*id).is_none_or(|block| Some(block) == open),
                     "{id} comes before the label of the block it was recorded in\n{}",
                     compiled.dump()
                 ),
@@ -4220,7 +4266,7 @@ mod tests {
 
             // an instruction the module recorded in a block never drifts into another one
             if let Some(block) = module.block_of(*id)
-                && !is_hoistable(ir)
+                && !is_global(ir)
             {
                 assert_eq!(Some(block), current, "{id} left the block it was recorded in");
             }
@@ -4279,6 +4325,99 @@ mod tests {
             .filter(|(_, ir)| matches!(ir, IR::ImageBarrier { value, .. } if module.resource_root(*value) == source))
             .count();
         assert_eq!(barriers, 1, "{}", compiled.dump());
+    }
+
+    /// An arm that never reached a buffer has nothing to make available, so bringing it to a
+    /// join the other arm read at is a barrier with no work in it.
+    #[test]
+    fn an_arm_that_never_reached_a_buffer_waits_on_nothing_at_the_join() {
+        let mut module = Module::default();
+        let buffer = module.transient_buffer(&BufferInfo::new(
+            256,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            MemoryLocation::GpuOnly,
+        ));
+        let target = module.transient_image(&transient_info());
+        let enabled = module.declare_bool_var("enabled", true);
+
+        let end = module.set_condition(
+            enabled,
+            |m| {
+                m.begin_compute()
+                    .bind_pipeline(PipelineId(0))
+                    .write(target)
+                    .read(buffer)
+                    .dispatch(1, 1, 1)
+                    .end_compute()
+            },
+            |_| target,
+        );
+
+        let compiled = module.compile(end);
+        assert_eq!(memory_barriers(&module, &compiled), vec![], "{}", compiled.dump());
+    }
+
+    /// Both arms leave the buffer written, so whichever ran it is written all the same and
+    /// there is nothing for the join to say. The two writes hold constants of their own, which
+    /// is what a join comparing them by name rather than by access would trip over.
+    #[test]
+    fn arms_that_write_a_buffer_the_same_way_need_no_barrier_at_the_join() {
+        let mut module = Module::default();
+        let buffer = module.import_buffer(&Buffer::default(), Access::ComputeRead);
+        let enabled = module.declare_bool_var("enabled", true);
+
+        let dispatch = |m: &mut Module, pipeline: u32| {
+            m.begin_compute()
+                .bind_pipeline(PipelineId(pipeline))
+                .write(buffer)
+                .dispatch(1, 1, 1)
+                .end_compute()
+        };
+        let end = module.set_condition(enabled, |m| dispatch(m, 0), |m| dispatch(m, 1));
+
+        let compiled = module.compile(end);
+        assert_eq!(
+            memory_barriers(&module, &compiled),
+            vec![
+                (Access::ComputeRead, Access::ComputeWrite),
+                (Access::ComputeRead, Access::ComputeWrite),
+            ],
+            "{}",
+            compiled.dump()
+        );
+    }
+
+    /// Two buffers an arm has to catch up on ask for the same pair, and a memory barrier names
+    /// no buffer, so the one covers both.
+    #[test]
+    fn buffers_caught_up_at_the_same_pair_share_one_barrier() {
+        let mut module = Module::default();
+        let first = module.import_buffer(&Buffer::default(), Access::ComputeRead);
+        let second = module.import_buffer(&Buffer::default(), Access::ComputeRead);
+        let target = module.transient_image(&transient_info());
+        let enabled = module.declare_bool_var("enabled", true);
+
+        let end = module.set_condition(
+            enabled,
+            |m| {
+                m.begin_compute()
+                    .bind_pipeline(PipelineId(0))
+                    .write(target)
+                    .read_uniform(first)
+                    .read_uniform(second)
+                    .dispatch(1, 1, 1)
+                    .end_compute()
+            },
+            |_| target,
+        );
+
+        let compiled = module.compile(end);
+        let (merge, _, skipped) = selection_labels(&compiled);
+        let caught_up = compiled.instructions()[block_at(&compiled, skipped)..block_at(&compiled, merge)]
+            .iter()
+            .filter(|(_, ir)| matches!(ir, IR::MemoryBarrier { .. }))
+            .count();
+        assert_eq!(caught_up, 1, "{}", compiled.dump());
     }
 
     /// Bytes pushed from a variable are only sized when compiled; what they hold is read
