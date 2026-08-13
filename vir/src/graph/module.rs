@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use ash::vk;
 
@@ -38,7 +41,7 @@ use crate::{
 };
 
 #[derive(Clone, Copy)]
-struct ResourceState {
+struct ImageState {
     layout: vk::ImageLayout,
     last_access: ValueId,
     access: Access,
@@ -52,14 +55,14 @@ struct BufferState {
 
 struct Construct {
     merge: LabelId,
-    entry_states: HashMap<ValueId, ResourceState>,
+    entry_images: HashMap<ValueId, ImageState>,
     entry_buffers: HashMap<ValueId, BufferState>,
     arms: Vec<Arm>,
 }
 
 struct Arm {
     at: usize,
-    states: HashMap<ValueId, ResourceState>,
+    images: HashMap<ValueId, ImageState>,
     buffers: HashMap<ValueId, BufferState>,
 }
 
@@ -904,25 +907,31 @@ impl Module {
 
     fn join_arms(
         &self, construct: Construct, predecessors: usize, result: &mut Vec<ir::Instr>, next_id: &mut u32,
-        undefined: ResourceState,
-    ) -> (HashMap<ValueId, ResourceState>, HashMap<ValueId, BufferState>) {
+        undefined: ImageState, live: &HashSet<ValueId>,
+    ) -> (HashMap<ValueId, ImageState>, HashMap<ValueId, BufferState>) {
         let Construct {
-            entry_states,
+            entry_images,
             entry_buffers,
             mut arms,
             ..
         } = construct;
 
         let join_from_arm = !arms.is_empty() && arms.len() == predecessors;
-        let (join_states, join_buffers) = match join_from_arm {
-            true => (arms[0].states.clone(), arms[0].buffers.clone()),
-            false => (entry_states.clone(), entry_buffers.clone()),
+        let (join_images, join_buffers) = match join_from_arm {
+            true => (arms[0].images.clone(), arms[0].buffers.clone()),
+            false => (entry_images.clone(), entry_buffers.clone()),
         };
 
-        // sorted so the barriers a graph compiles to do not depend on hash order
-        let mut images = join_states.iter().collect::<Vec<_>>();
+        // query images/buffers that live in current arm so we don't get dead barriers
+        let mut images = join_images
+            .iter()
+            .filter(|(resource, _)| live.contains(*resource))
+            .collect::<Vec<_>>();
         images.sort_by_key(|(resource, _)| resource.0);
-        let mut buffers = join_buffers.iter().collect::<Vec<_>>();
+        let mut buffers = join_buffers
+            .iter()
+            .filter(|(buffer, _)| live.contains(*buffer))
+            .collect::<Vec<_>>();
         buffers.sort_by_key(|(buffer, _)| buffer.0);
 
         // an insertion shifts everything after it, so the arms are patched back to front
@@ -932,9 +941,9 @@ impl Module {
 
             for (resource, target) in &images {
                 let current = arm
-                    .states
+                    .images
                     .get(*resource)
-                    .or_else(|| entry_states.get(*resource))
+                    .or_else(|| entry_images.get(*resource))
                     .copied()
                     .unwrap_or(undefined);
                 if current.layout == target.layout && current.access == target.access {
@@ -982,13 +991,13 @@ impl Module {
             result.splice(arm.at..arm.at, barriers);
         }
 
-        (join_states, join_buffers)
+        (join_images, join_buffers)
     }
 
     fn sync(&self, nodes: Vec<ir::Instr>, next_id: &mut u32) -> Vec<ir::Instr> {
         let mut result = Vec::with_capacity(nodes.len() * 2);
-        let mut states: HashMap<ValueId, ResourceState> = HashMap::new();
-        let mut buffer_states: HashMap<ValueId, BufferState> = HashMap::new();
+        let mut image_states = HashMap::new();
+        let mut buffer_states = HashMap::new();
 
         // how many ways there are into each block, which decides whether the state one arm
         // ends in can stand as the join or whether control can also fall straight through
@@ -1049,6 +1058,22 @@ impl Module {
                     bound.push((root, access));
                 }
             }
+        }
+
+        // which resources are still named past each label, walked backwards so every label
+        // sees what comes after it. a selection is the only construct there is, so program
+        // order is the whole of what can follow a merge
+        let mut live_after: HashMap<LabelId, HashSet<ValueId>> = HashMap::new();
+        let mut live: HashSet<ValueId> = HashSet::new();
+        let mut uses = Vec::new();
+        for (_, ir) in nodes.iter().rev() {
+            if let IR::Label { label } = ir {
+                live_after.insert(*label, live.clone());
+            }
+
+            uses.clear();
+            self.resource_uses(ir, &mut uses);
+            live.extend(uses.iter().copied());
         }
 
         macro_rules! alloc {
@@ -1175,7 +1200,7 @@ impl Module {
             }};
         }
 
-        let undefined = ResourceState {
+        let undefined = ImageState {
             layout: vk::ImageLayout::UNDEFINED,
             last_access: no_access_id,
             access: Access::None,
@@ -1186,7 +1211,7 @@ impl Module {
                 let resource = $resource;
                 let access: Access = $access;
                 let root = self.resource_root(resource);
-                let state = states.get(&root).copied().unwrap_or(undefined);
+                let state = image_states.get(&root).copied().unwrap_or(undefined);
                 let new_layout: vk::ImageLayout = access.into();
 
                 let new_state = if state.layout == new_layout && !state.access.writes() && !access.writes() {
@@ -1196,21 +1221,21 @@ impl Module {
                     } else {
                         emit_access!(merged)
                     };
-                    ResourceState {
+                    ImageState {
                         layout: new_layout,
                         last_access,
                         access: merged,
                     }
                 } else {
                     emit_barrier!(state.last_access, $access_id, state.layout, new_layout, resource);
-                    ResourceState {
+                    ImageState {
                         layout: new_layout,
                         last_access: $access_id,
                         access,
                     }
                 };
 
-                states.insert(root, new_state);
+                image_states.insert(root, new_state);
             }};
         }
 
@@ -1226,7 +1251,7 @@ impl Module {
                 IR::SelectionMerge { merge, .. } => {
                     constructs.push(Construct {
                         merge: *merge,
-                        entry_states: states.clone(),
+                        entry_images: image_states.clone(),
                         entry_buffers: buffer_states.clone(),
                         arms: Vec::new(),
                     });
@@ -1236,7 +1261,7 @@ impl Module {
                     let construct = constructs.last_mut().expect("just matched on the top construct");
                     construct.arms.push(Arm {
                         at: result.len(),
-                        states: std::mem::replace(&mut states, construct.entry_states.clone()),
+                        images: std::mem::replace(&mut image_states, construct.entry_images.clone()),
                         buffers: std::mem::replace(&mut buffer_states, construct.entry_buffers.clone()),
                     });
                 },
@@ -1244,15 +1269,16 @@ impl Module {
                 IR::Label { label } if constructs.last().is_some_and(|c| c.merge == *label) => {
                     let construct = constructs.pop().expect("just matched on the top construct");
                     let ways_in = predecessors.get(label).copied().unwrap_or_default();
-                    let joined = self.join_arms(construct, ways_in, &mut result, next_id, undefined);
-                    states = joined.0;
+                    let live = live_after.remove(label).unwrap_or_default();
+                    let joined = self.join_arms(construct, ways_in, &mut result, next_id, undefined, &live);
+                    image_states = joined.0;
                     buffer_states = joined.1;
                 },
 
                 IR::ConstructImage { initial_layout, .. } => {
-                    states.insert(
+                    image_states.insert(
                         value_id,
-                        ResourceState {
+                        ImageState {
                             layout: *initial_layout,
                             last_access: no_access_id,
                             access: Access::None,
@@ -1358,6 +1384,42 @@ impl Module {
             self.instructions.get(self.resource_root(id).0 as usize),
             Some(IR::ConstructBuffer { .. })
         )
+    }
+
+    /// The roots an instruction takes a barrier on, which is the whole of what reads the
+    /// state a join records.
+    fn resource_uses(&self, ir: &IR, uses: &mut Vec<ValueId>) {
+        let mut used = |resource: &ValueId| uses.push(self.resource_root(*resource));
+
+        match ir {
+            IR::Acquire { resource, .. } | IR::Release { resource, .. } => used(resource),
+            IR::Clear { attachment, .. } => used(attachment),
+            IR::Blit { src, dst, .. } => {
+                used(src);
+                used(dst);
+            },
+            IR::CopyBufferToImage { buffer, image, .. } => {
+                used(buffer);
+                used(image);
+            },
+            IR::BeginRendering {
+                color_attachments,
+                depth_attachment,
+                ..
+            } => {
+                color_attachments.iter().for_each(&mut used);
+                depth_attachment.iter().for_each(&mut used);
+            },
+            IR::SampleImage { image, .. } => used(image),
+            IR::BindVertexBuffers { buffers, .. } => buffers.iter().for_each(&mut used),
+            IR::BindIndexBuffer { buffer, .. } => used(buffer),
+            IR::BeginCompute { resources, .. } => resources.iter().for_each(|(resource, _)| used(resource)),
+            IR::Dispatch {
+                size: ir::DispatchSize::Indirect { buffer, .. },
+                ..
+            } => used(buffer),
+            _ => {},
+        }
     }
 
     fn resource_root(&self, id: ValueId) -> ValueId {
@@ -4552,19 +4614,18 @@ mod tests {
         let target = module.transient_image(&transient_info());
         let enabled = module.declare_bool_var("enabled", true);
 
-        let end = module.set_condition(
-            enabled,
-            |m| {
-                m.begin_compute()
-                    .bind_pipeline(PipelineId(0))
-                    .write(target)
-                    .read_uniform(first)
-                    .read_uniform(second)
-                    .dispatch(1, 1, 1)
-                    .end_compute()
-            },
-            |_| target,
-        );
+        let read_both = |m: &mut Module, target| {
+            m.begin_compute()
+                .bind_pipeline(PipelineId(0))
+                .write(target)
+                .read_uniform(first)
+                .read_uniform(second)
+                .dispatch(1, 1, 1)
+                .end_compute()
+        };
+
+        let drawn = module.set_condition(enabled, |m| read_both(m, target), |_| target);
+        let end = read_both(&mut module, drawn);
 
         let compiled = module.compile(end);
         let (merge, _, skipped) = selection_labels(&compiled);
@@ -4573,6 +4634,38 @@ mod tests {
             .filter(|(_, ir)| matches!(ir, IR::MemoryBarrier { .. }))
             .count();
         assert_eq!(caught_up, 1, "{}", compiled.dump());
+    }
+
+    /// Buffers an arm binds and nothing past the merge names again are never asked what state
+    /// they are in, so the arm that skipped the draw has nothing to catch up on.
+    #[test]
+    fn an_arm_skips_catching_up_a_resource_the_merge_never_reaches() {
+        let (mut module, target) = module_with_attachment();
+        let enabled = module.declare_bool_var("enabled", true);
+        let vertices = module.declare_buffer_var("vertices", Access::HostWrite);
+        let indices = module.declare_buffer_var("indices", Access::HostWrite);
+
+        let drawn = module.set_condition(
+            enabled,
+            |m| {
+                m.begin_rendering(&[target])
+                    .bind_graphics_pipeline(PipelineId(0))
+                    .bind_vertex_buffer(0, vertices)
+                    .bind_index_buffer(indices, vk::IndexType::UINT32)
+                    .draw(3, 1)
+                    .end_rendering()
+            },
+            |_| target,
+        );
+
+        let end = module.release(drawn, Access::Present, DomainFlag::Present);
+        let compiled = module.compile(end);
+        let (merge, _, skipped) = selection_labels(&compiled);
+        let caught_up = compiled.instructions()[block_at(&compiled, skipped)..block_at(&compiled, merge)]
+            .iter()
+            .filter(|(_, ir)| matches!(ir, IR::MemoryBarrier { .. }))
+            .count();
+        assert_eq!(caught_up, 0, "{}", compiled.dump());
     }
 
     /// Bytes pushed from a variable are only sized when compiled; what they hold is read
