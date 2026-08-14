@@ -1,6 +1,9 @@
-use std::{collections::HashSet, ops::Range};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::Range,
+};
 
-use crate::{IR, LabelId, Module, ValueId, graph::ir};
+use crate::{Access, IR, LabelId, Module, ValueId, graph::ir};
 
 struct BlockAddress {
     label: LabelId,
@@ -192,6 +195,87 @@ fn fold_equal_targets(nodes: &mut Vec<ir::Instr>) -> bool {
     true
 }
 
+fn access_constants(nodes: &[ir::Instr]) -> HashMap<ValueId, Access> {
+    nodes
+        .iter()
+        .filter_map(|(id, ir)| match ir {
+            IR::Constant(ir::Constant::Access(access)) => Some((*id, *access)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn barrier_runs(nodes: &[ir::Instr]) -> Vec<Vec<usize>> {
+    let mut runs = Vec::new();
+    let mut run: Vec<usize> = Vec::new();
+    let mut close = |run: &mut Vec<usize>| match run.len() > 1 {
+        true => runs.push(std::mem::take(run)),
+        false => run.clear(),
+    };
+
+    for (index, (_, ir)) in nodes.iter().enumerate() {
+        match ir {
+            IR::MemoryBarrier { .. } => run.push(index),
+            IR::ImageBarrier { .. } => {},
+            _ if !ir.side_effects().is_observable() => {},
+            _ => close(&mut run),
+        }
+    }
+
+    close(&mut run);
+
+    runs
+}
+
+struct Folded {
+    at: usize,
+    src: Access,
+    dst: Access,
+}
+
+fn fold_run(
+    nodes: &[ir::Instr], accesses: &HashMap<ValueId, Access>, run: &[usize], kept: &mut Vec<Folded>,
+    dropped: &mut HashSet<usize>,
+) {
+    let first = kept.len();
+
+    for &at in run {
+        let IR::MemoryBarrier { src_access, dst_access } = nodes[at].1 else {
+            continue;
+        };
+        let (Some(src), Some(dst)) = (accesses.get(&src_access), accesses.get(&dst_access)) else {
+            continue;
+        };
+        let (src, dst) = (*src, *dst);
+
+        match kept[first..]
+            .iter_mut()
+            .find(|folded| folded.src == src || folded.dst == dst)
+        {
+            Some(folded) => {
+                folded.src |= src;
+                folded.dst |= dst;
+                dropped.insert(at);
+            },
+            None => kept.push(Folded { at, src, dst }),
+        }
+    }
+}
+
+fn constant_for(
+    nodes: &mut Vec<ir::Instr>, pool: &mut HashMap<Access, ValueId>, next_id: &mut u32, access: Access,
+) -> ValueId {
+    if let Some(id) = pool.get(&access) {
+        return *id;
+    }
+
+    let id = ValueId(*next_id);
+    *next_id += 1;
+    pool.insert(access, id);
+    nodes.push((id, IR::Constant(ir::Constant::Access(access))));
+    id
+}
+
 impl Module {
     pub(crate) fn simplify_cfg(&self, mut nodes: Vec<ir::Instr>) -> Vec<ir::Instr> {
         loop {
@@ -203,6 +287,44 @@ impl Module {
             }
         }
     }
+
+    pub(crate) fn fold_barriers(&self, nodes: Vec<ir::Instr>, next_id: &mut u32) -> Vec<ir::Instr> {
+        let accesses = access_constants(&nodes);
+
+        let mut kept: Vec<Folded> = Vec::new();
+        let mut dropped = HashSet::new();
+        for run in barrier_runs(&nodes) {
+            fold_run(&nodes, &accesses, &run, &mut kept, &mut dropped);
+        }
+        if dropped.is_empty() {
+            return nodes;
+        }
+
+        let mut pool: HashMap<Access, ValueId> = HashMap::new();
+        for (id, ir) in &nodes {
+            if let IR::Constant(ir::Constant::Access(access)) = ir {
+                pool.entry(*access).or_insert(*id);
+            }
+        }
+
+        let mut result = Vec::with_capacity(nodes.len());
+        for (index, (id, ir)) in nodes.into_iter().enumerate() {
+            if dropped.contains(&index) {
+                continue;
+            }
+
+            let Some(folded) = kept.iter().find(|folded| folded.at == index) else {
+                result.push((id, ir));
+                continue;
+            };
+
+            let src_access = constant_for(&mut result, &mut pool, next_id, folded.src);
+            let dst_access = constant_for(&mut result, &mut pool, next_id, folded.dst);
+            result.push((id, IR::MemoryBarrier { src_access, dst_access }));
+        }
+
+        result
+    }
 }
 
 #[cfg(test)]
@@ -210,7 +332,7 @@ mod tests {
     use ash::vk;
 
     use super::*;
-    use crate::{Access, DomainFlag, ImageInfo, PipelineId, Program};
+    use crate::{DomainFlag, ImageInfo, PipelineId, Program};
 
     const FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
 
@@ -258,6 +380,18 @@ mod tests {
                 _ => None,
             })
             .unwrap_or_default()
+    }
+
+    fn memory_barriers(program: &Program) -> Vec<(Access, Access)> {
+        let accesses = access_constants(program.instructions());
+        program
+            .instructions()
+            .iter()
+            .filter_map(|(_, ir)| match ir {
+                IR::MemoryBarrier { src_access, dst_access } => Some((accesses[src_access], accesses[dst_access])),
+                _ => None,
+            })
+            .collect()
     }
 
     /// An arm that leaves every resource where the other arm leaves it has nothing to catch up
@@ -366,5 +500,67 @@ mod tests {
         let (taken, skipped) = conditional(&compiled).expect("the selection branches");
         assert_ne!(taken, skipped, "the merge could no longer tell the arms apart\n{dump}");
         assert_eq!(phi(&compiled).len(), 2, "{dump}");
+    }
+
+    /// Two host writes made visible with nothing recorded in between are one wait, so the pair
+    /// is asked for once and the reads it covers are named together.
+    #[test]
+    fn barriers_from_the_same_source_are_asked_for_once() {
+        let mut module = Module::default();
+        let target = transient_target(&mut module);
+        let vertices = module.declare_buffer_var("vertices", Access::HostWrite);
+        let indices = module.declare_buffer_var("indices", Access::HostWrite);
+
+        let drawn = module
+            .begin_rendering(&[target])
+            .bind_graphics_pipeline(PipelineId(0))
+            .bind_vertex_buffer(0, vertices)
+            .bind_index_buffer(indices, vk::IndexType::UINT32)
+            .draw(3, 1)
+            .end_rendering();
+        let end = module.release(drawn, Access::BlitRead, DomainFlag::Graphics);
+
+        let compiled = module.compile(end);
+        assert_eq!(
+            memory_barriers(&compiled),
+            vec![(Access::HostWrite, Access::AttributeRead | Access::IndexRead)],
+            "{}",
+            compiled.dump()
+        );
+    }
+
+    /// The second pass reads what the first one leaves behind, so where its wait sits among the
+    /// commands is observable and the two waits stay apart.
+    #[test]
+    fn barriers_a_pass_sits_between_stay_apart() {
+        let mut module = Module::default();
+        let target = transient_target(&mut module);
+        let vertices = module.declare_buffer_var("vertices", Access::HostWrite);
+        let indices = module.declare_buffer_var("indices", Access::HostWrite);
+
+        let first = module
+            .begin_rendering(&[target])
+            .bind_graphics_pipeline(PipelineId(0))
+            .bind_vertex_buffer(0, vertices)
+            .draw(3, 1)
+            .end_rendering();
+        let second = module
+            .begin_rendering(&[first])
+            .bind_graphics_pipeline(PipelineId(0))
+            .bind_index_buffer(indices, vk::IndexType::UINT32)
+            .draw(3, 1)
+            .end_rendering();
+        let end = module.release(second, Access::BlitRead, DomainFlag::Graphics);
+
+        let compiled = module.compile(end);
+        assert_eq!(
+            memory_barriers(&compiled),
+            vec![
+                (Access::HostWrite, Access::AttributeRead),
+                (Access::HostWrite, Access::IndexRead),
+            ],
+            "{}",
+            compiled.dump()
+        );
     }
 }

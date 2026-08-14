@@ -441,9 +441,9 @@ mod tests {
         assert!(dump.contains("var \"animate\" Bool"), "{dump}");
         assert!(dump.contains("= label 0:"), "{dump}");
         assert!(dump.contains("selection_merge label 1"), "{dump}");
-        assert!(dump.contains("branch_cond $animate -> label 2, label 3"), "{dump}");
+        assert!(dump.contains("branch_cond %5(animate) -> label 2, label 3"), "{dump}");
         assert!(dump.contains("branch label 1"), "{dump}");
-        assert!(dump.contains("color=$hue"), "{dump}");
+        assert!(dump.contains("color=%6(hue)"), "{dump}");
         assert!(dump.contains("phi ["), "{dump}");
         assert!(dump.contains("\n%12 =   selection_merge"), "{dump}");
     }

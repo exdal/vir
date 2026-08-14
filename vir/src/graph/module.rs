@@ -647,6 +647,7 @@ impl Module {
         let nodes = self.layout_blocks(nodes, &mut next_id);
         let nodes = self.sync(nodes, &mut next_id);
         let nodes = self.simplify_cfg(nodes);
+        let nodes = self.fold_barriers(nodes, &mut next_id);
         let mut nodes = globals_first(nodes);
         self.infer_usage(&mut nodes);
 
@@ -3222,8 +3223,10 @@ mod tests {
         );
     }
 
+    /// Both buffers wait on the same host writes with nothing recorded in between, so the two
+    /// waits fold into one that names every stage reading them.
     #[test]
-    fn vertex_and_index_buffers_each_get_the_barrier_their_stage_needs() {
+    fn vertex_and_index_buffers_share_the_barrier_their_stages_need() {
         let (mut module, attachment) = module_with_attachment();
         let vertices = module.import_buffer(&Buffer::default(), Access::HostWrite);
         let indices = module.import_buffer(&Buffer::default(), Access::HostWrite);
@@ -3236,10 +3239,13 @@ mod tests {
             .draw_indexed(3, 1)
             .end_rendering();
 
-        let barriers = memory_barriers(&module, &module.compile(end));
-        assert_eq!(barriers.len(), 2);
-        assert!(barriers.contains(&(Access::HostWrite, Access::AttributeRead)));
-        assert!(barriers.contains(&(Access::HostWrite, Access::IndexRead)));
+        let compiled = module.compile(end);
+        assert_eq!(
+            memory_barriers(&module, &compiled),
+            vec![(Access::HostWrite, Access::AttributeRead | Access::IndexRead)],
+            "{}",
+            compiled.dump()
+        );
     }
 
     #[test]
