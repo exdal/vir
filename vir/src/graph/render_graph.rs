@@ -33,7 +33,7 @@ use crate::{
     PushConstants,
     Rect2D,
     ResolvedViewport,
-    SwapchainBinding,
+    AcquiredSwapchain,
     TextureId,
     Value,
     ValueId,
@@ -1130,7 +1130,7 @@ impl RenderGraph {
                 self.set_value(value_id, Value::ImageAttachment(attachment));
             },
             IR::AcquireNextImage { swapchain } => {
-                let handle = self.get::<SwapchainBinding>(swapchain).handle;
+                let handle = self.get::<AcquiredSwapchain>(swapchain).handle;
                 let acquire_semaphore = allocator.allocate_binary_semaphore()?;
                 let image_index = ctx.acquire_next_image(handle, acquire_semaphore)?;
 
@@ -1144,7 +1144,7 @@ impl RenderGraph {
             },
             IR::SwapchainImage { swapchain, acquire, .. } => {
                 let image_index = self.get::<u32>(acquire);
-                let binding = self.get::<SwapchainBinding>(swapchain);
+                let binding = self.get::<AcquiredSwapchain>(swapchain);
 
                 let attachment = binding
                     .attachments

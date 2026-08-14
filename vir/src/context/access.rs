@@ -75,6 +75,8 @@ bitflags! {
 
 impl Access {
     pub fn writes(self) -> bool { self.intersects(Access::Writes) }
+
+    pub fn reads(self) -> bool { !self.difference(Access::Writes | Access::None).is_empty() }
 }
 
 impl From<Access> for vk::AccessFlags2 {

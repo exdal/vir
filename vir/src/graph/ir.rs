@@ -416,6 +416,212 @@ pub fn underlying_object(ir: &IR) -> UnderlyingObject {
     }
 }
 
+bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct SideEffect: u32 {
+        /// Reads the memory of a resource it names.
+        const Read = 1 << 0;
+        /// Writes the memory of a resource it names.
+        const Write = 1 << 1;
+        /// Exists to move a resource into another synchronization state.
+        const Sync = 1 << 2;
+        /// Records a command, so where it sits among the other commands is observable.
+        const Command = 1 << 3;
+        /// Writes pass state that the draws and dispatches after it read.
+        const State = 1 << 4;
+        /// Reads the state its pass has accumulated.
+        const ReadsState = 1 << 5;
+        /// Produces an identity of its own, so two of them are never the same value.
+        const Defines = 1 << 6;
+        /// Runs host code the graph cannot see into.
+        const Host = 1 << 7;
+        /// Is observable outside the module.
+        const External = 1 << 8;
+        /// Belongs to the block it sits in and cannot leave it.
+        const Control = 1 << 9;
+        /// Ends a block.
+        const Terminator = 1 << 10;
+
+        const Memory = Self::Read.bits() | Self::Write.bits();
+
+        /// The effects that keep an instruction alive even when nothing uses its value.
+        const Observable = Self::Write.bits()
+            | Self::Sync.bits()
+            | Self::Command.bits()
+            | Self::State.bits()
+            | Self::Host.bits()
+            | Self::External.bits()
+            | Self::Control.bits()
+            | Self::Terminator.bits();
+    }
+}
+
+impl SideEffect {
+    pub fn reads(self) -> bool { self.contains(SideEffect::Read) }
+
+    pub fn writes(self) -> bool { self.contains(SideEffect::Write) }
+
+    pub fn is_observable(self) -> bool { self.intersects(SideEffect::Observable) }
+}
+
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+pub enum SideEffectAccess {
+    /// The instruction fixes the access.
+    Fixed(Access),
+    /// The access is whatever the [`Constant::Access`] at this value holds.
+    Operand(ValueId),
+}
+
+impl SideEffectAccess {
+    pub fn fixed(self) -> Option<Access> {
+        match self {
+            SideEffectAccess::Fixed(access) => Some(access),
+            SideEffectAccess::Operand(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+pub struct ResourceSideEffect {
+    pub resource: ValueId,
+    pub access: SideEffectAccess,
+}
+
+impl IR {
+    pub fn side_effects(&self) -> SideEffect {
+        match self {
+            IR::Type(_) | IR::Constant(_) | IR::Variable { .. } | IR::Array { .. } | IR::Index { .. } => {
+                SideEffect::empty()
+            },
+
+            IR::ConstructBuffer { .. } | IR::ConstructImage { .. } | IR::SwapchainImage { .. } => SideEffect::Defines,
+            IR::AcquireNextImage { .. } => SideEffect::Defines | SideEffect::External,
+
+            IR::Acquire { .. } => SideEffect::Memory | SideEffect::Sync,
+            IR::Release { .. } => SideEffect::Memory | SideEffect::Sync | SideEffect::External,
+
+            IR::Clear { .. } => SideEffect::Write | SideEffect::Command,
+            IR::Blit { .. } | IR::CopyBufferToImage { .. } => SideEffect::Memory | SideEffect::Command,
+
+            IR::BeginRendering { .. } => SideEffect::Memory | SideEffect::Command | SideEffect::State,
+            IR::BeginCompute { resources, .. } => {
+                let mut effects = SideEffect::Sync | SideEffect::Command | SideEffect::State;
+                for (_, access) in resources {
+                    if access.reads() {
+                        effects |= SideEffect::Read;
+                    }
+                    if access.writes() {
+                        effects |= SideEffect::Write;
+                    }
+                }
+                effects
+            },
+            IR::EndRendering { .. } | IR::EndCompute { .. } => SideEffect::Command,
+
+            IR::BindPipeline { .. } | IR::SetState { .. } => SideEffect::State,
+            IR::BindVertexBuffers { .. } | IR::BindIndexBuffer { .. } => {
+                SideEffect::Read | SideEffect::State | SideEffect::Command
+            },
+            IR::SampleImage { .. } => SideEffect::Read | SideEffect::Sync,
+
+            IR::Draw { .. } | IR::DrawIndexed { .. } => SideEffect::Command | SideEffect::ReadsState,
+            IR::CallOpaque { .. } => SideEffect::Command | SideEffect::ReadsState | SideEffect::Host,
+            IR::Dispatch { size, .. } => {
+                let base = SideEffect::Command | SideEffect::ReadsState;
+                match size {
+                    DispatchSize::Indirect { .. } => base | SideEffect::Read | SideEffect::Sync,
+                    _ => base,
+                }
+            },
+
+            IR::Label { .. } | IR::SelectionMerge { .. } | IR::Phi { .. } => SideEffect::Control,
+            IR::Branch { .. } | IR::BranchConditional { .. } | IR::Return => SideEffect::Control | SideEffect::Terminator,
+
+            IR::MemoryBarrier { .. } | IR::ImageBarrier { .. } => SideEffect::Sync | SideEffect::Command,
+        }
+    }
+
+    /// Nothing observes the instruction beyond the value it produces.
+    pub fn is_pure(&self) -> bool { self.side_effects().is_empty() }
+
+    /// The instruction can be dropped once nothing names its value.
+    pub fn is_removable_when_unused(&self) -> bool { !self.side_effects().is_observable() }
+
+    /// Two of these with equal operands produce the same value, so one can stand for both.
+    pub fn is_mergeable(&self) -> bool { self.is_pure() }
+
+    pub fn is_terminator(&self) -> bool { self.side_effects().contains(SideEffect::Terminator) }
+
+    pub fn opens_region(&self) -> bool { matches!(self, IR::BeginRendering { .. } | IR::BeginCompute { .. }) }
+
+    pub fn closes_region(&self) -> bool { matches!(self, IR::EndRendering { .. } | IR::EndCompute { .. }) }
+
+    /// What the instruction does to each resource it names, in the order the operands are given.
+    pub fn visit_resource_side_effects(&self, mut visit: impl FnMut(ResourceSideEffect)) {
+        let mut fixed = |resource: ValueId, access: Access| {
+            visit(ResourceSideEffect {
+                resource,
+                access: SideEffectAccess::Fixed(access),
+            })
+        };
+
+        match self {
+            IR::Acquire { resource, access } | IR::Release { resource, access, .. } => visit(ResourceSideEffect {
+                resource: *resource,
+                access: SideEffectAccess::Operand(*access),
+            }),
+
+            IR::Clear { attachment, .. } => fixed(*attachment, Access::Clear),
+            IR::Blit { src, dst, .. } => {
+                fixed(*src, Access::BlitRead);
+                fixed(*dst, Access::BlitWrite);
+            },
+            IR::CopyBufferToImage { buffer, image, .. } => {
+                fixed(*buffer, Access::CopyRead);
+                fixed(*image, Access::CopyWrite);
+            },
+
+            IR::BeginRendering {
+                color_attachments,
+                depth_attachment,
+                ..
+            } => {
+                for attachment in color_attachments {
+                    fixed(*attachment, Access::ColorRW);
+                }
+                if let Some(depth) = depth_attachment {
+                    fixed(*depth, Access::DepthStencilRW);
+                }
+            },
+            IR::BeginCompute { resources, .. } => {
+                for (resource, access) in resources {
+                    fixed(*resource, *access);
+                }
+            },
+
+            IR::SampleImage { image, .. } => fixed(*image, Access::FragmentSampled),
+            IR::BindVertexBuffers { buffers, .. } => {
+                for buffer in buffers {
+                    fixed(*buffer, Access::AttributeRead);
+                }
+            },
+            IR::BindIndexBuffer { buffer, .. } => fixed(*buffer, Access::IndexRead),
+            IR::Dispatch {
+                size: DispatchSize::Indirect { buffer, .. },
+                ..
+            } => fixed(*buffer, Access::IndirectRead),
+
+            _ => {},
+        }
+    }
+
+    pub fn resource_effects(&self) -> Vec<ResourceSideEffect> {
+        let mut effects = Vec::new();
+        self.visit_resource_side_effects(|effect| effects.push(effect));
+        effects
+    }
+}
+
 #[derive(Default)]
 pub struct Symbols<'a> {
     values: HashMap<ValueId, &'a IR>,
@@ -442,6 +648,20 @@ impl<'a> Symbols<'a> {
         match self.get(id)? {
             IR::Constant(constant) => Some(constant),
             _ => None,
+        }
+    }
+
+    pub fn access(&self, id: ValueId) -> Option<Access> {
+        match self.constant(id)? {
+            Constant::Access(access) => Some(*access),
+            _ => None,
+        }
+    }
+
+    pub fn side_effect_access(&self, effect: &ResourceSideEffect) -> Option<Access> {
+        match effect.access {
+            SideEffectAccess::Fixed(access) => Some(access),
+            SideEffectAccess::Operand(id) => self.access(id),
         }
     }
 
@@ -1160,4 +1380,148 @@ fn fmt_pipeline(pipeline: &Option<PipelineId>) -> String {
 
 impl fmt::Display for IR {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { self.fmt_with(f, &Symbols::default(), ValueId(0)) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn value(id: u32) -> ValueId { ValueId(id) }
+
+    /// The instructions that name resources, one of each shape the effects cover.
+    fn naming() -> Vec<IR> {
+        vec![
+            IR::Clear {
+                attachment: value(1),
+                color: value(2),
+            },
+            IR::Blit {
+                src: value(1),
+                dst: value(2),
+                filter: vk::Filter::LINEAR,
+            },
+            IR::CopyBufferToImage {
+                buffer: value(1),
+                image: value(2),
+                region: None,
+            },
+            IR::BeginRendering {
+                color_attachments: vec![value(1)],
+                depth_attachment: Some(value(2)),
+                render_area: None,
+                name: None,
+            },
+            IR::BeginCompute {
+                resources: vec![(value(1), Access::ComputeRead)],
+                name: None,
+            },
+            IR::BeginCompute {
+                resources: vec![(value(1), Access::ComputeRead), (value(2), Access::ComputeWrite)],
+                name: None,
+            },
+            IR::SampleImage {
+                pass: value(0),
+                image: value(1),
+            },
+            IR::BindIndexBuffer {
+                pass: value(0),
+                buffer: value(1),
+                offset: 0,
+                index_type: vk::IndexType::UINT32,
+            },
+            IR::Dispatch {
+                pass: value(0),
+                size: DispatchSize::Indirect {
+                    buffer: value(1),
+                    offset: 0,
+                },
+                pipeline: None,
+                push_constants: PushConstants::default(),
+            },
+        ]
+    }
+
+    #[test]
+    fn read_and_write_match_the_resources_named() {
+        for ir in naming() {
+            let effects = ir.side_effects();
+            let accesses = ir
+                .resource_effects()
+                .into_iter()
+                .map(|effect| effect.access.fixed().expect("these instructions fix their access"))
+                .collect::<Vec<_>>();
+
+            assert!(!accesses.is_empty(), "{ir} names no resource");
+            assert_eq!(
+                effects.reads(),
+                accesses.iter().any(|access| access.reads()),
+                "{ir} is mislabelled for reads"
+            );
+            assert_eq!(
+                effects.writes(),
+                accesses.iter().any(|access| access.writes()),
+                "{ir} is mislabelled for writes"
+            );
+        }
+    }
+
+    #[test]
+    fn instructions_that_touch_resources_are_kept() {
+        for ir in naming() {
+            assert!(!ir.is_removable_when_unused(), "{ir} would be dropped when unused");
+        }
+    }
+
+    #[test]
+    fn values_are_pure_and_resources_are_only_dead_without_uses() {
+        assert!(IR::Constant(Constant::U32(0)).is_pure());
+        assert!(
+            IR::Index {
+                array: value(1),
+                index: value(2),
+            }
+            .is_pure()
+        );
+
+        let buffer = IR::ConstructBuffer {
+            buffer: Buffer::default(),
+            size: None,
+            usage: vk::BufferUsageFlags::empty(),
+            location: MemoryLocation::GpuOnly,
+            initial_access: Access::None,
+            name: None,
+        };
+        assert!(!buffer.is_pure(), "a construct is an identity of its own");
+        assert!(!buffer.is_mergeable());
+        assert!(buffer.is_removable_when_unused());
+    }
+
+    #[test]
+    fn an_operand_access_resolves_through_the_symbols() {
+        let instructions = [
+            (value(0), IR::Constant(Constant::Access(Access::Present))),
+            (
+                value(1),
+                IR::Release {
+                    resource: value(2),
+                    access: value(0),
+                    dst_domain: DomainFlag::empty(),
+                },
+            ),
+        ];
+        let symbols = Symbols::new(&instructions);
+
+        let effects = instructions[1].1.resource_effects();
+        assert_eq!(effects.len(), 1);
+        assert_eq!(effects[0].resource, value(2));
+        assert_eq!(effects[0].access, SideEffectAccess::Operand(value(0)));
+        assert_eq!(symbols.side_effect_access(&effects[0]), Some(Access::Present));
+    }
+
+    #[test]
+    fn terminators_end_their_block() {
+        assert!(IR::Return.is_terminator());
+        assert!(IR::Branch { target: LabelId(1) }.is_terminator());
+        assert!(!IR::Label { label: LabelId(1) }.is_terminator());
+    }
 }

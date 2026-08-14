@@ -11,13 +11,13 @@ pub struct SwapChain {
 }
 
 #[derive(Debug, Default, Clone)]
-pub struct SwapchainBinding {
+pub struct AcquiredSwapchain {
     pub handle: vk::SwapchainKHR,
     pub attachments: Vec<ImageAttachment>,
     pub present_semaphores: Vec<vk::Semaphore>,
 }
 
-impl From<&SwapChain> for SwapchainBinding {
+impl From<&SwapChain> for AcquiredSwapchain {
     fn from(swapchain: &SwapChain) -> Self {
         Self {
             handle: swapchain.handle,

@@ -2,7 +2,7 @@ use std::{fmt, sync::Arc};
 
 use ash::vk;
 
-use crate::{Access, Buffer, ClearValue, ImageAttachment, PassCallback, SwapchainBinding, graph::ir::VariableKind};
+use crate::{Access, Buffer, ClearValue, ImageAttachment, PassCallback, AcquiredSwapchain, graph::ir::VariableKind};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ValueId(pub u32);
@@ -36,7 +36,7 @@ pub enum Value {
     ImageAttachment(ImageAttachment),
     Buffer(Buffer),
     Bytes(Arc<[u8]>),
-    Swapchain(SwapchainBinding),
+    Swapchain(AcquiredSwapchain),
     Slice(Vec<ValueId>),
     Reference(ValueId),
     Access(Access),
@@ -87,8 +87,8 @@ impl From<ClearValue> for Value {
 impl From<&[u8]> for Value {
     fn from(v: &[u8]) -> Self { Value::Bytes(Arc::from(v)) }
 }
-impl From<SwapchainBinding> for Value {
-    fn from(v: SwapchainBinding) -> Self { Value::Swapchain(v) }
+impl From<AcquiredSwapchain> for Value {
+    fn from(v: AcquiredSwapchain) -> Self { Value::Swapchain(v) }
 }
 impl From<Buffer> for Value {
     fn from(v: Buffer) -> Self { Value::Buffer(v) }
@@ -119,7 +119,7 @@ impl FromValue for bool {
     }
 }
 
-impl FromValue for SwapchainBinding {
+impl FromValue for AcquiredSwapchain {
     fn from_value(value: &Value) -> Self {
         match value {
             Value::Swapchain(v) => v.clone(),

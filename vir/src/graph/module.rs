@@ -7,6 +7,7 @@ use ash::vk;
 
 use crate::{
     Access,
+    AcquiredSwapchain,
     Buffer,
     BufferImageCopy,
     BufferInfo,
@@ -30,7 +31,6 @@ use crate::{
     RenderingState,
     StateChange,
     SwapChain,
-    SwapchainBinding,
     Value,
     ValueId,
     Viewport,
@@ -506,7 +506,7 @@ impl Module {
         self.declare_var(
             ir::VariableKind::Swapchain,
             name,
-            Value::Swapchain(SwapchainBinding::default()),
+            Value::Swapchain(AcquiredSwapchain::default()),
         )
     }
 
@@ -526,7 +526,7 @@ impl Module {
     pub fn acquire_next_image(&mut self, swapchain: &SwapChain) -> ValueId {
         let variable = self.declare_swapchain_var("swapchain");
         if let Some(declared) = self.variables.last_mut() {
-            declared.value = Value::Swapchain(SwapchainBinding::from(swapchain));
+            declared.value = Value::Swapchain(AcquiredSwapchain::from(swapchain));
         }
 
         self.acquire_next_image_from(variable, swapchain.format(), swapchain.samples())
@@ -643,9 +643,11 @@ impl Module {
         roots.extend(self.branch_conditions());
 
         let mut next_id = self.instructions.len() as u32;
-        let linearized = self.layout_blocks(self.topo_sort(&roots), &mut next_id);
-        let mut synced = globals_first(self.sync(linearized, &mut next_id));
-        self.infer_usage(&mut synced);
+        let nodes = self.topo_sort(&roots);
+        let nodes = self.layout_blocks(nodes, &mut next_id);
+        let nodes = self.sync(nodes, &mut next_id);
+        let mut nodes = globals_first(nodes);
+        self.infer_usage(&mut nodes);
 
         let slots: HashMap<ValueId, u32> = self
             .variable_ids
@@ -653,8 +655,9 @@ impl Module {
             .enumerate()
             .map(|(slot, id)| (*id, slot as u32))
             .collect();
+        let nodes = self.infer(nodes);
 
-        Program::new(self.infer(synced), self.variables.clone(), slots)
+        Program::new(nodes, self.variables.clone(), slots)
     }
 
     fn topo_sort(&self, roots: &[ValueId]) -> Vec<ir::Instr> {
@@ -1389,37 +1392,7 @@ impl Module {
     /// The roots an instruction takes a barrier on, which is the whole of what reads the
     /// state a join records.
     fn resource_uses(&self, ir: &IR, uses: &mut Vec<ValueId>) {
-        let mut used = |resource: &ValueId| uses.push(self.resource_root(*resource));
-
-        match ir {
-            IR::Acquire { resource, .. } | IR::Release { resource, .. } => used(resource),
-            IR::Clear { attachment, .. } => used(attachment),
-            IR::Blit { src, dst, .. } => {
-                used(src);
-                used(dst);
-            },
-            IR::CopyBufferToImage { buffer, image, .. } => {
-                used(buffer);
-                used(image);
-            },
-            IR::BeginRendering {
-                color_attachments,
-                depth_attachment,
-                ..
-            } => {
-                color_attachments.iter().for_each(&mut used);
-                depth_attachment.iter().for_each(&mut used);
-            },
-            IR::SampleImage { image, .. } => used(image),
-            IR::BindVertexBuffers { buffers, .. } => buffers.iter().for_each(&mut used),
-            IR::BindIndexBuffer { buffer, .. } => used(buffer),
-            IR::BeginCompute { resources, .. } => resources.iter().for_each(|(resource, _)| used(resource)),
-            IR::Dispatch {
-                size: ir::DispatchSize::Indirect { buffer, .. },
-                ..
-            } => used(buffer),
-            _ => {},
-        }
+        ir.visit_resource_side_effects(|effect| uses.push(self.resource_root(effect.resource)));
     }
 
     fn resource_root(&self, id: ValueId) -> ValueId {
