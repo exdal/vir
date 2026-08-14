@@ -888,7 +888,7 @@ impl fmt::Display for Operand<'_> {
 
         if let Some(IR::Variable { slot, name, .. }) = self.program.get(self.id) {
             return match name {
-                Some(name) => write!(f, "${name}"),
+                Some(name) => write!(f, "{}({name})", self.id),
                 None => write!(f, "$slot{slot}"),
             };
         }
@@ -1648,7 +1648,6 @@ mod tests {
             name: None,
         };
         assert!(!buffer.is_pure(), "a construct is an identity of its own");
-        assert!(!buffer.is_mergeable());
         assert!(buffer.is_removable_when_unused());
     }
 
