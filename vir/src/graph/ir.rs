@@ -541,20 +541,176 @@ impl IR {
         }
     }
 
-    /// Nothing observes the instruction beyond the value it produces.
     pub fn is_pure(&self) -> bool { self.side_effects().is_empty() }
 
-    /// The instruction can be dropped once nothing names its value.
     pub fn is_removable_when_unused(&self) -> bool { !self.side_effects().is_observable() }
-
-    /// Two of these with equal operands produce the same value, so one can stand for both.
-    pub fn is_mergeable(&self) -> bool { self.is_pure() }
 
     pub fn is_terminator(&self) -> bool { self.side_effects().contains(SideEffect::Terminator) }
 
     pub fn opens_region(&self) -> bool { matches!(self, IR::BeginRendering { .. } | IR::BeginCompute { .. }) }
 
     pub fn closes_region(&self) -> bool { matches!(self, IR::EndRendering { .. } | IR::EndCompute { .. }) }
+
+    pub fn visit_operands(&self, mut visit: impl FnMut(ValueId)) {
+        match self {
+            IR::Type(_)
+            | IR::Constant(_)
+            | IR::Variable { .. }
+            | IR::Label { .. }
+            | IR::SelectionMerge { .. }
+            | IR::Branch { .. }
+            | IR::Return => {},
+
+            IR::Array { ty, elements } => {
+                visit(*ty);
+                elements.iter().copied().for_each(&mut visit);
+            },
+            IR::Index { array, index } => {
+                visit(*array);
+                visit(*index);
+            },
+
+            IR::ConstructBuffer { size, .. } => size.iter().copied().for_each(&mut visit),
+            IR::ConstructImage {
+                extent,
+                base_level,
+                level_count,
+                base_layer,
+                layer_count,
+                ..
+            } => {
+                extent.iter().copied().for_each(&mut visit);
+                visit(*base_level);
+                visit(*level_count);
+                visit(*base_layer);
+                visit(*layer_count);
+            },
+
+            IR::AcquireNextImage { swapchain } => visit(*swapchain),
+            IR::SwapchainImage { swapchain, acquire, .. } => {
+                visit(*swapchain);
+                visit(*acquire);
+            },
+            IR::Acquire { resource, access } | IR::Release { resource, access, .. } => {
+                visit(*resource);
+                visit(*access);
+            },
+
+            IR::Clear { attachment, color } => {
+                visit(*attachment);
+                visit(*color);
+            },
+            IR::Blit { src, dst, .. } => {
+                visit(*src);
+                visit(*dst);
+            },
+            IR::CopyBufferToImage { buffer, image, .. } => {
+                visit(*buffer);
+                visit(*image);
+            },
+
+            IR::BeginRendering {
+                color_attachments,
+                depth_attachment,
+                render_area,
+                ..
+            } => {
+                color_attachments.iter().copied().for_each(&mut visit);
+                depth_attachment.iter().copied().for_each(&mut visit);
+                render_area.iter().copied().for_each(&mut visit);
+            },
+            IR::BeginCompute { resources, .. } => resources.iter().for_each(|(id, _)| visit(*id)),
+
+            IR::BindPipeline { pass, .. } | IR::EndRendering { pass } | IR::EndCompute { pass } => visit(*pass),
+            IR::SetState { pass, change } => {
+                visit(*pass);
+                match change {
+                    StateChange::PushConstantsFrom { source, .. } => visit(*source),
+                    StateChange::PushConstantAddress { buffer, .. } => visit(*buffer),
+                    _ => {},
+                }
+            },
+            IR::BindVertexBuffers { pass, buffers, .. } => {
+                visit(*pass);
+                buffers.iter().copied().for_each(&mut visit);
+            },
+            IR::BindIndexBuffer { pass, buffer, .. } => {
+                visit(*pass);
+                visit(*buffer);
+            },
+            IR::SampleImage { pass, image } => {
+                visit(*pass);
+                visit(*image);
+            },
+
+            IR::Draw {
+                pass,
+                vertex_count,
+                instance_count,
+                first_vertex,
+                first_instance,
+                ..
+            } => {
+                visit(*pass);
+                visit(*vertex_count);
+                visit(*instance_count);
+                visit(*first_vertex);
+                visit(*first_instance);
+            },
+            IR::DrawIndexed {
+                pass,
+                index_count,
+                instance_count,
+                first_index,
+                vertex_offset,
+                first_instance,
+                ..
+            } => {
+                visit(*pass);
+                visit(*index_count);
+                visit(*instance_count);
+                visit(*first_index);
+                visit(*vertex_offset);
+                visit(*first_instance);
+            },
+            IR::CallOpaque { pass, body, .. } => {
+                visit(*pass);
+                visit(*body);
+            },
+            IR::Dispatch { pass, size, .. } => {
+                visit(*pass);
+                match size {
+                    DispatchSize::Groups { x, y, z } | DispatchSize::Invocations { x, y, z } => {
+                        visit(*x);
+                        visit(*y);
+                        visit(*z);
+                    },
+                    DispatchSize::InvocationsPerPixel { image, .. } => visit(*image),
+                    DispatchSize::InvocationsPerElement { buffer, .. } | DispatchSize::Indirect { buffer, .. } => {
+                        visit(*buffer)
+                    },
+                }
+            },
+
+            IR::BranchConditional { condition, .. } => visit(*condition),
+            IR::Phi { incoming } => incoming.iter().for_each(|(value, _)| visit(*value)),
+
+            IR::MemoryBarrier { src_access, dst_access } => {
+                visit(*src_access);
+                visit(*dst_access);
+            },
+            IR::ImageBarrier {
+                src_access,
+                dst_access,
+                value,
+                ..
+            } => {
+                visit(*src_access);
+                visit(*dst_access);
+                visit(*value);
+            },
+        }
+    }
 
     /// What the instruction does to each resource it names, in the order the operands are given.
     pub fn visit_resource_side_effects(&self, mut visit: impl FnMut(ResourceSideEffect)) {

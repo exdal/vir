@@ -646,6 +646,7 @@ impl Module {
         let nodes = self.topo_sort(&roots);
         let nodes = self.layout_blocks(nodes, &mut next_id);
         let nodes = self.sync(nodes, &mut next_id);
+        let nodes = self.simplify_cfg(nodes);
         let mut nodes = globals_first(nodes);
         self.infer_usage(&mut nodes);
 
