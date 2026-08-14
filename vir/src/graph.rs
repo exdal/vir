@@ -10,7 +10,7 @@ pub mod value;
 
 pub use attachment::ImageAttachment;
 // dont export Constant, i think its ok to use it as ir::Constant
-pub use ir::{DispatchSize, SideEffectAccess, SideEffect, IR, ResourceSideEffect};
+pub use ir::{DispatchSize, IR, ResourceSideEffect, SideEffect, SideEffectAccess};
 pub use module::{ComputePass, Count, Module, RenderPass};
 pub use pass::PassCallback;
 pub use program::Program;

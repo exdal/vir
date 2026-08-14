@@ -2,7 +2,7 @@ use std::{fmt, sync::Arc};
 
 use ash::vk;
 
-use crate::{Access, Buffer, ClearValue, ImageAttachment, PassCallback, AcquiredSwapchain, graph::ir::VariableKind};
+use crate::{Access, AcquiredSwapchain, Buffer, ClearValue, ImageAttachment, PassCallback, graph::ir::VariableKind};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ValueId(pub u32);

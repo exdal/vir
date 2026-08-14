@@ -1,0 +1,88 @@
+name: Set up the toolchain
+description: Installs the pinned nightly toolchain, the cargo cache, and optionally the Slang SDK the examples need.
+
+inputs:
+  cache-key:
+    description: Suffix for the cargo cache so jobs with different targets do not share one.
+    required: false
+    default: ""
+  slang:
+    description: Install the Slang SDK. Only vir-examples needs it, vir itself does not.
+    required: false
+    default: "true"
+  slang-version:
+    description: Slang release to install, without the leading v. Set to latest to track upstream.
+    required: false
+    default: 2026.14.1
+
+runs:
+  using: composite
+  steps:
+    - name: Install nightly
+      id: toolchain
+      shell: bash
+      run: |
+        set -euo pipefail
+        rustup toolchain install nightly --profile minimal --component rustfmt,clippy
+        rustup default nightly
+        cargo --version
+
+        # Something like 1.98.0-nightly-f28ac764c. It goes in the cache key so a new nightly
+        # does not restore artifacts the old one built.
+        version=$(rustc --version | sed 's/^rustc //; s/ (\([0-9a-f]*\).*/-\1/')
+        echo "rustc $version"
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+
+    # Cargo.lock is in the key with no restore-keys, so bumping any dependency version starts
+    # from an empty cache instead of restoring one built against the old versions.
+    - name: Cache crates
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+          target
+        key: ${{ runner.os }}-cargo-${{ inputs.cache-key }}-${{ steps.toolchain.outputs.version }}-slang${{ inputs.slang-version }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+
+    - name: Install libclang
+      if: inputs.slang == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo apt-get update
+        sudo apt-get install --no-install-recommends -y libclang-dev
+
+        # bindgen usually finds libclang on its own, but point it at the install so a runner
+        # image that moves llvm around does not turn into a build script failure.
+        libclang=$(ls /usr/lib/llvm-*/lib/libclang.so* 2>/dev/null | head -n 1 || true)
+        if [ -n "$libclang" ]; then
+          echo "LIBCLANG_PATH=$(dirname "$libclang")" >> "$GITHUB_ENV"
+        fi
+
+    - name: Install Slang
+      if: inputs.slang == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        SLANG_VERSION: ${{ inputs.slang-version }}
+      run: |
+        set -euo pipefail
+
+        version=$SLANG_VERSION
+        if [ "$version" = "latest" ]; then
+          version=$(gh api repos/shader-slang/slang/releases/latest --jq .tag_name)
+          version=${version#v}
+        fi
+
+        url="https://github.com/shader-slang/slang/releases/download/v$version/slang-$version-linux-x86_64.tar.gz"
+        echo "installing $url"
+
+        # The tarball holds bin/, include/ and lib/ at its root, which is the layout SLANG_DIR wants.
+        mkdir -p "$RUNNER_TEMP/slang"
+        curl -fsSL "$url" | tar -xz -C "$RUNNER_TEMP/slang"
+
+        # shader-slang-sys reads SLANG_DIR at build time, and the build script that drives
+        # the compiler links against libslang, so the loader has to find it as well.
+        echo "SLANG_DIR=$RUNNER_TEMP/slang" >> "$GITHUB_ENV"
+        echo "LD_LIBRARY_PATH=$RUNNER_TEMP/slang/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"

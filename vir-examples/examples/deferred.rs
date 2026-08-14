@@ -945,7 +945,7 @@ mod scene {
     fn generate_normals(vertices: &mut [Vertex], indices: &[u32]) {
         let mut accumulated = vec![Vec3::ZERO; vertices.len()];
 
-        for triangle in indices.chunks_exact(3) {
+        for triangle in indices.as_chunks::<3>().0 {
             let [a, b, c] = [triangle[0] as usize, triangle[1] as usize, triangle[2] as usize];
             let Some(([pa, pb], pc)) = vertices
                 .get(a)
@@ -1143,7 +1143,7 @@ mod tests {
         let (mut agree, mut total) = (0usize, 0usize);
 
         for mesh in meshes {
-            for triangle in mesh.indices.chunks_exact(3) {
+            for triangle in mesh.indices.as_chunks::<3>().0 {
                 let [a, b, c] = [
                     mesh.vertices[triangle[0] as usize],
                     mesh.vertices[triangle[1] as usize],

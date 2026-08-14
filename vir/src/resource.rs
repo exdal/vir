@@ -36,4 +36,4 @@ pub use pipeline::{
 };
 pub use sampler::SamplerInfo;
 pub use shader::{DescriptorBinding, Reflection};
-pub use swapchain::{SwapChain, AcquiredSwapchain};
+pub use swapchain::{AcquiredSwapchain, SwapChain};

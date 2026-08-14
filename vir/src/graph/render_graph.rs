@@ -9,6 +9,7 @@ use ash::vk::{self, Handle};
 
 use crate::{
     Access,
+    AcquiredSwapchain,
     AllocatorKind,
     Buffer,
     BufferImageCopy,
@@ -33,7 +34,6 @@ use crate::{
     PushConstants,
     Rect2D,
     ResolvedViewport,
-    AcquiredSwapchain,
     TextureId,
     Value,
     ValueId,

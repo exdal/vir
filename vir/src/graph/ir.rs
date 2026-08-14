@@ -535,7 +535,9 @@ impl IR {
             },
 
             IR::Label { .. } | IR::SelectionMerge { .. } | IR::Phi { .. } => SideEffect::Control,
-            IR::Branch { .. } | IR::BranchConditional { .. } | IR::Return => SideEffect::Control | SideEffect::Terminator,
+            IR::Branch { .. } | IR::BranchConditional { .. } | IR::Return => {
+                SideEffect::Control | SideEffect::Terminator
+            },
 
             IR::MemoryBarrier { .. } | IR::ImageBarrier { .. } => SideEffect::Sync | SideEffect::Command,
         }
