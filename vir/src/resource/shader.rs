@@ -65,6 +65,7 @@ pub struct DescriptorBinding {
     pub descriptor_type: vk::DescriptorType,
     pub count: u32,
     pub variable_count: bool,
+    pub stages: vk::ShaderStageFlags,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -539,6 +540,7 @@ pub fn reflect(spirv: &[u32]) -> Result<Reflection, vk::Result> {
             descriptor_type,
             count,
             variable_count,
+            stages: stage,
         });
     }
 

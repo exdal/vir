@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     io::IsTerminal,
     ptr::NonNull,
     sync::Arc,
@@ -18,7 +18,7 @@ use crate::{
     CommandBuffer,
     ComputePipelineInfo,
     Context,
-    DescriptorSets,
+    DescriptorBinding,
     DomainFlag,
     DynamicValues,
     GraphicsPipelineInfo,
@@ -27,6 +27,7 @@ use crate::{
     ImageInfo,
     MemoryLocation,
     PassCallback,
+    PipelineBindings,
     PipelineId,
     PipelineLayout,
     PipelineState,
@@ -34,7 +35,6 @@ use crate::{
     PushConstants,
     Rect2D,
     ResolvedViewport,
-    TextureId,
     Value,
     ValueId,
     VertexLayout,
@@ -46,7 +46,14 @@ use crate::{
     },
     resource::{
         self,
-        pipeline::{ComputePipelineRequest, PipelineRequest, create_compute_pipelines, create_pipelines},
+        descriptor::DescriptorArena,
+        pipeline::{
+            ComputePipelineRequest,
+            PipelineRequest,
+            create_compute_pipelines,
+            create_pipelines,
+            validate_descriptor_bindings,
+        },
         shader::{self, Reflection},
     },
 };
@@ -167,29 +174,62 @@ enum PipelineKind {
 
 struct DeclaredPipeline {
     reflections: Vec<Reflection>,
+    bindings: Vec<DescriptorBinding>,
     layout: Option<PipelineLayout>,
-    descriptors: Option<DescriptorSets>,
-    written_textures: u64,
     kind: PipelineKind,
+}
+
+fn merged_bindings(reflections: &[Reflection]) -> Vec<DescriptorBinding> {
+    let mut merged: BTreeMap<(u32, u32), DescriptorBinding> = BTreeMap::new();
+    for reflection in reflections {
+        for binding in &reflection.bindings {
+            merged
+                .entry((binding.set, binding.binding))
+                .and_modify(|shared| shared.stages |= binding.stages)
+                .or_insert(*binding);
+        }
+    }
+
+    merged.into_values().collect()
 }
 
 impl DeclaredPipeline {
     fn layout_handle(&self) -> vk::PipelineLayout {
         self.layout.as_ref().map_or(vk::PipelineLayout::null(), |l| l.handle)
     }
+
+    fn bindless(&self) -> Option<crate::BindlessDescriptorSet> {
+        match &self.kind {
+            PipelineKind::Graphics { info, .. } => info.bindless,
+            PipelineKind::Compute { info, .. } => info.bindless,
+        }
+    }
 }
 
-#[derive(Clone, Copy)]
-struct Texture {
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DescriptorSetKey {
+    pipeline: PipelineId,
+    set: u32,
+    descriptors: Vec<ResolvedImageDescriptor>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ResolvedImageDescriptor {
+    set: u32,
+    binding: u32,
     image_view: vk::ImageView,
-    sampler: vk::Sampler,
+    sampler: Option<vk::Sampler>,
 }
 
-pub const DEFAULT_VARIABLE_DESCRIPTOR_COUNT: u32 = 1024;
+struct RetiredDescriptorArena {
+    arena: DescriptorArena,
+    waits: Vec<(vk::Semaphore, u64)>,
+}
 
 pub struct Recorder<'a> {
     graph: &'a mut RenderGraph,
     pipeline: PipelineId,
+    descriptors: BTreeMap<(u32, u32), ResolvedImageDescriptor>,
     result: Result<(), vk::Result>,
 }
 
@@ -240,7 +280,10 @@ impl Recorder<'_> {
     pub fn draw_range(
         &mut self, vertex_count: u32, instance_count: u32, first_vertex: u32, first_instance: u32,
     ) -> &mut Self {
-        self.record(|graph| {
+        let pipeline = self.pipeline;
+        let descriptors = self.descriptors.values().copied().collect::<Vec<_>>();
+        self.record(move |graph| {
+            graph.bind_resolved_descriptor_sets(pipeline, vk::PipelineBindPoint::GRAPHICS, &descriptors)?;
             graph
                 .batch()?
                 .draw(vertex_count, instance_count, first_vertex, first_instance);
@@ -255,7 +298,10 @@ impl Recorder<'_> {
     pub fn draw_indexed_range(
         &mut self, index_count: u32, instance_count: u32, first_index: u32, vertex_offset: i32, first_instance: u32,
     ) -> &mut Self {
-        self.record(|graph| {
+        let pipeline = self.pipeline;
+        let descriptors = self.descriptors.values().copied().collect::<Vec<_>>();
+        self.record(move |graph| {
+            graph.bind_resolved_descriptor_sets(pipeline, vk::PipelineBindPoint::GRAPHICS, &descriptors)?;
             graph
                 .batch()?
                 .draw_indexed(index_count, instance_count, first_index, vertex_offset, first_instance);
@@ -266,6 +312,32 @@ impl Recorder<'_> {
     pub fn buffer(&self, id: ValueId) -> Buffer { self.graph.get::<Buffer>(&id) }
 
     pub fn image(&self, id: ValueId) -> ImageAttachment { self.graph.get::<ImageAttachment>(&id) }
+
+    pub fn bind_image(&mut self, set: u32, binding: u32, image: &ImageAttachment) -> &mut Self {
+        self.descriptors.insert(
+            (set, binding),
+            ResolvedImageDescriptor {
+                set,
+                binding,
+                image_view: image.image_view(),
+                sampler: None,
+            },
+        );
+        self
+    }
+
+    pub fn bind_texture(&mut self, set: u32, binding: u32, image: &ImageAttachment, sampler: vk::Sampler) -> &mut Self {
+        self.descriptors.insert(
+            (set, binding),
+            ResolvedImageDescriptor {
+                set,
+                binding,
+                image_view: image.image_view(),
+                sampler: Some(sampler),
+            },
+        );
+        self
+    }
 
     fn record(&mut self, action: impl FnOnce(&mut RenderGraph) -> Result<(), vk::Result>) -> &mut Self {
         if self.result.is_ok() {
@@ -278,14 +350,14 @@ impl Recorder<'_> {
 pub struct RenderGraph {
     device: NonNull<ash::Device>,
     pipelines: Vec<DeclaredPipeline>,
-    variable_descriptor_count: u32,
     warned_push_constants: HashSet<PipelineId>,
-    textures: Vec<Option<Texture>>,
-    free_textures: Vec<u32>,
-    texture_revision: u64,
+    descriptor_arena: Option<DescriptorArena>,
+    descriptor_cache: HashMap<DescriptorSetKey, vk::DescriptorSet>,
+    retired_descriptor_arenas: Vec<RetiredDescriptorArena>,
     values: Vec<Value>,
     bound_pipeline: Option<vk::Pipeline>,
-    bound_layout: Option<(vk::PipelineBindPoint, vk::PipelineLayout)>,
+    active_descriptors: Vec<ResolvedImageDescriptor>,
+    bound_descriptors: Option<PipelineId>,
     render_area: vk::Rect2D,
     recorded_viewports: Vec<ResolvedViewport>,
     recorded_scissors: Vec<vk::Rect2D>,
@@ -298,19 +370,34 @@ pub struct RenderGraph {
     timeline_signals: Vec<(vk::Semaphore, u64)>,
 }
 
+impl PipelineBindings for RenderGraph {
+    fn bindings(&self, pipeline: PipelineId) -> Option<&[DescriptorBinding]> {
+        self.pipelines
+            .get(pipeline.0 as usize)
+            .map(|declared| declared.bindings.as_slice())
+    }
+
+    fn bindless_set(&self, pipeline: PipelineId) -> Option<u32> {
+        self.pipelines
+            .get(pipeline.0 as usize)
+            .and_then(|declared| declared.bindless())
+            .map(|external| external.index)
+    }
+}
+
 impl RenderGraph {
     pub fn new(ctx: &Context) -> Self {
         Self {
             device: NonNull::from(ctx.device()),
             pipelines: Vec::new(),
-            variable_descriptor_count: DEFAULT_VARIABLE_DESCRIPTOR_COUNT,
             warned_push_constants: HashSet::new(),
-            textures: Vec::new(),
-            free_textures: Vec::new(),
-            texture_revision: 0,
+            descriptor_arena: None,
+            descriptor_cache: HashMap::new(),
+            retired_descriptor_arenas: Vec::new(),
             values: Vec::new(),
             bound_pipeline: None,
-            bound_layout: None,
+            active_descriptors: Vec::new(),
+            bound_descriptors: None,
             render_area: vk::Rect2D::default(),
             recorded_viewports: Vec::new(),
             recorded_scissors: Vec::new(),
@@ -324,11 +411,6 @@ impl RenderGraph {
         }
     }
 
-    pub fn with_variable_descriptor_count(mut self, count: u32) -> Self {
-        self.variable_descriptor_count = count;
-        self
-    }
-
     pub fn declare_pipeline(&mut self, info: GraphicsPipelineInfo) -> Result<PipelineId, vk::Result> {
         if info.shaders.is_empty() {
             tracing::error!("pipeline declared without any shaders");
@@ -340,15 +422,15 @@ impl RenderGraph {
             .iter()
             .map(|spirv| shader::reflect(spirv))
             .collect::<Result<Vec<_>, _>>()?;
+        validate_descriptor_bindings(&reflections, info.bindless)?;
 
         let vertex = VertexLayout::interleaved(&reflections);
 
         let id = PipelineId(self.pipelines.len() as u32);
         self.pipelines.push(DeclaredPipeline {
+            bindings: merged_bindings(&reflections),
             reflections,
             layout: None,
-            descriptors: None,
-            written_textures: 0,
             kind: PipelineKind::Graphics {
                 info,
                 vertex,
@@ -370,102 +452,17 @@ impl RenderGraph {
             tracing::error!(stage = ?reflection.stage, "compute pipeline declared with a shader that is not compute");
             return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
         }
+        validate_descriptor_bindings(std::slice::from_ref(&reflection), info.bindless)?;
 
         let id = PipelineId(self.pipelines.len() as u32);
         self.pipelines.push(DeclaredPipeline {
+            bindings: merged_bindings(std::slice::from_ref(&reflection)),
             reflections: vec![reflection],
             layout: None,
-            descriptors: None,
-            written_textures: 0,
             kind: PipelineKind::Compute { info, handle: None },
         });
 
         Ok(id)
-    }
-
-    pub fn register_texture(&mut self, image_view: vk::ImageView, sampler: vk::Sampler) -> TextureId {
-        let texture = Some(Texture { image_view, sampler });
-        self.texture_revision += 1;
-
-        match self.free_textures.pop() {
-            Some(index) => {
-                self.textures[index as usize] = texture;
-                TextureId(index)
-            },
-            None => {
-                self.textures.push(texture);
-                TextureId(self.textures.len() as u32 - 1)
-            },
-        }
-    }
-
-    pub fn unregister_texture(&mut self, id: TextureId) {
-        let Some(slot) = self.textures.get_mut(id.0 as usize) else {
-            tracing::error!(%id, "texture was never registered with this graph");
-            return;
-        };
-        if slot.take().is_none() {
-            tracing::error!(%id, "texture slot is already free");
-            return;
-        }
-
-        self.free_textures.push(id.0);
-        self.texture_revision += 1;
-    }
-
-    fn update_descriptors(&mut self) {
-        let device_ptr = self.device;
-        let device = unsafe { device_ptr.as_ref() };
-        let revision = self.texture_revision;
-
-        let mut runs: Vec<(u32, Vec<vk::DescriptorImageInfo>)> = Vec::new();
-        for (index, texture) in self.textures.iter().enumerate() {
-            let Some(texture) = texture else {
-                continue;
-            };
-            let info = vk::DescriptorImageInfo::default()
-                .sampler(texture.sampler)
-                .image_view(texture.image_view)
-                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-
-            match runs.last_mut() {
-                Some((first, infos)) if *first as usize + infos.len() == index => infos.push(info),
-                _ => runs.push((index as u32, vec![info])),
-            }
-        }
-
-        for pipeline in &mut self.pipelines {
-            if pipeline.written_textures == revision {
-                continue;
-            }
-
-            let (Some(layout), Some(descriptors)) = (&pipeline.layout, &pipeline.descriptors) else {
-                continue;
-            };
-            let Some(table) = layout.texture_binding else {
-                continue;
-            };
-            let Some(set) = descriptors.set(table.set) else {
-                continue;
-            };
-
-            let writes = runs
-                .iter()
-                .map(|(first, infos)| {
-                    vk::WriteDescriptorSet::default()
-                        .dst_set(set)
-                        .dst_binding(table.binding)
-                        .dst_array_element(*first)
-                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                        .image_info(infos)
-                })
-                .collect::<Vec<_>>();
-
-            if !writes.is_empty() {
-                unsafe { device.update_descriptor_sets(&writes, &[]) };
-            }
-            pipeline.written_textures = revision;
-        }
     }
 
     fn construct_pipelines(&mut self, instructions: &[ir::Instr]) -> Result<(), vk::Result> {
@@ -539,10 +536,8 @@ impl RenderGraph {
             let layout = PipelineLayout::create(
                 device,
                 &self.pipelines[index].reflections,
-                self.variable_descriptor_count,
+                self.pipelines[index].bindless(),
             )?;
-            self.pipelines[index].descriptors = DescriptorSets::create(device, &layout)?;
-            self.pipelines[index].written_textures = 0;
             self.pipelines[index].layout = Some(layout);
         }
 
@@ -626,7 +621,8 @@ impl RenderGraph {
         }
 
         self.bound_pipeline = None;
-        self.bound_layout = None;
+        self.active_descriptors.clear();
+        self.bound_descriptors = None;
         self.render_area = vk::Rect2D::default();
         self.recorded_viewports.clear();
         self.recorded_scissors.clear();
@@ -678,7 +674,7 @@ impl RenderGraph {
         let cmd_buf = allocator.allocate_command_buffer(queue.family_index())?;
         self.current_batch = Some(Batch::new(cmd_buf)?);
         self.bound_pipeline = None;
-        self.bound_layout = None;
+        self.bound_descriptors = None;
         self.recorded_viewports.clear();
         self.recorded_scissors.clear();
         self.recorded_push_constants = None;
@@ -704,113 +700,196 @@ impl RenderGraph {
         Ok(())
     }
 
+    fn prepare_descriptor_arena(&mut self, instructions: &[ir::Instr]) -> Result<(), vk::Result> {
+        if self.descriptor_arena.is_some() {
+            tracing::error!("a previous descriptor execution was not retired");
+            return Err(vk::Result::ERROR_UNKNOWN);
+        }
+
+        let mut max_sets = 0;
+        let mut totals: BTreeMap<i32, (vk::DescriptorType, u32)> = BTreeMap::new();
+        for (_, instruction) in instructions {
+            let pipeline = match instruction {
+                IR::Draw { pipeline, .. }
+                | IR::DrawIndexed { pipeline, .. }
+                | IR::CallOpaque { pipeline, .. }
+                | IR::Dispatch { pipeline, .. } => *pipeline,
+                _ => None,
+            };
+            let Some(layout) = pipeline
+                .and_then(|pipeline| self.pipelines.get(pipeline.0 as usize))
+                .and_then(|pipeline| pipeline.layout.as_ref())
+            else {
+                continue;
+            };
+
+            for set in &layout.sets {
+                if set.sizes.is_empty() {
+                    continue;
+                }
+                max_sets += 1;
+                for (descriptor_type, count) in &set.sizes {
+                    let total = totals.entry(descriptor_type.as_raw()).or_insert((*descriptor_type, 0));
+                    total.1 += count;
+                }
+            }
+        }
+
+        self.descriptor_cache.clear();
+        self.descriptor_arena = DescriptorArena::create(self.device(), max_sets, &totals)?;
+        Ok(())
+    }
+
+    fn retire_descriptor_arena(&mut self, waits: Vec<(vk::Semaphore, u64)>) {
+        self.descriptor_cache.clear();
+        let Some(arena) = self.descriptor_arena.take() else {
+            return;
+        };
+        if waits.is_empty() {
+            arena.destroy(self.device());
+        } else {
+            self.retired_descriptor_arenas
+                .push(RetiredDescriptorArena { arena, waits });
+        }
+    }
+
+    fn collect_descriptor_arenas(&mut self) -> Result<(), vk::Result> {
+        let mut pending = Vec::new();
+        let mut retired = std::mem::take(&mut self.retired_descriptor_arenas).into_iter();
+        while let Some(item) = retired.next() {
+            let complete = item.waits.iter().try_fold(true, |complete, (semaphore, value)| {
+                let reached = unsafe { self.device().get_semaphore_counter_value(*semaphore) }?;
+                Ok::<_, vk::Result>(complete && reached >= *value)
+            });
+            match complete {
+                Ok(true) => item.arena.destroy(self.device()),
+                Ok(false) => pending.push(item),
+                Err(err) => {
+                    pending.push(item);
+                    pending.extend(retired);
+                    self.retired_descriptor_arenas = pending;
+                    return Err(err);
+                },
+            }
+        }
+        self.retired_descriptor_arenas = pending;
+        Ok(())
+    }
+
     pub fn execute(
         &mut self, ctx: &Context, program: &Program, allocator: &mut AllocatorKind,
     ) -> Result<(), vk::Result> {
         let instructions = program.instructions();
+        self.collect_descriptor_arenas()?;
         self.construct_pipelines(instructions)?;
-        self.update_descriptors();
         self.reset(program)?;
+        self.prepare_descriptor_arena(instructions)?;
 
-        let mut pc = 0;
-        let mut block = None;
-        let mut arrived_from = None;
-        while let Some((value_id, node)) = instructions.get(pc) {
-            match node {
-                IR::Label { label, .. } => block = Some(*label),
-                IR::SelectionMerge { .. } => {},
-                IR::Branch { target, .. } => {
-                    arrived_from = block;
-                    pc = program.label_index(*target).ok_or(vk::Result::ERROR_UNKNOWN)?;
-                    continue;
-                },
-                IR::BranchConditional {
-                    condition,
-                    true_label,
-                    false_label,
-                    ..
-                } => {
-                    let taken = match self.get::<bool>(condition) {
-                        true => *true_label,
-                        false => *false_label,
-                    };
-                    arrived_from = block;
-                    pc = program.label_index(taken).ok_or(vk::Result::ERROR_UNKNOWN)?;
-                    continue;
-                },
-                IR::Return => break,
-                // a bound resource was placed by reset, there is nothing here to allocate
-                IR::ConstructBuffer { .. } | IR::ConstructImage { .. } if program.bound(value_id).is_some() => {},
-                IR::Phi { incoming, .. } => {
-                    let chosen = incoming
-                        .iter()
-                        .find(|(_, from)| Some(*from) == arrived_from)
-                        .map(|(value, _)| *value)
-                        .ok_or(vk::Result::ERROR_UNKNOWN)?;
-                    self.set_value(value_id, Value::Reference(chosen));
-                },
-                node => self.execute_one(ctx, value_id, node, allocator)?,
-            }
-            pc += 1;
-        }
-
-        if self.current_batch.is_some() || !self.current_submit.cmd_buffers.is_empty() {
-            self.flush_submit(None)?;
-        }
-
-        for submit in self.submits.drain(..) {
-            let queue = ctx
-                .command_queue_by_domain(submit.domain)
-                .ok_or(vk::Result::ERROR_UNKNOWN)?;
-
-            let timeline_value = queue.next_timeline_value();
-            let timeline_signal = SemaphoreSubmitInfo {
-                semaphore: *queue.semaphore(),
-                value: timeline_value,
-                access: Access::MemoryRW,
-            };
-
-            let stack = ScopedStack::new();
-            let wait_semas = stack.alloc_slice::<vk::SemaphoreSubmitInfo>(submit.wait_semas.len());
-            let cmd_buf_infos = stack.alloc_slice::<vk::CommandBufferSubmitInfo>(submit.cmd_buffers.len());
-            let signal_semas = stack.alloc_slice::<vk::SemaphoreSubmitInfo>(submit.signal_semas.len() + 1);
-
-            for (dst, src) in wait_semas.iter_mut().zip(&submit.wait_semas) {
-                *dst = src.into();
-            }
-            for (dst, src) in cmd_buf_infos.iter_mut().zip(&submit.cmd_buffers) {
-                *dst = vk::CommandBufferSubmitInfo::default().command_buffer(src.into());
-            }
-            for (dst, src) in signal_semas
-                .iter_mut()
-                .zip(submit.signal_semas.iter().chain(std::iter::once(&timeline_signal)))
-            {
-                *dst = src.into();
+        let result = (|| {
+            let mut pc = 0;
+            let mut block = None;
+            let mut arrived_from = None;
+            while let Some((value_id, node)) = instructions.get(pc) {
+                match node {
+                    IR::Label { label, .. } => block = Some(*label),
+                    IR::SelectionMerge { .. } => {},
+                    IR::Branch { target, .. } => {
+                        arrived_from = block;
+                        pc = program.label_index(*target).ok_or(vk::Result::ERROR_UNKNOWN)?;
+                        continue;
+                    },
+                    IR::BranchConditional {
+                        condition,
+                        true_label,
+                        false_label,
+                        ..
+                    } => {
+                        let taken = match self.get::<bool>(condition) {
+                            true => *true_label,
+                            false => *false_label,
+                        };
+                        arrived_from = block;
+                        pc = program.label_index(taken).ok_or(vk::Result::ERROR_UNKNOWN)?;
+                        continue;
+                    },
+                    IR::Return => break,
+                    // a bound resource was placed by reset, there is nothing here to allocate
+                    IR::ConstructBuffer { .. } | IR::ConstructImage { .. } if program.bound(value_id).is_some() => {},
+                    IR::Phi { incoming, .. } => {
+                        let chosen = incoming
+                            .iter()
+                            .find(|(_, from)| Some(*from) == arrived_from)
+                            .map(|(value, _)| *value)
+                            .ok_or(vk::Result::ERROR_UNKNOWN)?;
+                        self.set_value(value_id, Value::Reference(chosen));
+                    },
+                    node => self.execute_one(ctx, value_id, node, allocator)?,
+                }
+                pc += 1;
             }
 
-            let submit_info = vk::SubmitInfo2::default()
-                .wait_semaphore_infos(wait_semas)
-                .command_buffer_infos(cmd_buf_infos)
-                .signal_semaphore_infos(signal_semas);
-            queue.submit(&[submit_info])?;
+            if self.current_batch.is_some() || !self.current_submit.cmd_buffers.is_empty() {
+                self.flush_submit(None)?;
+            }
 
-            allocator.add_timeline_wait(*queue.semaphore(), timeline_value);
-            self.timeline_signals.push((*queue.semaphore(), timeline_value));
-        }
+            for submit in self.submits.drain(..) {
+                let queue = ctx
+                    .command_queue_by_domain(submit.domain)
+                    .ok_or(vk::Result::ERROR_UNKNOWN)?;
 
-        for present in self.presents.drain(..) {
-            let queue = ctx
-                .command_queue_by_domain(DomainFlag::Graphics)
-                .ok_or(vk::Result::ERROR_UNKNOWN)?;
+                let timeline_value = queue.next_timeline_value();
+                let timeline_signal = SemaphoreSubmitInfo {
+                    semaphore: *queue.semaphore(),
+                    value: timeline_value,
+                    access: Access::MemoryRW,
+                };
 
-            let present_info = vk::PresentInfoKHR::default()
-                .wait_semaphores(std::slice::from_ref(&present.semaphore))
-                .swapchains(std::slice::from_ref(&present.swapchain))
-                .image_indices(std::slice::from_ref(&present.image_index));
-            ctx.present(queue, &present_info)?;
-        }
+                let stack = ScopedStack::new();
+                let wait_semas = stack.alloc_slice::<vk::SemaphoreSubmitInfo>(submit.wait_semas.len());
+                let cmd_buf_infos = stack.alloc_slice::<vk::CommandBufferSubmitInfo>(submit.cmd_buffers.len());
+                let signal_semas = stack.alloc_slice::<vk::SemaphoreSubmitInfo>(submit.signal_semas.len() + 1);
 
-        Ok(())
+                for (dst, src) in wait_semas.iter_mut().zip(&submit.wait_semas) {
+                    *dst = src.into();
+                }
+                for (dst, src) in cmd_buf_infos.iter_mut().zip(&submit.cmd_buffers) {
+                    *dst = vk::CommandBufferSubmitInfo::default().command_buffer(src.into());
+                }
+                for (dst, src) in signal_semas
+                    .iter_mut()
+                    .zip(submit.signal_semas.iter().chain(std::iter::once(&timeline_signal)))
+                {
+                    *dst = src.into();
+                }
+
+                let submit_info = vk::SubmitInfo2::default()
+                    .wait_semaphore_infos(wait_semas)
+                    .command_buffer_infos(cmd_buf_infos)
+                    .signal_semaphore_infos(signal_semas);
+                queue.submit(&[submit_info])?;
+
+                allocator.add_timeline_wait(*queue.semaphore(), timeline_value);
+                self.timeline_signals.push((*queue.semaphore(), timeline_value));
+            }
+
+            for present in self.presents.drain(..) {
+                let queue = ctx
+                    .command_queue_by_domain(DomainFlag::Graphics)
+                    .ok_or(vk::Result::ERROR_UNKNOWN)?;
+
+                let present_info = vk::PresentInfoKHR::default()
+                    .wait_semaphores(std::slice::from_ref(&present.semaphore))
+                    .swapchains(std::slice::from_ref(&present.swapchain))
+                    .image_indices(std::slice::from_ref(&present.image_index));
+                ctx.present(queue, &present_info)?;
+            }
+
+            Ok(())
+        })();
+
+        let waits = self.timeline_signals.clone();
+        self.retire_descriptor_arena(waits);
+        result
     }
 
     pub fn wait(&self) -> Result<(), vk::Result> {
@@ -829,6 +908,7 @@ impl RenderGraph {
     ) -> Result<(), vk::Result> {
         self.execute(ctx, program, allocator)?;
         self.wait()?;
+        self.collect_descriptor_arenas()?;
         allocator.free_command_buffers();
 
         Ok(())
@@ -924,31 +1004,148 @@ impl RenderGraph {
         Ok(())
     }
 
-    fn bind_descriptor_sets(
+    /// A pass starts and ends with nothing written, so neither can inherit the other's sets.
+    fn open_descriptors(&mut self) {
+        self.active_descriptors.clear();
+        self.bound_descriptors = None;
+    }
+
+    /// Binds the writes still standing, unless the same pipeline already has them bound.
+    fn bind_active_descriptors(
         &mut self, pipeline: PipelineId, bind_point: vk::PipelineBindPoint,
     ) -> Result<(), vk::Result> {
-        let bound = self.pipelines.get(pipeline.0 as usize).and_then(|declared| {
-            let layout = declared.layout.as_ref()?;
-            Some((layout.handle, declared.descriptors.as_ref().map(|d| d.sets().to_vec())))
-        });
-
-        let Some((handle, sets)) = bound else {
-            return Ok(());
-        };
-        if self.bound_layout == Some((bind_point, handle)) {
+        if self.bound_descriptors == Some(pipeline) {
             return Ok(());
         }
-        self.bound_layout = Some((bind_point, handle));
 
-        if let Some(sets) = sets {
-            self.batch()?.bind_descriptor_sets(bind_point, handle, 0, &sets);
+        let descriptors = std::mem::take(&mut self.active_descriptors);
+        let result = self.bind_resolved_descriptor_sets(pipeline, bind_point, &descriptors);
+        self.active_descriptors = descriptors;
+
+        if result.is_ok() {
+            self.bound_descriptors = Some(pipeline);
+        }
+        result
+    }
+
+    fn bind_resolved_descriptor_sets(
+        &mut self, pipeline: PipelineId, bind_point: vk::PipelineBindPoint, descriptors: &[ResolvedImageDescriptor],
+    ) -> Result<(), vk::Result> {
+        let Some(declared) = self.pipelines.get(pipeline.0 as usize) else {
+            return Err(vk::Result::ERROR_UNKNOWN);
+        };
+        let Some(layout) = declared.layout.as_ref() else {
+            return Err(vk::Result::ERROR_UNKNOWN);
+        };
+
+        let layout_handle = layout.handle;
+        let set_layouts = layout.sets.iter().map(|set| set.handle).collect::<Vec<_>>();
+        let external = layout.bindless;
+
+        // A pass can draw with several pipelines. Its descriptor table is their union, while
+        // each pipeline only consumes the locations present in its own reflected layout.
+        let mut ordinary = BTreeMap::<u32, Vec<(ResolvedImageDescriptor, vk::DescriptorType)>>::new();
+        for expected in &declared.bindings {
+            let (set, binding, descriptor_type) = (expected.set, expected.binding, expected.descriptor_type);
+            if external.is_some_and(|external| external.index == set) {
+                continue;
+            }
+
+            let found = descriptors
+                .binary_search_by_key(&(set, binding), |provided| (provided.set, provided.binding))
+                .ok()
+                .map(|at| descriptors[at]);
+            let Some(descriptor) = found else {
+                tracing::error!(%pipeline, set, binding, "pipeline descriptor has no image bound for this pass");
+                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+            };
+            if descriptor.image_view.is_null() {
+                tracing::error!(%pipeline, set, binding, "image descriptor uses a null image view");
+                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+            }
+            if descriptor.sampler.is_some_and(|sampler| sampler.is_null()) {
+                tracing::error!(%pipeline, set, binding, "combined image sampler uses a null sampler");
+                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+            }
+            let combined = descriptor_type == vk::DescriptorType::COMBINED_IMAGE_SAMPLER;
+            if combined != descriptor.sampler.is_some() {
+                tracing::error!(
+                    %pipeline,
+                    set,
+                    binding,
+                    descriptor_type = ?descriptor_type,
+                    "the image binding method does not match the reflected descriptor type"
+                );
+                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+            }
+            ordinary.entry(set).or_default().push((descriptor, descriptor_type));
+        }
+
+        let device_ptr = self.device;
+        let device = unsafe { device_ptr.as_ref() };
+        let mut sets = Vec::new();
+        for (set, bindings) in ordinary {
+            let key = DescriptorSetKey {
+                pipeline,
+                set,
+                descriptors: bindings.iter().map(|(descriptor, _)| *descriptor).collect(),
+            };
+            let descriptor_set = match self.descriptor_cache.get(&key).copied() {
+                Some(descriptor_set) => descriptor_set,
+                None => {
+                    let set_layout = set_layouts
+                        .get(set as usize)
+                        .copied()
+                        .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+                    let arena = self
+                        .descriptor_arena
+                        .as_mut()
+                        .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+                    let descriptor_set = arena.allocate(device, set_layout)?;
+
+                    let infos = bindings
+                        .iter()
+                        .map(|(descriptor, _)| {
+                            vk::DescriptorImageInfo::default()
+                                .sampler(descriptor.sampler.unwrap_or(vk::Sampler::null()))
+                                .image_view(descriptor.image_view)
+                                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                        })
+                        .collect::<Vec<_>>();
+                    let writes = bindings
+                        .iter()
+                        .zip(&infos)
+                        .map(|((descriptor, descriptor_type), info)| {
+                            vk::WriteDescriptorSet::default()
+                                .dst_set(descriptor_set)
+                                .dst_binding(descriptor.binding)
+                                .descriptor_type(*descriptor_type)
+                                .image_info(std::slice::from_ref(info))
+                        })
+                        .collect::<Vec<_>>();
+                    unsafe { device.update_descriptor_sets(&writes, &[]) };
+                    self.descriptor_cache.insert(key, descriptor_set);
+                    descriptor_set
+                },
+            };
+            sets.push((set, descriptor_set));
+        }
+
+        if let Some(external) = external {
+            sets.push((external.index, external.set));
+        }
+        sets.sort_unstable_by_key(|(set, _)| *set);
+
+        let cmd_buf = self.batch()?.clone();
+        for (set, descriptor_set) in sets {
+            cmd_buf.bind_descriptor_sets(bind_point, layout_handle, set, &[descriptor_set]);
         }
 
         Ok(())
     }
 
     fn prepare_draw(
-        &mut self, pipeline: Option<PipelineId>, state: &PipelineState, dynamic: &DynamicValues,
+        &mut self, pipeline: Option<PipelineId>, state: &PipelineState, dynamic: &DynamicValues, bind_descriptors: bool,
     ) -> Result<(), vk::Result> {
         let pipeline = pipeline.ok_or(vk::Result::ERROR_UNKNOWN)?;
         let handle = self
@@ -965,7 +1162,9 @@ impl RenderGraph {
             self.bound_pipeline = Some(handle);
         }
 
-        self.bind_descriptor_sets(pipeline, vk::PipelineBindPoint::GRAPHICS)?;
+        if bind_descriptors {
+            self.bind_active_descriptors(pipeline, vk::PipelineBindPoint::GRAPHICS)?;
+        }
 
         let viewports = dynamic.viewports(self.render_area);
         if !viewports.is_empty() && viewports != self.recorded_viewports {
@@ -1017,7 +1216,7 @@ impl RenderGraph {
             self.bound_pipeline = Some(handle);
         }
 
-        self.bind_descriptor_sets(pipeline, vk::PipelineBindPoint::COMPUTE)?;
+        self.bind_active_descriptors(pipeline, vk::PipelineBindPoint::COMPUTE)?;
 
         self.record_push_constants(pipeline, push_constants)
     }
@@ -1259,6 +1458,7 @@ impl RenderGraph {
                 ..
             } => {
                 self.ensure_batch(ctx, allocator)?;
+                self.open_descriptors();
 
                 let attachments = color_attachments
                     .iter()
@@ -1309,8 +1509,36 @@ impl RenderGraph {
                     None => self.set_value(value_id, Value::None),
                 }
             },
-            IR::BindPipeline { pass, .. } | IR::SetState { pass, .. } | IR::SampleImage { pass, .. } => {
+            IR::BindPipeline { pass, .. } | IR::SetState { pass, .. } => {
                 self.set_value(value_id, Value::Reference(*pass));
+            },
+            IR::WriteDescriptor {
+                pass,
+                set,
+                binding,
+                descriptor,
+                ..
+            } => {
+                self.set_value(value_id, Value::Reference(*pass));
+
+                let image = self.get::<ImageAttachment>(&descriptor.image());
+                let written = ResolvedImageDescriptor {
+                    set: *set,
+                    binding: *binding,
+                    image_view: image.image_view(),
+                    sampler: descriptor.sampler(),
+                };
+
+                match self
+                    .active_descriptors
+                    .binary_search_by_key(&(*set, *binding), |bound| (bound.set, bound.binding))
+                {
+                    Ok(at) if self.active_descriptors[at] == written => return Ok(()),
+                    Ok(at) => self.active_descriptors[at] = written,
+                    Err(at) => self.active_descriptors.insert(at, written),
+                }
+
+                self.bound_descriptors = None;
             },
             IR::BindVertexBuffers {
                 pass,
@@ -1350,7 +1578,7 @@ impl RenderGraph {
                 dynamic,
             } => {
                 self.set_value(value_id, Value::Reference(*pass));
-                self.prepare_draw(*pipeline, state, dynamic)?;
+                self.prepare_draw(*pipeline, state, dynamic, true)?;
 
                 let vertex_count = self.get::<u32>(vertex_count);
                 let instance_count = self.get::<u32>(instance_count);
@@ -1371,7 +1599,7 @@ impl RenderGraph {
                 dynamic,
             } => {
                 self.set_value(value_id, Value::Reference(*pass));
-                self.prepare_draw(*pipeline, state, dynamic)?;
+                self.prepare_draw(*pipeline, state, dynamic, true)?;
 
                 let index_count = self.get::<u32>(index_count);
                 let instance_count = self.get::<u32>(instance_count);
@@ -1389,20 +1617,28 @@ impl RenderGraph {
                 dynamic,
             } => {
                 self.set_value(value_id, Value::Reference(*pass));
-                self.prepare_draw(*pipeline, state, dynamic)?;
+                self.prepare_draw(*pipeline, state, dynamic, false)?;
 
                 let body = self.get::<PassCallback>(body);
                 let pipeline = pipeline.ok_or(vk::Result::ERROR_UNKNOWN)?;
+                let descriptors = self
+                    .active_descriptors
+                    .iter()
+                    .map(|descriptor| ((descriptor.set, descriptor.binding), *descriptor))
+                    .collect();
                 let mut recorder = Recorder {
                     graph: self,
                     pipeline,
+                    descriptors,
                     result: Ok(()),
                 };
                 body.call(&mut recorder);
                 let result = recorder.result;
 
+                // the callback bound whatever it drew with, so nothing the pass wrote is still
+                // in force
                 self.bound_pipeline = None;
-                self.bound_layout = None;
+                self.bound_descriptors = None;
                 self.recorded_viewports.clear();
                 self.recorded_scissors.clear();
                 self.recorded_push_constants = None;
@@ -1412,15 +1648,20 @@ impl RenderGraph {
             IR::EndRendering { pass } => {
                 self.set_value(value_id, Value::Reference(*pass));
                 self.batch()?.end_rendering();
+                self.open_descriptors();
             },
-            IR::BeginCompute { resources, .. } => {
+            IR::BeginCompute { declared_access, .. } => {
                 self.ensure_batch(ctx, allocator)?;
-                match resources.first() {
+                self.open_descriptors();
+                match declared_access.first() {
                     Some((first, _)) => self.set_value(value_id, Value::Reference(*first)),
                     None => self.set_value(value_id, Value::None),
                 }
             },
-            IR::EndCompute { pass } => self.set_value(value_id, Value::Reference(*pass)),
+            IR::EndCompute { pass } => {
+                self.set_value(value_id, Value::Reference(*pass));
+                self.open_descriptors();
+            },
             IR::Dispatch {
                 pass,
                 size,
@@ -1509,10 +1750,18 @@ impl RenderGraph {
 
 impl Drop for RenderGraph {
     fn drop(&mut self) {
-        let device = self.device();
+        let device_ptr = self.device;
+        let device = unsafe { device_ptr.as_ref() };
 
         if let Err(err) = unsafe { device.device_wait_idle() } {
             tracing::error!(?err, "failed to wait for the device before tearing down pipelines");
+        }
+
+        if let Some(arena) = self.descriptor_arena.take() {
+            arena.destroy(device);
+        }
+        for retired in std::mem::take(&mut self.retired_descriptor_arenas) {
+            retired.arena.destroy(device);
         }
 
         for declared in &self.pipelines {
@@ -1528,10 +1777,6 @@ impl Drop for RenderGraph {
                     unsafe { device.destroy_pipeline(*handle, None) };
                 },
                 PipelineKind::Compute { .. } => {},
-            }
-
-            if let Some(descriptors) = &declared.descriptors {
-                descriptors.destroy(device);
             }
 
             if let Some(layout) = &declared.layout {

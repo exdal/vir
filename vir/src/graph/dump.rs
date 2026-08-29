@@ -209,17 +209,17 @@ fn blank_line(out: &mut String) {
 }
 
 fn pass_header(program: &Symbols, ir: &IR) -> String {
-    let (resources, name) = match ir {
+    let (targeted, name) = match ir {
         IR::BeginRendering {
             color_attachments,
             name,
             ..
         } => (color_attachments.clone(), name),
-        IR::BeginCompute { resources, name } => (resources.iter().map(|(id, _)| *id).collect(), name),
+        IR::BeginCompute { declared_access, name } => (declared_access.iter().map(|(id, _)| *id).collect(), name),
         _ => return String::new(),
     };
 
-    let targets = resources
+    let targets = targeted
         .iter()
         .map(|resource| {
             let mut target = match program.name(*resource) {
@@ -244,9 +244,10 @@ fn pass_header(program: &Symbols, ir: &IR) -> String {
 
 #[cfg(test)]
 mod tests {
-    use ash::vk;
+    use ash::{vk, vk::Handle};
 
-    use crate::{BlendPreset, Image, ImageAttachment, Module, PipelineId, Rect2D};
+    use super::super::analysis::Declared;
+    use crate::{BlendPreset, Image, ImageAttachment, ImageInfo, Module, PipelineId, Rect2D, Unchecked};
 
     const FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
 
@@ -287,7 +288,10 @@ mod tests {
             .draw(3, 1)
             .end_rendering();
 
-        module.compile(rendered).dump_with(syntax_highlighting)
+        module
+            .compile(&Unchecked, rendered)
+            .unwrap()
+            .dump_with(syntax_highlighting)
     }
 
     /// A program that never branches is still a program with a block: the entry one, which
@@ -334,13 +338,13 @@ mod tests {
         let end = module
             .begin_compute()
             .with_name("blur")
-            .bind_pipeline(PipelineId(0))
+            .bind_compute_pipeline(PipelineId(0))
             .write(target)
             .push_constants(&1u32)
             .dispatch(8, 4, 1)
             .end_compute();
 
-        let dump = module.compile(end).dump();
+        let dump = module.compile(&Unchecked, end).unwrap().dump();
         assert!(dump.contains("Pass \"blur\" -> \"storage\" 64x32"), "{dump}");
         assert!(
             dump.contains("  dispatch groups_x=8 groups_y=4 groups_z=1 pipeline=#0"),
@@ -377,7 +381,7 @@ mod tests {
             .record_from(body)
             .end_rendering();
 
-        let dump = module.compile(end).dump();
+        let dump = module.compile(&Unchecked, end).unwrap().dump();
         let expected = match cfg!(debug_assertions) {
             true => format!("var \"draws\" Callback({}:{line}) slot=", file!()),
             false => "var \"draws\" Callback slot=".to_string(),
@@ -436,7 +440,7 @@ mod tests {
         let cleared = module.set_condition(animate, |m| m.clear_from(target, color), |_| target);
         let end = module.release(cleared, crate::Access::BlitRead, crate::DomainFlag::Graphics);
 
-        let dump = module.compile(end).dump();
+        let dump = module.compile(&Unchecked, end).unwrap().dump();
         assert!(dump.contains("4 blocks"), "{dump}");
         assert!(dump.contains("var \"animate\" Bool"), "{dump}");
         assert!(dump.contains("= label 0:"), "{dump}");
@@ -446,5 +450,27 @@ mod tests {
         assert!(dump.contains("color=%6(hue)"), "{dump}");
         assert!(dump.contains("phi ["), "{dump}");
         assert!(dump.contains("\n%12 =   selection_merge"), "{dump}");
+    }
+    /// A descriptor write is an instruction of its region, so it reads back as one of its lines.
+    #[test]
+    fn a_descriptor_write_is_a_line_of_its_region() {
+        let target = vk::Extent2D::default().width(4).height(4);
+        let mut module = Module::default();
+        let attachment = module.transient_image(&ImageInfo::color_target(target, FORMAT));
+        let texture = module.transient_image(&ImageInfo::color_target(target, FORMAT));
+        module.set_name(texture, "source");
+
+        let end = module
+            .begin_rendering(&[attachment])
+            .bind_graphics_pipeline(PipelineId(0))
+            .bind_texture(1, 2, texture, vk::Sampler::from_raw(7))
+            .draw(3, 1)
+            .end_rendering();
+
+        let bindings = Declared::new(&[(1, 2, vk::DescriptorType::COMBINED_IMAGE_SAMPLER)]);
+        let dump = module.compile(&bindings, end).unwrap().dump();
+        assert!(dump.contains("write_descriptor set=1 binding=2"), "{dump}");
+        assert!(dump.contains("combined_image_sampler %5(source)"), "{dump}");
+        assert!(dump.contains("access=FragmentSampled"), "{dump}");
     }
 }

@@ -191,7 +191,7 @@ pub fn compile_example<E: Example>(
     let (drawn, egui) = egui_pass.record(&mut module, drawn);
     let present = module.present(drawn);
 
-    let program = module.compile(present);
+    let program = module.compile(&*graph, present)?;
     dump_ir("frame", &program);
 
     Ok(CompiledFrame { program, egui })
@@ -256,15 +256,6 @@ impl Renderer {
             .dynamic_rendering(true)
             .shader_demote_to_helper_invocation(true);
         let mut vk12_features = vk::PhysicalDeviceVulkan12Features::default()
-            .descriptor_indexing(true)
-            .shader_sampled_image_array_non_uniform_indexing(true)
-            .shader_storage_image_array_non_uniform_indexing(true)
-            .descriptor_binding_sampled_image_update_after_bind(true)
-            .descriptor_binding_storage_image_update_after_bind(true)
-            .descriptor_binding_update_unused_while_pending(true)
-            .descriptor_binding_partially_bound(true)
-            .descriptor_binding_variable_descriptor_count(true)
-            .runtime_descriptor_array(true)
             .timeline_semaphore(true)
             .buffer_device_address(true)
             .scalar_block_layout(true);

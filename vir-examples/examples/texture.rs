@@ -1,8 +1,8 @@
 //! Uploading an image to the GPU and sampling it.
 //!
 //! Startup runs a one-shot module: staging buffer, one copy into the image, then a release into
-//! the layout a shader read wants. After that the image is a slot in the graph's bindless table,
-//! so a draw names it by pushing an index instead of binding a descriptor set.
+//! the layout a shader read wants. The draw then binds that graph image directly to the scalar
+//! descriptor reflected from the fragment shader.
 
 use ash::vk;
 use vir::{
@@ -21,7 +21,6 @@ use vir::{
     Rect2D,
     RenderGraph,
     SamplerInfo,
-    TextureId,
     ValueId,
     allocator::Allocator,
 };
@@ -45,7 +44,6 @@ const BACKGROUND: ClearValue = ClearValue::rgba_f32(0.02, 0.02, 0.05, 1.0);
 #[derive(Clone, Copy)]
 struct PushConstants {
     scale: [f32; 2],
-    texture_index: u32,
 }
 
 struct Texture {
@@ -53,8 +51,6 @@ struct Texture {
     image: Image,
     image_view: vk::ImageView,
     sampler: vk::Sampler,
-    /// The image's slot in the bindless table, pushed by the draw.
-    slot: TextureId,
     extent: vk::Extent2D,
     push: Option<ValueId>,
     ui: UiState,
@@ -124,8 +120,6 @@ impl Example for Texture {
                 .with_min_filter(vk::Filter::LINEAR)
                 .with_address_mode(vk::SamplerAddressMode::CLAMP_TO_EDGE),
         )?;
-        let slot = setup.graph.register_texture(image_view, sampler);
-
         let pixels = decoded.into_raw();
         let mut staging = setup.allocator.allocate_buffer(
             &BufferInfo::staging(size_of_val(pixels.as_slice()) as u64).with_name("texture staging"),
@@ -140,11 +134,10 @@ impl Example for Texture {
         module.set_name(destination, "vir logo");
         let uploaded = module.copy_buffer_to_image(source, destination);
         let ready = module.release(uploaded, RESTING_ACCESS, DomainFlag::Graphics);
-        setup.graph.execute_blocking(
-            setup.ctx,
-            &module.compile(ready),
-            &mut AllocatorKind::Persistent(setup.allocator),
-        )?;
+        let program = module.compile(&*setup.graph, ready)?;
+        setup
+            .graph
+            .execute_blocking(setup.ctx, &program, &mut AllocatorKind::Persistent(setup.allocator))?;
         setup.allocator.deallocate_buffer(staging);
 
         Ok(Self {
@@ -152,7 +145,6 @@ impl Example for Texture {
             image,
             image_view,
             sampler,
-            slot,
             extent,
             push: None,
             ui: UiState::default(),
@@ -164,10 +156,7 @@ impl Example for Texture {
             .default_pos([24.0, 24.0])
             .default_size([300.0, 180.0])
             .show(ctx, |ui| {
-                ui.label(format!(
-                    "{}x{} uploaded once, sampled through bindless slot {}",
-                    self.extent.width, self.extent.height, self.slot.0
-                ));
+                ui.label(format!("{}x{} uploaded once", self.extent.width, self.extent.height));
                 ui.checkbox(&mut self.ui.keep_aspect, "keep aspect");
                 ui.add(egui::Slider::new(&mut self.ui.zoom, 0.05..=1.0).text("zoom"));
                 ui.separator();
@@ -202,7 +191,7 @@ impl Example for Texture {
                 cull_mode: vk::CullModeFlags::NONE,
                 ..Default::default()
             })
-            .sample_image(texture)
+            .bind_texture(0, 0, texture, self.sampler)
             .push_constants_from(push)
             .draw(4, 1)
             .end_rendering())
@@ -214,7 +203,6 @@ impl Example for Texture {
                 push,
                 &PushConstants {
                     scale: self.quad_scale(frame.target.extent),
-                    texture_index: self.slot.0,
                 },
             );
         }
@@ -222,8 +210,7 @@ impl Example for Texture {
         Ok(())
     }
 
-    fn destroy(&mut self, graph: &mut RenderGraph, allocator: &mut PersistentAllocator) {
-        graph.unregister_texture(self.slot);
+    fn destroy(&mut self, _graph: &mut RenderGraph, allocator: &mut PersistentAllocator) {
         allocator.deallocate_image_view(self.image_view);
         allocator.deallocate_image(self.image);
         allocator.deallocate_sampler(self.sampler);
@@ -239,10 +226,8 @@ mod tests {
 
     use super::*;
 
-    /// The bindless table is a variable-count combined image sampler array; a shader that
-    /// reflects as anything else silently samples nothing.
     #[test]
-    fn the_fragment_shader_declares_the_bindless_texture_table() {
+    fn the_fragment_shader_declares_one_texture() {
         let reflection = shader::reflect(&read_spirv(FRAG_SPV)).expect("shader should reflect");
 
         assert_eq!(
@@ -252,27 +237,24 @@ mod tests {
                 binding: 0,
                 descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
                 count: 1,
-                variable_count: true,
+                variable_count: false,
+                stages: vk::ShaderStageFlags::FRAGMENT,
             }]
         );
 
-        // and the vertex stage stays out of it, so the table is fragment-only
+        // and the vertex stage stays out of it, so the descriptor is fragment-only
         let vertex = shader::reflect(&read_spirv(VERT_SPV)).expect("shader should reflect");
         assert!(vertex.bindings.is_empty());
     }
 
-    /// The vertex stage reads scale and the fragment stage the texture index, so one range
-    /// covers both stages.
+    /// Only the vertex stage reads the scale block.
     #[test]
-    fn the_push_constant_range_covers_both_stages() {
+    fn the_push_constant_range_covers_the_vertex_stage() {
         let reflect = |spirv| shader::reflect(&read_spirv(spirv)).expect("shader should reflect");
 
         let ranges = vir::resource::pipeline::push_constant_ranges(&[reflect(VERT_SPV), reflect(FRAG_SPV)]);
         assert_eq!(ranges.len(), 1);
-        assert_eq!(
-            ranges[0].stage_flags,
-            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT
-        );
+        assert_eq!(ranges[0].stage_flags, vk::ShaderStageFlags::VERTEX);
         assert_eq!(ranges[0].offset, 0);
         assert_eq!(ranges[0].size as usize, size_of::<PushConstants>());
     }

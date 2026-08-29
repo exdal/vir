@@ -78,6 +78,7 @@ impl VertexLayout {
 #[derive(Debug, Clone, Default)]
 pub struct GraphicsPipelineInfo {
     pub shaders: Vec<Vec<u32>>,
+    pub bindless: Option<BindlessDescriptorSet>,
 }
 
 impl GraphicsPipelineInfo {
@@ -87,15 +88,38 @@ impl GraphicsPipelineInfo {
         self.shaders.push(spirv.to_vec());
         self
     }
+
+    pub fn with_bindless_set(mut self, index: u32, layout: vk::DescriptorSetLayout, set: vk::DescriptorSet) -> Self {
+        self.bindless = Some(BindlessDescriptorSet { index, layout, set });
+        self
+    }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct ComputePipelineInfo {
     pub shader: Vec<u32>,
+    pub bindless: Option<BindlessDescriptorSet>,
 }
 
 impl ComputePipelineInfo {
-    pub fn new(spirv: &[u32]) -> Self { Self { shader: spirv.to_vec() } }
+    pub fn new(spirv: &[u32]) -> Self {
+        Self {
+            shader: spirv.to_vec(),
+            bindless: None,
+        }
+    }
+
+    pub fn with_bindless_set(mut self, index: u32, layout: vk::DescriptorSetLayout, set: vk::DescriptorSet) -> Self {
+        self.bindless = Some(BindlessDescriptorSet { index, layout, set });
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BindlessDescriptorSet {
+    pub index: u32,
+    pub layout: vk::DescriptorSetLayout,
+    pub set: vk::DescriptorSet,
 }
 
 pub fn push_constant_ranges(reflections: &[Reflection]) -> Vec<vk::PushConstantRange> {
@@ -122,17 +146,61 @@ pub fn push_constant_ranges(reflections: &[Reflection]) -> Vec<vk::PushConstantR
         .collect()
 }
 
+pub(crate) fn validate_descriptor_bindings(
+    reflections: &[Reflection], bindless: Option<BindlessDescriptorSet>,
+) -> Result<(), vk::Result> {
+    if let Some(external) = bindless
+        && (external.layout.is_null() || external.set.is_null())
+    {
+        tracing::error!(set = external.index, "external bindless handles must not be null");
+        return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+    }
+
+    let mut seen: BTreeMap<(u32, u32), (vk::DescriptorType, u32, bool)> = BTreeMap::new();
+    for reflection in reflections {
+        for binding in &reflection.bindings {
+            let shape = (binding.descriptor_type, binding.count, binding.variable_count);
+            if let Some(existing) = seen.insert((binding.set, binding.binding), shape)
+                && existing != shape
+            {
+                tracing::error!(
+                    set = binding.set,
+                    binding = binding.binding,
+                    "shader stages disagree on descriptor shape"
+                );
+                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+            }
+
+            if bindless.is_some_and(|external| external.index == binding.set) {
+                continue;
+            }
+
+            let supported_type = matches!(
+                binding.descriptor_type,
+                vk::DescriptorType::SAMPLED_IMAGE | vk::DescriptorType::COMBINED_IMAGE_SAMPLER
+            );
+            if !supported_type || binding.count != 1 || binding.variable_count {
+                tracing::error!(
+                    set = binding.set,
+                    binding = binding.binding,
+                    descriptor_type = ?binding.descriptor_type,
+                    count = binding.count,
+                    variable_count = binding.variable_count,
+                    "ordinary descriptors only support scalar sampled images and combined image samplers"
+                );
+                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct SetLayout {
     pub handle: vk::DescriptorSetLayout,
     pub sizes: Vec<(vk::DescriptorType, u32)>,
-    pub variable_count: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TextureBinding {
-    pub set: u32,
-    pub binding: u32,
+    owned: bool,
 }
 
 #[derive(Debug, Default)]
@@ -140,7 +208,7 @@ pub struct PipelineLayout {
     pub handle: vk::PipelineLayout,
     pub sets: Vec<SetLayout>,
     pub push_constant_ranges: Vec<vk::PushConstantRange>,
-    pub texture_binding: Option<TextureBinding>,
+    pub bindless: Option<BindlessDescriptorSet>,
 }
 
 impl PipelineLayout {
@@ -154,7 +222,7 @@ impl PipelineLayout {
     }
 
     pub(crate) fn create(
-        device: &ash::Device, reflections: &[Reflection], max_variable_descriptor_count: u32,
+        device: &ash::Device, reflections: &[Reflection], bindless: Option<BindlessDescriptorSet>,
     ) -> Result<Self, vk::Result> {
         struct Merged {
             descriptor_type: vk::DescriptorType,
@@ -178,6 +246,14 @@ impl PipelineLayout {
                             );
                             return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
                         }
+                        if existing.count != binding.count || existing.variable_count != binding.variable_count {
+                            tracing::error!(
+                                set = binding.set,
+                                binding = binding.binding,
+                                "stages disagree on descriptor count"
+                            );
+                            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+                        }
                         existing.count = existing.count.max(binding.count);
                         existing.variable_count |= binding.variable_count;
                         existing.stages |= reflection.stage;
@@ -194,67 +270,50 @@ impl PipelineLayout {
             }
         }
 
-        let set_count = merged.keys().map(|(set, _)| set + 1).max().unwrap_or(0);
+        let reflected_set_count = merged.keys().map(|(set, _)| set + 1).max().unwrap_or(0);
+        let set_count = bindless.map_or(reflected_set_count, |set| reflected_set_count.max(set.index + 1));
         let mut sets: Vec<SetLayout> = Vec::with_capacity(set_count as usize);
-        let mut texture_binding = None;
 
         let destroy_sets = |sets: &[SetLayout]| {
             sets.iter()
+                .filter(|set| set.owned)
                 .for_each(|set| unsafe { device.destroy_descriptor_set_layout(set.handle, None) });
         };
 
         for set in 0..set_count {
+            if let Some(external) = bindless.filter(|external| external.index == set) {
+                sets.push(SetLayout {
+                    handle: external.layout,
+                    sizes: Vec::new(),
+                    owned: false,
+                });
+                continue;
+            }
+
             let entries = merged.range((set, 0)..(set + 1, 0));
 
             let mut bindings = Vec::new();
-            let mut binding_flags = Vec::new();
             let mut sizes = Vec::new();
-            let mut variable_count = 0;
 
             for ((_, binding), info) in entries {
-                let count = if info.variable_count {
-                    variable_count = max_variable_descriptor_count;
-                    max_variable_descriptor_count
-                } else {
-                    info.count
-                };
-
-                if info.variable_count && info.descriptor_type == vk::DescriptorType::COMBINED_IMAGE_SAMPLER {
-                    texture_binding = Some(TextureBinding { set, binding: *binding });
-                }
-
                 bindings.push(
                     vk::DescriptorSetLayoutBinding::default()
                         .binding(*binding)
                         .descriptor_type(info.descriptor_type)
-                        .descriptor_count(count)
+                        .descriptor_count(info.count)
                         .stage_flags(info.stages),
                 );
 
-                binding_flags.push(if info.variable_count {
-                    vk::DescriptorBindingFlags::VARIABLE_DESCRIPTOR_COUNT
-                        | vk::DescriptorBindingFlags::PARTIALLY_BOUND
-                        | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND
-                } else {
-                    vk::DescriptorBindingFlags::empty()
-                });
-
-                sizes.push((info.descriptor_type, count));
+                sizes.push((info.descriptor_type, info.count));
             }
 
-            let mut flags_info = vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&binding_flags);
-            let mut create_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
-            if variable_count > 0 {
-                create_info = create_info
-                    .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL)
-                    .push_next(&mut flags_info);
-            }
+            let create_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
 
             match unsafe { device.create_descriptor_set_layout(&create_info, None) } {
                 Ok(handle) => sets.push(SetLayout {
                     handle,
                     sizes,
-                    variable_count,
+                    owned: true,
                 }),
                 Err(err) => {
                     destroy_sets(&sets);
@@ -282,7 +341,7 @@ impl PipelineLayout {
             handle,
             sets,
             push_constant_ranges,
-            texture_binding,
+            bindless,
         })
     }
 
@@ -291,6 +350,7 @@ impl PipelineLayout {
             device.destroy_pipeline_layout(self.handle, None);
             self.sets
                 .iter()
+                .filter(|set| set.owned)
                 .for_each(|set| device.destroy_descriptor_set_layout(set.handle, None));
         }
     }
@@ -578,8 +638,10 @@ pub(crate) fn create_compute_pipelines(
 mod tests {
     use std::ffi::CString;
 
+    use ash::vk::Handle;
+
     use super::*;
-    use crate::resource::shader::VertexInput;
+    use crate::resource::shader::{DescriptorBinding, VertexInput};
 
     fn reflection(stage: vk::ShaderStageFlags, vertex_inputs: Vec<VertexInput>) -> Reflection {
         Reflection {
@@ -597,6 +659,13 @@ mod tests {
         Reflection {
             push_constant_offset: offset,
             push_constant_size: size,
+            ..reflection(stage, Vec::new())
+        }
+    }
+
+    fn with_bindings(stage: vk::ShaderStageFlags, bindings: Vec<DescriptorBinding>) -> Reflection {
+        Reflection {
+            bindings,
             ..reflection(stage, Vec::new())
         }
     }
@@ -722,5 +791,44 @@ mod tests {
 
         // and one that lands past every range covers nothing
         assert_eq!(layout.cover(64, 4).count(), 0);
+    }
+
+    #[test]
+    fn ordinary_descriptors_accept_scalar_sampled_images() {
+        let reflection = with_bindings(
+            vk::ShaderStageFlags::FRAGMENT,
+            vec![DescriptorBinding {
+                set: 1,
+                binding: 3,
+                descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                count: 1,
+                variable_count: false,
+                stages: vk::ShaderStageFlags::FRAGMENT,
+            }],
+        );
+        assert!(validate_descriptor_bindings(&[reflection], None).is_ok());
+    }
+
+    #[test]
+    fn descriptor_arrays_require_an_external_bindless_set() {
+        let reflection = with_bindings(
+            vk::ShaderStageFlags::FRAGMENT,
+            vec![DescriptorBinding {
+                set: 2,
+                binding: 0,
+                descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                count: 0,
+                variable_count: true,
+                stages: vk::ShaderStageFlags::FRAGMENT,
+            }],
+        );
+        assert!(validate_descriptor_bindings(std::slice::from_ref(&reflection), None).is_err());
+
+        let bindless = BindlessDescriptorSet {
+            index: 2,
+            layout: vk::DescriptorSetLayout::from_raw(1),
+            set: vk::DescriptorSet::from_raw(2),
+        };
+        assert!(validate_descriptor_bindings(&[reflection], Some(bindless)).is_ok());
     }
 }

@@ -1,8 +1,6 @@
 /// The lighting half of the deferred pair. It draws no geometry: one triangle covers the
 /// screen and every pixel is shaded out of what the geometry pass left in the G-buffer.
 
-/// The three G-buffer targets arrive as bindless slots, so the pass names them by index
-/// instead of binding a descriptor set of its own.
 struct PushConstants {
     float3 camera_position;
     float ambient;
@@ -10,19 +8,18 @@ struct PushConstants {
     float light_intensity;
     float3 light_color;
     float specular_strength;
-    uint albedo_index;
-    uint normal_index;
-    uint position_index;
     uint mode;
 };
 
 [[vk::push_constant]]
 ConstantBuffer<PushConstants> push;
 
-/// The graph's bindless table, the same variable-count combined image sampler array every
-/// other example samples through.
 [[vk::binding(0, 0)]]
-Sampler2D textures[];
+Sampler2D albedo_texture;
+[[vk::binding(1, 0)]]
+Sampler2D normal_texture;
+[[vk::binding(2, 0)]]
+Sampler2D position_texture;
 
 static const uint MODE_SHADED = 0;
 static const uint MODE_ALBEDO = 1;
@@ -50,15 +47,15 @@ VSOutput vs_main(uint vertex_id: SV_VertexID) {
 
 [shader("fragment")]
 float4 fs_main(VSOutput input): SV_Target {
-    float4 position_sample = textures[push.position_index].Sample(input.uv);
+    float4 position_sample = position_texture.Sample(input.uv);
 
     // the geometry pass only wrote alpha where it drew, so the rest is background
     if (position_sample.a < 0.5) {
         return float4(BACKGROUND, 1.0);
     }
 
-    float3 albedo = textures[push.albedo_index].Sample(input.uv).rgb;
-    float3 normal = normalize(textures[push.normal_index].Sample(input.uv).xyz * 2.0 - 1.0);
+    float3 albedo = albedo_texture.Sample(input.uv).rgb;
+    float3 normal = normalize(normal_texture.Sample(input.uv).xyz * 2.0 - 1.0);
     float3 world = position_sample.xyz;
 
     switch (push.mode) {

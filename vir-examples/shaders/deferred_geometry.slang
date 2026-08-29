@@ -8,18 +8,13 @@
 struct PushConstants {
     float4x4 view_proj;
     float3 base_color;
-    /// The material's base color texture, or `NO_TEXTURE` for a material that is only a factor.
-    uint base_color_texture;
 };
 
 [[vk::push_constant]]
 ConstantBuffer<PushConstants> push;
 
-/// The graph's bindless table, the same one the lighting pass reads the G-buffer back through.
 [[vk::binding(0, 0)]]
-Sampler2D textures[];
-
-static const uint NO_TEXTURE = 0xFFFFFFFF;
+Sampler2D base_color_texture;
 
 /// What the example uploads: `float3 position`, `float3 normal`, then `float2 uv`, which is
 /// what reflection packs into binding 0.
@@ -56,10 +51,7 @@ VSOutput vs_main(VSInput input) {
 [shader("fragment")]
 GBuffer fs_main(VSOutput input) {
     // the texture is an `_SRGB` image, so what comes back is already linear
-    float3 albedo = push.base_color;
-    if (push.base_color_texture != NO_TEXTURE) {
-        albedo *= textures[push.base_color_texture].Sample(input.uv).rgb;
-    }
+    float3 albedo = push.base_color * base_color_texture.Sample(input.uv).rgb;
 
     GBuffer output;
     output.albedo = float4(albedo, 1.0);

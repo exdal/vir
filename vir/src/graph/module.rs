@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
 
@@ -35,6 +35,7 @@ use crate::{
     ValueId,
     Viewport,
     graph::{
+        analysis::{PipelineBindings, analyze_descriptors},
         ir::{self, scaled},
         program::Variable,
     },
@@ -64,6 +65,54 @@ struct Arm {
     at: usize,
     images: HashMap<ValueId, ImageState>,
     buffers: HashMap<ValueId, BufferState>,
+}
+
+fn resolve_descriptor_access(mut nodes: Vec<ir::Instr>, pipelines: &impl PipelineBindings) -> Vec<ir::Instr> {
+    let mut written: BTreeMap<(u32, u32), usize> = BTreeMap::new();
+    let mut open = false;
+    let mut bound: Option<PipelineId> = None;
+    let mut resolved: HashMap<usize, Access> = HashMap::new();
+
+    for (index, (_, ir)) in nodes.iter().enumerate() {
+        match ir {
+            IR::BeginRendering { .. } | IR::BeginCompute { .. } => {
+                written.clear();
+                open = true;
+                bound = None;
+            },
+            IR::EndRendering { .. } | IR::EndCompute { .. } => {
+                open = false;
+                bound = None;
+            },
+            IR::BindPipeline { pipeline, .. } => bound = Some(*pipeline),
+
+            IR::WriteDescriptor { set, binding, .. } if open => {
+                written.insert((*set, *binding), index);
+            },
+
+            IR::Draw { .. } | IR::DrawIndexed { .. } | IR::CallOpaque { .. } | IR::Dispatch { .. } => {
+                let Some(bindings) = bound.and_then(|pipeline| pipelines.bindings(pipeline)) else {
+                    continue;
+                };
+
+                for binding in bindings {
+                    if let Some(at) = written.get(&(binding.set, binding.binding)) {
+                        *resolved.entry(*at).or_insert(Access::empty()) |= Access::sampled_by(binding.stages);
+                    }
+                }
+            },
+
+            _ => {},
+        }
+    }
+
+    for (index, access) in resolved {
+        if let IR::WriteDescriptor { access: slot, .. } = &mut nodes[index].1 {
+            *slot = access;
+        }
+    }
+
+    nodes
 }
 
 fn globals_first(nodes: Vec<ir::Instr>) -> Vec<ir::Instr> {
@@ -121,6 +170,28 @@ fn is_global(ir: &IR) -> bool {
     )
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PassKind {
+    Rendering,
+    Compute,
+}
+
+impl PassKind {
+    fn name(self) -> &'static str {
+        match self {
+            PassKind::Rendering => "rendering",
+            PassKind::Compute => "compute",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct OngoingPass {
+    kind: PassKind,
+    begin: ValueId,
+    tip: ValueId,
+}
+
 pub struct Module {
     types: HashMap<ir::Type, ValueId>,
     constants: HashMap<ir::Constant, ValueId>,
@@ -131,6 +202,7 @@ pub struct Module {
     instruction_block: Vec<Option<LabelId>>,
     label_count: u32,
     current_block: Option<LabelId>,
+    ongoing_pass: Option<OngoingPass>,
 }
 
 impl Default for Module {
@@ -149,6 +221,7 @@ impl Default for Module {
             instruction_block: Vec::new(),
             label_count: 1,
             current_block: Some(entry),
+            ongoing_pass: None,
         }
     }
 }
@@ -220,6 +293,8 @@ impl Module {
         &mut self, condition: ValueId, then: impl FnOnce(&mut Module) -> ValueId,
         otherwise: impl FnOnce(&mut Module) -> ValueId,
     ) -> ValueId {
+        self.expect_no_open_pass("a selection is recorded");
+
         let merge = self.declare_label();
         let true_label = self.declare_label();
         let false_label = self.declare_label();
@@ -228,10 +303,12 @@ impl Module {
 
         self.place_label(true_label);
         let taken = then(self);
+        self.expect_no_open_pass("an arm ends");
         self.branch(merge);
 
         self.place_label(false_label);
         let skipped = otherwise(self);
+        self.expect_no_open_pass("an arm ends");
         self.branch(merge);
 
         self.place_label(merge);
@@ -592,59 +669,66 @@ impl Module {
         self.emit(IR::Clear { attachment, color })
     }
 
-    pub fn begin_rendering(&mut self, color_attachments: &[ValueId]) -> RenderPass<'_> {
+    pub fn begin_rendering(&mut self, color_attachments: &[ValueId]) -> &mut Self {
         self.begin_rendering_with(color_attachments, None, None)
     }
 
-    pub fn begin_rendering_depth(&mut self, color_attachments: &[ValueId], depth: ValueId) -> RenderPass<'_> {
+    pub fn begin_rendering_depth(&mut self, color_attachments: &[ValueId], depth: ValueId) -> &mut Self {
         self.begin_rendering_with(color_attachments, Some(depth), None)
     }
 
-    pub fn begin_rendering_area(&mut self, color_attachments: &[ValueId], render_area: vk::Extent2D) -> RenderPass<'_> {
+    pub fn begin_rendering_area(&mut self, color_attachments: &[ValueId], render_area: vk::Extent2D) -> &mut Self {
         let render_area = self.lower_constant(ir::Constant::Extent2D(render_area));
         self.begin_rendering_with(color_attachments, None, Some(render_area))
     }
 
     pub fn begin_rendering_depth_area(
         &mut self, color_attachments: &[ValueId], depth: ValueId, render_area: vk::Extent2D,
-    ) -> RenderPass<'_> {
+    ) -> &mut Self {
         let render_area = self.lower_constant(ir::Constant::Extent2D(render_area));
         self.begin_rendering_with(color_attachments, Some(depth), Some(render_area))
     }
 
     fn begin_rendering_with(
         &mut self, color_attachments: &[ValueId], depth_attachment: Option<ValueId>, render_area: Option<ValueId>,
-    ) -> RenderPass<'_> {
+    ) -> &mut Self {
         let id = self.emit(IR::BeginRendering {
             color_attachments: color_attachments.to_vec(),
             depth_attachment,
             render_area,
+            declared_access: Vec::new(),
             name: None,
         });
-        RenderPass {
-            pass: Pass::begin(self, id),
-        }
+        self.open_pass(PassKind::Rendering, id)
     }
 
-    pub fn begin_compute(&mut self) -> ComputePass<'_> {
+    pub fn begin_compute(&mut self) -> &mut Self {
         let id = self.emit(IR::BeginCompute {
-            resources: Vec::new(),
+            declared_access: Vec::new(),
             name: None,
         });
-        ComputePass {
-            pass: Pass::begin(self, id),
-        }
+        self.open_pass(PassKind::Compute, id)
     }
 
-    pub fn compile(&self, id: ValueId) -> Program { self.compile_all(&[id]) }
+    pub fn compile(&self, pipelines: &impl PipelineBindings, id: ValueId) -> Result<Program, vk::Result> {
+        self.compile_all(pipelines, &[id])
+    }
 
-    pub fn compile_all(&self, ids: &[ValueId]) -> Program {
+    pub fn compile_all(&self, pipelines: &impl PipelineBindings, ids: &[ValueId]) -> Result<Program, vk::Result> {
+        let program = self.lower(pipelines, ids);
+        analyze_descriptors(&program, pipelines)?;
+        Ok(program)
+    }
+
+    fn lower(&self, pipelines: &impl PipelineBindings, ids: &[ValueId]) -> Program {
         let mut roots = ids.to_vec();
         roots.extend(self.branch_conditions());
 
         let mut next_id = self.instructions.len() as u32;
         let nodes = self.topo_sort(&roots);
         let nodes = self.layout_blocks(nodes, &mut next_id);
+        // the barriers are what the resolved accesses are for, so this comes before them
+        let nodes = resolve_descriptor_access(nodes, pipelines);
         let nodes = self.sync(nodes, &mut next_id);
         let nodes = self.simplify_cfg(nodes);
         let nodes = self.fold_barriers(nodes, &mut next_id);
@@ -736,8 +820,10 @@ impl Module {
                         color_attachments,
                         depth_attachment,
                         render_area,
+                        declared_access,
                         ..
                     } => {
+                        declared_access.iter().rev().for_each(|(id, _)| stack.push(*id));
                         render_area.iter().for_each(|v| stack.push(*v));
                         depth_attachment.iter().for_each(|v| stack.push(*v));
                         color_attachments.iter().rev().for_each(|v| stack.push(*v));
@@ -762,9 +848,9 @@ impl Module {
                         stack.push(*pass);
                         stack.push(*buffer);
                     },
-                    IR::SampleImage { pass, image } => {
+                    IR::WriteDescriptor { pass, descriptor, .. } => {
                         stack.push(*pass);
-                        stack.push(*image);
+                        stack.push(descriptor.image());
                     },
                     IR::Draw {
                         pass,
@@ -803,8 +889,8 @@ impl Module {
                     IR::EndRendering { pass } => {
                         stack.push(*pass);
                     },
-                    IR::BeginCompute { resources, .. } => {
-                        resources.iter().rev().for_each(|(id, _)| stack.push(*id));
+                    IR::BeginCompute { declared_access, .. } => {
+                        declared_access.iter().rev().for_each(|(id, _)| stack.push(*id));
                     },
                     IR::Dispatch { pass, size, .. } => {
                         match size {
@@ -1022,28 +1108,26 @@ impl Module {
             }
         }
 
-        // what a rendering region reads, gathered up front: a layout transition cannot be
-        // recorded inside a region, and a host write only has to be made visible once, so both
-        // resolve to barriers emitted before the region opens
         let mut region_buffers: HashMap<ValueId, Vec<(ValueId, Access)>> = HashMap::new();
-        let mut region_images: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
+        let mut region_images: HashMap<ValueId, Vec<(ValueId, Access)>> = HashMap::new();
         let mut open_region: Option<ValueId> = None;
         for (value_id, ir) in &nodes {
             let (buffers, access) = match ir {
-                IR::BeginRendering { .. } => {
+                IR::BeginRendering { .. } | IR::BeginCompute { .. } => {
                     open_region = Some(*value_id);
                     continue;
                 },
-                IR::EndRendering { .. } => {
+                IR::EndRendering { .. } | IR::EndCompute { .. } => {
                     open_region = None;
                     continue;
                 },
-                IR::SampleImage { image, .. } => {
+                IR::WriteDescriptor { descriptor, access, .. } => {
                     if let Some(region) = open_region {
+                        let root = self.resource_root(descriptor.image());
                         let sampled = region_images.entry(region).or_default();
-                        let root = self.resource_root(*image);
-                        if !sampled.contains(&root) {
-                            sampled.push(root);
+                        match sampled.iter_mut().find(|(seen, _)| *seen == root) {
+                            Some((_, merged)) => *merged |= *access,
+                            None => sampled.push((root, *access)),
                         }
                     }
                     continue;
@@ -1065,7 +1149,7 @@ impl Module {
             }
         }
 
-        // which resources are still named past each label, walked backwards so every label
+        // which declared_access are still named past each label, walked backwards so every label
         // sees what comes after it. a selection is the only construct there is, so program
         // order is the whole of what can follow a merge
         let mut live_after: HashMap<LabelId, HashSet<ValueId>> = HashMap::new();
@@ -1327,11 +1411,25 @@ impl Module {
                 IR::BeginRendering {
                     color_attachments,
                     depth_attachment,
+                    declared_access,
                     ..
                 } => {
-                    for image in region_images.get(&value_id).cloned().into_iter().flatten() {
-                        let sampled_id = read_access!(Access::FragmentSampled);
-                        transition!(image, sampled_id, Access::FragmentSampled);
+                    for (image, access) in region_images.get(&value_id).cloned().into_iter().flatten() {
+                        let sampled_id = read_access!(access);
+                        transition!(image, sampled_id, access);
+                    }
+
+                    for (resource, access) in declared_access {
+                        if self.is_buffer(*resource) {
+                            buffer_barrier!(self.resource_root(*resource), *access);
+                            continue;
+                        }
+
+                        let access_id = match access.writes() {
+                            true => emit_access!(*access),
+                            false => read_access!(*access),
+                        };
+                        transition!(*resource, access_id, *access);
                     }
 
                     let access_id = emit_access!(Access::ColorRW);
@@ -1349,8 +1447,13 @@ impl Module {
                     }
                 },
 
-                IR::BeginCompute { resources, .. } => {
-                    for (resource, access) in resources {
+                IR::BeginCompute { declared_access, .. } => {
+                    for (image, access) in region_images.get(&value_id).cloned().into_iter().flatten() {
+                        let sampled_id = read_access!(access);
+                        transition!(image, sampled_id, access);
+                    }
+
+                    for (resource, access) in declared_access {
                         if self.is_buffer(*resource) {
                             buffer_barrier!(self.resource_root(*resource), *access);
                             continue;
@@ -1452,8 +1555,8 @@ impl Module {
                     .iter()
                     .for_each(|b| used(b, vk::BufferUsageFlags::VERTEX_BUFFER)),
                 IR::BindIndexBuffer { buffer, .. } => used(buffer, vk::BufferUsageFlags::INDEX_BUFFER),
-                IR::BeginCompute { resources, .. } => {
-                    for (resource, access) in resources {
+                IR::BeginRendering { declared_access, .. } | IR::BeginCompute { declared_access, .. } => {
+                    for (resource, access) in declared_access {
                         if self.is_buffer(*resource) {
                             used(resource, vk::BufferUsageFlags::from(*access));
                         }
@@ -1744,7 +1847,7 @@ impl Module {
 
                 IR::BindVertexBuffers { pass, .. }
                 | IR::BindIndexBuffer { pass, .. }
-                | IR::SampleImage { pass, .. }
+                | IR::WriteDescriptor { pass, .. }
                 | IR::EndRendering { pass }
                 | IR::EndCompute { pass } => {
                     if let Some(in_force) = regions.get(pass).cloned() {
@@ -1760,257 +1863,6 @@ impl Module {
     }
 }
 
-struct Pass<'a> {
-    module: &'a mut Module,
-    id: ValueId,
-    begin: ValueId,
-}
-
-impl<'a> Pass<'a> {
-    fn begin(module: &'a mut Module, id: ValueId) -> Self { Self { module, id, begin: id } }
-
-    fn chain(&mut self, ir: IR) { self.id = self.module.emit(ir); }
-
-    fn set_state(&mut self, change: StateChange) { self.chain(IR::SetState { pass: self.id, change }) }
-
-    fn bind_pipeline(&mut self, pipeline: PipelineId, bind_point: vk::PipelineBindPoint) {
-        self.chain(IR::BindPipeline {
-            pass: self.id,
-            pipeline,
-            bind_point,
-        })
-    }
-
-    fn push_constant_bytes(&mut self, offset: u32, data: &[u8]) {
-        self.set_state(StateChange::PushConstants {
-            offset,
-            data: data.to_vec(),
-        })
-    }
-
-    fn push_constants_from_at(&mut self, offset: u32, variable: ValueId) {
-        let Some(size) = self.module.variable_bytes_size(variable) else {
-            tracing::error!(%variable, "push constants can only come from a bytes variable");
-            return;
-        };
-
-        self.set_state(StateChange::PushConstantsFrom {
-            offset,
-            size,
-            source: variable,
-        })
-    }
-
-    fn push_constant_address(&mut self, offset: u32, buffer: ValueId) {
-        self.set_state(StateChange::PushConstantAddress { offset, buffer })
-    }
-}
-
-macro_rules! pass_builder {
-    ($pass:ident) => {
-        impl $pass<'_> {
-            pub fn id(&self) -> ValueId { self.pass.id }
-
-            pub fn with_name(self, name: impl Into<Arc<str>>) -> Self {
-                self.pass.module.set_name(self.pass.begin, name);
-                self
-            }
-
-            pub fn push_constants<T: Copy>(self, value: &T) -> Self { self.push_constants_at(0, value) }
-
-            pub fn push_constants_at<T: Copy>(self, offset: u32, value: &T) -> Self {
-                let bytes = unsafe { std::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) };
-                self.push_constant_bytes(offset, bytes)
-            }
-
-            pub fn push_constant_bytes(mut self, offset: u32, data: &[u8]) -> Self {
-                self.pass.push_constant_bytes(offset, data);
-                self
-            }
-
-            pub fn push_constants_from(self, variable: ValueId) -> Self { self.push_constants_from_at(0, variable) }
-
-            pub fn push_constants_from_at(mut self, offset: u32, variable: ValueId) -> Self {
-                self.pass.push_constants_from_at(offset, variable);
-                self
-            }
-
-            pub fn push_constant_address(mut self, offset: u32, buffer: ValueId) -> Self {
-                self.pass.push_constant_address(offset, buffer);
-                self
-            }
-        }
-    };
-}
-
-pub struct RenderPass<'a> {
-    pass: Pass<'a>,
-}
-
-pass_builder!(RenderPass);
-
-impl RenderPass<'_> {
-    pub fn bind_graphics_pipeline(mut self, pipeline: PipelineId) -> Self {
-        self.pass.bind_pipeline(pipeline, vk::PipelineBindPoint::GRAPHICS);
-        self
-    }
-
-    fn set_state(mut self, change: StateChange) -> Self {
-        self.pass.set_state(change);
-        self
-    }
-
-    pub fn bind_vertex_buffer(self, binding: u32, buffer: ValueId) -> Self {
-        self.bind_vertex_buffers(binding, &[buffer], &[0])
-    }
-
-    pub fn bind_vertex_buffers(mut self, first_binding: u32, buffers: &[ValueId], offsets: &[u64]) -> Self {
-        assert_eq!(
-            buffers.len(),
-            offsets.len(),
-            "every bound vertex buffer needs an offset"
-        );
-
-        self.pass.chain(IR::BindVertexBuffers {
-            pass: self.pass.id,
-            first_binding,
-            buffers: buffers.to_vec(),
-            offsets: offsets.to_vec(),
-        });
-        self
-    }
-
-    pub fn bind_index_buffer(self, buffer: ValueId, index_type: vk::IndexType) -> Self {
-        self.bind_index_buffer_at(buffer, 0, index_type)
-    }
-
-    pub fn bind_index_buffer_at(mut self, buffer: ValueId, offset: u64, index_type: vk::IndexType) -> Self {
-        self.pass.chain(IR::BindIndexBuffer {
-            pass: self.pass.id,
-            buffer,
-            offset,
-            index_type,
-        });
-        self
-    }
-
-    pub fn sample_image(mut self, image: ValueId) -> Self {
-        self.pass.chain(IR::SampleImage {
-            pass: self.pass.id,
-            image,
-        });
-        self
-    }
-
-    pub fn set_primitive_topology(self, topology: vk::PrimitiveTopology) -> Self {
-        self.set_state(StateChange::PrimitiveTopology(topology))
-    }
-
-    pub fn set_depth(self, depth: DepthState) -> Self { self.set_state(StateChange::Depth(depth)) }
-
-    pub fn set_rasterization(self, rasterization: RasterizationState) -> Self {
-        self.set_state(StateChange::Rasterization(rasterization))
-    }
-
-    pub fn set_dynamic_state(self, dynamic: DynamicStateFlags) -> Self {
-        self.set_state(StateChange::DynamicState(dynamic))
-    }
-
-    pub fn set_viewport(self, index: u32, viewport: impl Into<Viewport>) -> Self {
-        self.set_state(StateChange::Viewport {
-            index,
-            viewport: viewport.into(),
-        })
-    }
-
-    pub fn set_scissor(self, index: u32, rect: Rect2D) -> Self { self.set_state(StateChange::Scissor { index, rect }) }
-
-    pub fn set_color_blend(self, index: u32, blend: impl Into<ColorBlendAttachmentState>) -> Self {
-        self.set_state(StateChange::ColorBlend {
-            index: Some(index),
-            blend: blend.into(),
-        })
-    }
-
-    pub fn broadcast_color_blend(self, blend: impl Into<ColorBlendAttachmentState>) -> Self {
-        self.set_state(StateChange::ColorBlend {
-            index: None,
-            blend: blend.into(),
-        })
-    }
-
-    pub fn draw(self, vertex_count: impl Count, instance_count: impl Count) -> Self {
-        self.draw_range(vertex_count, instance_count, 0, 0)
-    }
-
-    pub fn draw_range(
-        mut self, vertex_count: impl Count, instance_count: impl Count, first_vertex: impl Count,
-        first_instance: impl Count,
-    ) -> Self {
-        let vertex_count = vertex_count.lower(self.pass.module);
-        let instance_count = instance_count.lower(self.pass.module);
-        let first_vertex = first_vertex.lower(self.pass.module);
-        let first_instance = first_instance.lower(self.pass.module);
-        self.pass.chain(IR::Draw {
-            pass: self.pass.id,
-            vertex_count,
-            instance_count,
-            first_vertex,
-            first_instance,
-            pipeline: None,
-            state: Default::default(),
-            dynamic: Default::default(),
-        });
-        self
-    }
-
-    pub fn draw_indexed(self, index_count: impl Count, instance_count: impl Count) -> Self {
-        self.draw_indexed_range(index_count, instance_count, 0, 0, 0)
-    }
-
-    pub fn draw_indexed_range(
-        mut self, index_count: impl Count, instance_count: impl Count, first_index: impl Count, vertex_offset: i32,
-        first_instance: impl Count,
-    ) -> Self {
-        let index_count = index_count.lower(self.pass.module);
-        let instance_count = instance_count.lower(self.pass.module);
-        let first_index = first_index.lower(self.pass.module);
-        let vertex_offset = self.pass.module.lower_i32(vertex_offset);
-        let first_instance = first_instance.lower(self.pass.module);
-        self.pass.chain(IR::DrawIndexed {
-            pass: self.pass.id,
-            index_count,
-            instance_count,
-            first_index,
-            vertex_offset,
-            first_instance,
-            pipeline: None,
-            state: Default::default(),
-            dynamic: Default::default(),
-        });
-        self
-    }
-
-    pub fn record_from(mut self, body: ValueId) -> Self {
-        self.pass.chain(IR::CallOpaque {
-            pass: self.pass.id,
-            body,
-            pipeline: None,
-            state: Default::default(),
-            dynamic: Default::default(),
-        });
-        self
-    }
-
-    pub fn end_rendering(self) -> ValueId { self.pass.module.emit(IR::EndRendering { pass: self.pass.id }) }
-}
-
-pub struct ComputePass<'a> {
-    pass: Pass<'a>,
-}
-
-pass_builder!(ComputePass);
-
 pub trait Count {
     fn lower(self, module: &mut Module) -> ValueId;
 }
@@ -2023,52 +1875,349 @@ impl Count for ValueId {
     fn lower(self, _: &mut Module) -> ValueId { self }
 }
 
-impl ComputePass<'_> {
-    pub fn bind_pipeline(mut self, pipeline: PipelineId) -> Self {
-        self.pass.bind_pipeline(pipeline, vk::PipelineBindPoint::COMPUTE);
+impl Module {
+    fn open_pass(&mut self, kind: PassKind, begin: ValueId) -> &mut Self {
+        self.expect_no_open_pass("another one opens");
+        self.ongoing_pass = Some(OngoingPass {
+            kind,
+            begin,
+            tip: begin,
+        });
         self
     }
 
-    pub fn access(self, resource: ValueId, access: Access) -> Self {
-        let begin = self.pass.begin.0 as usize;
-        let Some(IR::BeginCompute { resources, .. }) = self.pass.module.instructions.get_mut(begin) else {
+    fn close_pass(&mut self) -> Option<OngoingPass> { self.ongoing_pass.take() }
+
+    fn expect_no_open_pass(&mut self, when: &str) {
+        if let Some(open) = self.close_pass() {
+            tracing::error!(
+                begin = %open.begin,
+                "a {} pass is still open where {when}; it is closed here",
+                open.kind.name()
+            );
+        }
+    }
+
+    fn chain(&mut self, wanted: Option<PassKind>, what: &str, ir: impl FnOnce(ValueId) -> IR) -> &mut Self {
+        let Some(open) = self.ongoing_pass else {
+            tracing::error!(what, "recorded outside of a pass; it is dropped");
             return self;
         };
 
-        match resources.iter_mut().find(|(id, _)| *id == resource) {
+        if let Some(wanted) = wanted
+            && open.kind != wanted
+        {
+            tracing::error!(
+                what,
+                "belongs to a {} pass but a {} pass is open; it is dropped",
+                wanted.name(),
+                open.kind.name()
+            );
+            return self;
+        }
+
+        let id = self.emit(ir(open.tip));
+        if let Some(open) = self.ongoing_pass.as_mut() {
+            open.tip = id;
+        }
+        self
+    }
+
+    fn set_state(&mut self, change: StateChange) -> &mut Self {
+        self.chain(Some(PassKind::Rendering), "state", |pass| IR::SetState { pass, change })
+    }
+
+    pub fn with_name(&mut self, name: impl Into<Arc<str>>) -> &mut Self {
+        match self.ongoing_pass {
+            Some(open) => {
+                self.set_name(open.begin, name);
+            },
+            None => tracing::error!("no pass is open to name; the name is dropped"),
+        }
+        self
+    }
+
+    pub fn push_constants<T: Copy>(&mut self, value: &T) -> &mut Self { self.push_constants_at(0, value) }
+
+    pub fn push_constants_at<T: Copy>(&mut self, offset: u32, value: &T) -> &mut Self {
+        let bytes = unsafe { std::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) };
+        self.push_constant_bytes(offset, bytes)
+    }
+
+    pub fn push_constant_bytes(&mut self, offset: u32, data: &[u8]) -> &mut Self {
+        self.pass_state(StateChange::PushConstants {
+            offset,
+            data: data.to_vec(),
+        })
+    }
+
+    pub fn push_constants_from(&mut self, variable: ValueId) -> &mut Self { self.push_constants_from_at(0, variable) }
+
+    pub fn push_constants_from_at(&mut self, offset: u32, variable: ValueId) -> &mut Self {
+        let Some(size) = self.variable_bytes_size(variable) else {
+            tracing::error!(%variable, "push constants can only come from a bytes variable");
+            return self;
+        };
+
+        self.pass_state(StateChange::PushConstantsFrom {
+            offset,
+            size,
+            source: variable,
+        })
+    }
+
+    pub fn push_constant_address(&mut self, offset: u32, buffer: ValueId) -> &mut Self {
+        self.pass_state(StateChange::PushConstantAddress { offset, buffer })
+    }
+
+    /// Push constants are the one piece of state both kinds of pass carry, so they are chained
+    /// without asking which one is open.
+    fn pass_state(&mut self, change: StateChange) -> &mut Self {
+        self.chain(None, "push constants", |pass| IR::SetState { pass, change })
+    }
+
+    fn bind_pipeline(&mut self, kind: PassKind, pipeline: PipelineId, bind_point: vk::PipelineBindPoint) -> &mut Self {
+        self.chain(Some(kind), "pipeline", |pass| IR::BindPipeline {
+            pass,
+            pipeline,
+            bind_point,
+        })
+    }
+
+    pub fn bind_graphics_pipeline(&mut self, pipeline: PipelineId) -> &mut Self {
+        self.bind_pipeline(PassKind::Rendering, pipeline, vk::PipelineBindPoint::GRAPHICS)
+    }
+
+    pub fn bind_compute_pipeline(&mut self, pipeline: PipelineId) -> &mut Self {
+        self.bind_pipeline(PassKind::Compute, pipeline, vk::PipelineBindPoint::COMPUTE)
+    }
+
+    /// Writes one descriptor into the open pass. Every write still standing when a draw or
+    /// dispatch is reached is what that command's descriptor sets are built from, so rebinding
+    /// the same set and binding only affects the commands after it.
+    fn write_descriptor(&mut self, set: u32, binding: u32, descriptor: ir::Descriptor) -> &mut Self {
+        if !self.is_image(descriptor.image()) {
+            tracing::error!(
+                image = %descriptor.image(),
+                set,
+                binding,
+                "only an image value can be written to an image descriptor"
+            );
+            return self;
+        }
+
+        self.chain(None, "descriptor", |pass| IR::WriteDescriptor {
+            pass,
+            set,
+            binding,
+            descriptor,
+            access: Access::None,
+        })
+    }
+
+    pub fn bind_image(&mut self, set: u32, binding: u32, image: ValueId) -> &mut Self {
+        self.write_descriptor(set, binding, ir::Descriptor::SampledImage { image })
+    }
+
+    pub fn bind_texture(&mut self, set: u32, binding: u32, image: ValueId, sampler: vk::Sampler) -> &mut Self {
+        self.write_descriptor(set, binding, ir::Descriptor::CombinedImageSampler { image, sampler })
+    }
+
+    pub fn bind_vertex_buffer(&mut self, binding: u32, buffer: ValueId) -> &mut Self {
+        self.bind_vertex_buffers(binding, &[buffer], &[0])
+    }
+
+    pub fn bind_vertex_buffers(&mut self, first_binding: u32, buffers: &[ValueId], offsets: &[u64]) -> &mut Self {
+        assert_eq!(
+            buffers.len(),
+            offsets.len(),
+            "every bound vertex buffer needs an offset"
+        );
+
+        let buffers = buffers.to_vec();
+        let offsets = offsets.to_vec();
+        self.chain(Some(PassKind::Rendering), "vertex buffers", |pass| {
+            IR::BindVertexBuffers {
+                pass,
+                first_binding,
+                buffers,
+                offsets,
+            }
+        })
+    }
+
+    pub fn bind_index_buffer(&mut self, buffer: ValueId, index_type: vk::IndexType) -> &mut Self {
+        self.bind_index_buffer_at(buffer, 0, index_type)
+    }
+
+    pub fn bind_index_buffer_at(&mut self, buffer: ValueId, offset: u64, index_type: vk::IndexType) -> &mut Self {
+        self.chain(Some(PassKind::Rendering), "index buffer", |pass| IR::BindIndexBuffer {
+            pass,
+            buffer,
+            offset,
+            index_type,
+        })
+    }
+
+    pub fn set_primitive_topology(&mut self, topology: vk::PrimitiveTopology) -> &mut Self {
+        self.set_state(StateChange::PrimitiveTopology(topology))
+    }
+
+    pub fn set_depth(&mut self, depth: DepthState) -> &mut Self { self.set_state(StateChange::Depth(depth)) }
+
+    pub fn set_rasterization(&mut self, rasterization: RasterizationState) -> &mut Self {
+        self.set_state(StateChange::Rasterization(rasterization))
+    }
+
+    pub fn set_dynamic_state(&mut self, dynamic: DynamicStateFlags) -> &mut Self {
+        self.set_state(StateChange::DynamicState(dynamic))
+    }
+
+    pub fn set_viewport(&mut self, index: u32, viewport: impl Into<Viewport>) -> &mut Self {
+        self.set_state(StateChange::Viewport {
+            index,
+            viewport: viewport.into(),
+        })
+    }
+
+    pub fn set_scissor(&mut self, index: u32, rect: Rect2D) -> &mut Self {
+        self.set_state(StateChange::Scissor { index, rect })
+    }
+
+    pub fn set_color_blend(&mut self, index: u32, blend: impl Into<ColorBlendAttachmentState>) -> &mut Self {
+        self.set_state(StateChange::ColorBlend {
+            index: Some(index),
+            blend: blend.into(),
+        })
+    }
+
+    pub fn broadcast_color_blend(&mut self, blend: impl Into<ColorBlendAttachmentState>) -> &mut Self {
+        self.set_state(StateChange::ColorBlend {
+            index: None,
+            blend: blend.into(),
+        })
+    }
+
+    pub fn draw(&mut self, vertex_count: impl Count, instance_count: impl Count) -> &mut Self {
+        self.draw_range(vertex_count, instance_count, 0, 0)
+    }
+
+    pub fn draw_range(
+        &mut self, vertex_count: impl Count, instance_count: impl Count, first_vertex: impl Count,
+        first_instance: impl Count,
+    ) -> &mut Self {
+        let vertex_count = vertex_count.lower(self);
+        let instance_count = instance_count.lower(self);
+        let first_vertex = first_vertex.lower(self);
+        let first_instance = first_instance.lower(self);
+        self.chain(Some(PassKind::Rendering), "draw", |pass| IR::Draw {
+            pass,
+            vertex_count,
+            instance_count,
+            first_vertex,
+            first_instance,
+            pipeline: None,
+            state: Default::default(),
+            dynamic: Default::default(),
+        })
+    }
+
+    pub fn draw_indexed(&mut self, index_count: impl Count, instance_count: impl Count) -> &mut Self {
+        self.draw_indexed_range(index_count, instance_count, 0, 0, 0)
+    }
+
+    pub fn draw_indexed_range(
+        &mut self, index_count: impl Count, instance_count: impl Count, first_index: impl Count, vertex_offset: i32,
+        first_instance: impl Count,
+    ) -> &mut Self {
+        let index_count = index_count.lower(self);
+        let instance_count = instance_count.lower(self);
+        let first_index = first_index.lower(self);
+        let vertex_offset = self.lower_i32(vertex_offset);
+        let first_instance = first_instance.lower(self);
+        self.chain(Some(PassKind::Rendering), "indexed draw", |pass| IR::DrawIndexed {
+            pass,
+            index_count,
+            instance_count,
+            first_index,
+            vertex_offset,
+            first_instance,
+            pipeline: None,
+            state: Default::default(),
+            dynamic: Default::default(),
+        })
+    }
+
+    pub fn record_from(&mut self, body: ValueId) -> &mut Self {
+        self.chain(Some(PassKind::Rendering), "callback", |pass| IR::CallOpaque {
+            pass,
+            body,
+            pipeline: None,
+            state: Default::default(),
+            dynamic: Default::default(),
+        })
+    }
+
+    pub fn end_rendering(&mut self) -> ValueId { self.end_pass(PassKind::Rendering, |pass| IR::EndRendering { pass }) }
+
+    pub fn access(&mut self, resource: ValueId, access: Access) -> &mut Self {
+        let Some(open) = self.ongoing_pass else {
+            tracing::error!(%resource, "an access was declared outside of a pass; it is dropped");
+            return self;
+        };
+
+        let declared = match self.instructions.get_mut(open.begin.0 as usize) {
+            Some(IR::BeginRendering { declared_access, .. } | IR::BeginCompute { declared_access, .. }) => {
+                declared_access
+            },
+            _ => return self,
+        };
+
+        match declared.iter_mut().find(|(id, _)| *id == resource) {
             Some((_, merged)) => *merged |= access,
-            None => resources.push((resource, access)),
+            None => declared.push((resource, access)),
         }
 
         self
     }
 
-    pub fn read(self, resource: ValueId) -> Self { self.access(resource, Access::ComputeRead) }
+    /// [`Self::access`] for the compute accesses, which only a compute pass reaches anything by.
+    fn compute_access(&mut self, resource: ValueId, access: Access) -> &mut Self {
+        if self.ongoing_pass.is_some_and(|open| open.kind != PassKind::Compute) {
+            tracing::error!(%resource, "a compute access was declared in a rendering pass; it is dropped");
+            return self;
+        }
 
-    pub fn write(self, resource: ValueId) -> Self { self.access(resource, Access::ComputeWrite) }
+        self.access(resource, access)
+    }
 
-    pub fn read_write(self, resource: ValueId) -> Self { self.access(resource, Access::ComputeRW) }
+    pub fn read(&mut self, resource: ValueId) -> &mut Self { self.compute_access(resource, Access::ComputeRead) }
 
-    pub fn sample_image(self, image: ValueId) -> Self { self.access(image, Access::ComputeSampled) }
+    pub fn write(&mut self, resource: ValueId) -> &mut Self { self.compute_access(resource, Access::ComputeWrite) }
 
-    pub fn read_uniform(self, buffer: ValueId) -> Self { self.access(buffer, Access::ComputeUniformRead) }
+    pub fn read_write(&mut self, resource: ValueId) -> &mut Self { self.compute_access(resource, Access::ComputeRW) }
 
-    fn dispatch_size(mut self, size: ir::DispatchSize) -> Self {
-        self.pass.chain(IR::Dispatch {
-            pass: self.pass.id,
+    pub fn sample_image(&mut self, image: ValueId) -> &mut Self { self.compute_access(image, Access::ComputeSampled) }
+
+    pub fn read_uniform(&mut self, buffer: ValueId) -> &mut Self {
+        self.compute_access(buffer, Access::ComputeUniformRead)
+    }
+
+    fn dispatch_size(&mut self, size: ir::DispatchSize) -> &mut Self {
+        self.chain(Some(PassKind::Compute), "dispatch", |pass| IR::Dispatch {
+            pass,
             size,
             pipeline: None,
             push_constants: Default::default(),
-        });
-        self
+        })
     }
 
     /// Dispatches these group counts. Each axis is a count known now or a value holding one when
     /// the module runs, in any mix.
-    pub fn dispatch(self, groups_x: impl Count, groups_y: impl Count, groups_z: impl Count) -> Self {
-        let x = groups_x.lower(self.pass.module);
-        let y = groups_y.lower(self.pass.module);
-        let z = groups_z.lower(self.pass.module);
+    pub fn dispatch(&mut self, groups_x: impl Count, groups_y: impl Count, groups_z: impl Count) -> &mut Self {
+        let x = groups_x.lower(self);
+        let y = groups_y.lower(self);
+        let z = groups_z.lower(self);
         self.dispatch_size(ir::DispatchSize::Groups { x, y, z })
     }
 
@@ -2076,28 +2225,28 @@ impl ComputePass<'_> {
     /// whatever the bound pipeline declares. An axis given as a value is counted and rounded up
     /// when the module runs rather than now.
     pub fn dispatch_invocations(
-        self, invocations_x: impl Count, invocations_y: impl Count, invocations_z: impl Count,
-    ) -> Self {
-        let x = invocations_x.lower(self.pass.module);
-        let y = invocations_y.lower(self.pass.module);
-        let z = invocations_z.lower(self.pass.module);
+        &mut self, invocations_x: impl Count, invocations_y: impl Count, invocations_z: impl Count,
+    ) -> &mut Self {
+        let x = invocations_x.lower(self);
+        let y = invocations_y.lower(self);
+        let z = invocations_z.lower(self);
         self.dispatch_size(ir::DispatchSize::Invocations { x, y, z })
     }
 
     /// Dispatches one invocation per pixel of `image`, width along x, height along y and depth
     /// along z.
-    pub fn dispatch_invocations_per_pixel(self, image: ValueId) -> Self {
+    pub fn dispatch_invocations_per_pixel(&mut self, image: ValueId) -> &mut Self {
         self.dispatch_invocations_per_pixel_scaled(image, [1.0; 3])
     }
 
     /// Dispatches [`Self::dispatch_invocations_per_pixel`] scaled per axis: above one is more
     /// invocations than pixels, below one is fewer. Rounding up to whole workgroups happens after
     /// the scaling.
-    pub fn dispatch_invocations_per_pixel_scaled(self, image: ValueId, scale: [f32; 3]) -> Self {
+    pub fn dispatch_invocations_per_pixel_scaled(&mut self, image: ValueId, scale: [f32; 3]) -> &mut Self {
         // an image sized by a variable has no extent to read here, so the count is left for
         // the interpreter to work out from whatever the image was allocated at
-        let Some(extent) = self.pass.module.resolve_image(image).and_then(|image| image.extent) else {
-            if !self.pass.module.is_image(image) {
+        let Some(extent) = self.resolve_image(image).and_then(|image| image.extent) else {
+            if !self.is_image(image) {
                 tracing::warn!(%image, "cannot infer the extent to dispatch over; the dispatch is dropped");
                 return self;
             }
@@ -2113,13 +2262,15 @@ impl ComputePass<'_> {
     }
 
     /// Dispatches one invocation per `element_size` bytes of `buffer`, along the x-axis only.
-    pub fn dispatch_invocations_per_element(self, buffer: ValueId, element_size: u64) -> Self {
+    pub fn dispatch_invocations_per_element(&mut self, buffer: ValueId, element_size: u64) -> &mut Self {
         self.dispatch_invocations_per_element_scaled(buffer, element_size, 1.0)
     }
 
     /// Dispatches [`Self::dispatch_invocations_per_element`] scaled: above one is more invocations
     /// than elements, below one is fewer.
-    pub fn dispatch_invocations_per_element_scaled(self, buffer: ValueId, element_size: u64, scale: f32) -> Self {
+    pub fn dispatch_invocations_per_element_scaled(
+        &mut self, buffer: ValueId, element_size: u64, scale: f32,
+    ) -> &mut Self {
         if element_size == 0 {
             tracing::warn!(%buffer, "elements of no size have no count to dispatch over; the dispatch is dropped");
             return self;
@@ -2128,8 +2279,8 @@ impl ComputePass<'_> {
         // a buffer bound to a variable has no size to read here, so the count is left for the
         // interpreter to work out from whatever was bound, the same way a per-pixel dispatch
         // over an image sized at run time is
-        let Some(size) = self.pass.module.resolve_buffer_size(buffer) else {
-            if !self.pass.module.is_buffer(buffer) {
+        let Some(size) = self.resolve_buffer_size(buffer) else {
+            if !self.is_buffer(buffer) {
                 tracing::warn!(%buffer, "cannot infer the element count to dispatch over; the dispatch is dropped");
                 return self;
             }
@@ -2141,19 +2292,31 @@ impl ComputePass<'_> {
     }
 
     /// Dispatches the group counts the device reads out of `buffer` itself.
-    pub fn dispatch_indirect(self, buffer: ValueId) -> Self { self.dispatch_indirect_at(buffer, 0) }
+    pub fn dispatch_indirect(&mut self, buffer: ValueId) -> &mut Self { self.dispatch_indirect_at(buffer, 0) }
 
-    pub fn dispatch_indirect_at(self, buffer: ValueId, offset: u64) -> Self {
+    pub fn dispatch_indirect_at(&mut self, buffer: ValueId, offset: u64) -> &mut Self {
         self.dispatch_size(ir::DispatchSize::Indirect { buffer, offset })
     }
 
-    pub fn end_compute(self) -> ValueId { self.pass.module.emit(IR::EndCompute { pass: self.pass.id }) }
+    pub fn end_compute(&mut self) -> ValueId { self.end_pass(PassKind::Compute, |pass| IR::EndCompute { pass }) }
+
+    fn end_pass(&mut self, kind: PassKind, end: impl FnOnce(ValueId) -> IR) -> ValueId {
+        let Some(open) = self.ongoing_pass.filter(|open| open.kind == kind) else {
+            tracing::error!("no {} pass is open to close", kind.name());
+            return self.ongoing_pass.map_or(ValueId(0), |open| open.tip);
+        };
+
+        self.close_pass();
+        self.emit(end(open.tip))
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use ash::vk::Handle;
+
     use super::*;
-    use crate::{BlendPreset, Image, PipelineState, ResolvedViewport, clear};
+    use crate::{BlendPreset, Image, PipelineState, ResolvedViewport, Unchecked, clear, graph::analysis::Declared};
 
     const FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
     const LAYOUT: vk::ImageLayout = vk::ImageLayout::READ_ONLY_OPTIMAL;
@@ -2259,6 +2422,10 @@ mod tests {
         }
     }
 
+    /// A sampler handle that stands for one, since a combined image sampler is only well formed
+    /// with a real one behind it.
+    fn a_sampler() -> vk::Sampler { vk::Sampler::from_raw(1) }
+
     fn image_usage(program: &Program, id: ValueId) -> vk::ImageUsageFlags {
         program
             .instructions()
@@ -2314,7 +2481,7 @@ mod tests {
             .record_from(body)
             .end_rendering();
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         let calls = compiled
             .instructions()
             .iter()
@@ -2343,12 +2510,12 @@ mod tests {
         let drawn = module
             .begin_rendering(&[swapchain])
             .bind_graphics_pipeline(PipelineId(0))
-            .sample_image(cleared)
+            .access(cleared, Access::FragmentSampled)
             .record_from(body)
             .end_rendering();
         let end = module.present(drawn);
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         let transitions = image_barriers(&module, &compiled)
             .into_iter()
             .filter(|barrier| module.resource_root(barrier.resource) == sampled)
@@ -2388,7 +2555,7 @@ mod tests {
             .record_from(body)
             .end_rendering();
 
-        let mut compiled = module.compile(end);
+        let mut compiled = module.compile(&Unchecked, end).unwrap();
         assert!(
             compiled
                 .instructions()
@@ -2424,7 +2591,7 @@ mod tests {
         let end = module.present(swapchain);
 
         assert_eq!(
-            image_usage(&module.compile(end), target),
+            image_usage(&module.compile(&Unchecked, end).unwrap(), target),
             vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC
         );
     }
@@ -2435,7 +2602,7 @@ mod tests {
         let source = module.transient_image(&transient_info());
         let end = module.blit(source, destination);
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         let barriers = image_barriers(&module, &compiled);
         assert_eq!(barriers.len(), 2);
 
@@ -2463,7 +2630,7 @@ mod tests {
         let imported = module.import_image(&image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
         let end = module.clear(imported, crate::clear::f32::BLACK);
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         let barriers = image_barriers(&module, &compiled);
         assert_eq!(barriers.len(), 1);
         assert_eq!(barriers[0].old_layout, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
@@ -2480,7 +2647,7 @@ mod tests {
         let first = module.blit(source, first);
         let end = module.blit(source, first);
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         let barriers = image_barriers(&module, &compiled);
         let reads = barriers.iter().filter(|b| b.resource == source).count();
         assert_eq!(reads, 1);
@@ -2497,14 +2664,15 @@ mod tests {
 
         let present = module.present(blit);
         let resting = module.release(source, Access::BlitRead, DomainFlag::Graphics);
-        let compiled = module.compile_all(&[present, resting]);
+        let compiled = module.compile_all(&Unchecked, &[present, resting]).unwrap();
 
         // nothing consumes the release, so only naming it as a root keeps it
         let position = |id: ValueId| compiled.instructions().iter().position(|(instr_id, _)| *instr_id == id);
         assert!(position(resting) > position(blit));
         assert!(
             module
-                .compile(present)
+                .compile(&Unchecked, present)
+                .unwrap()
                 .instructions()
                 .iter()
                 .all(|(id, _)| *id != resting)
@@ -2523,7 +2691,7 @@ mod tests {
 
         let present = module.present(blit);
         let resting = module.release(source, Access::ColorRW, DomainFlag::Graphics);
-        let compiled = module.compile_all(&[present, resting]);
+        let compiled = module.compile_all(&Unchecked, &[present, resting]).unwrap();
 
         let barriers = image_barriers(&module, &compiled);
         let last = barriers
@@ -2546,7 +2714,7 @@ mod tests {
             .draw(3, 1)
             .end_rendering();
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         let instructions = compiled.instructions();
         assert_eq!(
             memory_barriers(&module, &compiled),
@@ -2589,7 +2757,7 @@ mod tests {
 
         let written = module
             .begin_compute()
-            .bind_pipeline(PipelineId(0))
+            .bind_compute_pipeline(PipelineId(0))
             .write(scratch)
             .push_constant_address(0, scratch)
             .dispatch(1, 1, 1)
@@ -2602,7 +2770,7 @@ mod tests {
             .draw(3, 1)
             .end_rendering();
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         let usage = compiled
             .instructions()
             .iter()
@@ -2633,18 +2801,18 @@ mod tests {
 
         let written = module
             .begin_compute()
-            .bind_pipeline(PipelineId(0))
+            .bind_compute_pipeline(PipelineId(0))
             .write(scratch)
             .dispatch(1, 1, 1)
             .end_compute();
         let end = module
             .begin_compute()
-            .bind_pipeline(PipelineId(0))
+            .bind_compute_pipeline(PipelineId(0))
             .read(written)
             .dispatch(1, 1, 1)
             .end_compute();
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         assert_eq!(
             memory_barriers(&module, &compiled),
             vec![(Access::ComputeWrite, Access::ComputeRead)]
@@ -2664,12 +2832,12 @@ mod tests {
 
         let end = module
             .begin_compute()
-            .bind_pipeline(PipelineId(0))
+            .bind_compute_pipeline(PipelineId(0))
             .push_constant_address(0, scratch)
             .dispatch(1, 1, 1)
             .end_compute();
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         let constructed = compiled
             .instructions()
             .iter()
@@ -2686,18 +2854,18 @@ mod tests {
 
         let written = module
             .begin_compute()
-            .bind_pipeline(PipelineId(0))
+            .bind_compute_pipeline(PipelineId(0))
             .write(instances)
             .dispatch(1, 1, 1)
             .end_compute();
         let end = module
             .begin_compute()
-            .bind_pipeline(PipelineId(0))
+            .bind_compute_pipeline(PipelineId(0))
             .read(written)
             .dispatch(1, 1, 1)
             .end_compute();
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         assert_eq!(module.resource_root(written), instances);
         assert_eq!(module.resource_root(end), instances);
         assert_eq!(
@@ -2722,18 +2890,18 @@ mod tests {
 
         let written = module
             .begin_compute()
-            .bind_pipeline(PipelineId(0))
+            .bind_compute_pipeline(PipelineId(0))
             .write(instances)
             .dispatch(1, 1, 1)
             .end_compute();
         let end = module
             .begin_compute()
-            .bind_pipeline(PipelineId(0))
+            .bind_compute_pipeline(PipelineId(0))
             .read(written)
             .dispatch(1, 1, 1)
             .end_compute();
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         assert_eq!(
             memory_barriers(&module, &compiled),
             vec![
@@ -2752,7 +2920,7 @@ mod tests {
 
         let written = module
             .begin_compute()
-            .bind_pipeline(PipelineId(0))
+            .bind_compute_pipeline(PipelineId(0))
             .write(vertices)
             .push_constant_address(0, vertices)
             .dispatch(1, 1, 1)
@@ -2765,7 +2933,7 @@ mod tests {
             .draw(3, 1)
             .end_rendering();
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         let usage = compiled
             .instructions()
             .iter()
@@ -2798,7 +2966,7 @@ mod tests {
             .draw(3, 1)
             .end_rendering();
 
-        let draws = draws(&module.compile(end));
+        let draws = draws(&module.compile(&Unchecked, end).unwrap());
         assert_eq!(draws.len(), 1);
         assert!(draws[0].1.viewports.is_empty(), "{:?}", draws[0].1.viewports);
         assert!(draws[0].1.dynamic.contains(DynamicStateFlags::Viewport));
@@ -2818,7 +2986,7 @@ mod tests {
             .draw(3, 1)
             .end_rendering();
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         let draws = draws(&compiled);
         assert_eq!(draws.len(), 1);
         assert_eq!(draws[0].1.rendering.color_formats, vec![FORMAT]);
@@ -2841,19 +3009,19 @@ mod tests {
 
         let painted = module
             .begin_compute()
-            .bind_pipeline(PipelineId(0))
+            .bind_compute_pipeline(PipelineId(0))
             .write(target)
             .dispatch_invocations_per_pixel(target)
             .end_compute();
         let end = module
             .begin_compute()
-            .bind_pipeline(PipelineId(0))
+            .bind_compute_pipeline(PipelineId(0))
             .write(elements)
             .read(painted)
             .dispatch_invocations_per_element(elements, 16)
             .end_compute();
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         match dispatch_sizes(&compiled).as_slice() {
             [
                 ir::DispatchSize::InvocationsPerPixel { image, .. },
@@ -2878,12 +3046,12 @@ mod tests {
 
         let end = module
             .begin_compute()
-            .bind_pipeline(PipelineId(0))
+            .bind_compute_pipeline(PipelineId(0))
             .write(instances)
             .dispatch(1, 1, 1)
             .end_compute();
 
-        let dump = module.compile(end).dump();
+        let dump = module.compile(&Unchecked, end).unwrap().dump();
         assert!(dump.contains("buffer \"instances\""), "{dump}");
         assert!(dump.contains(" bound"), "{dump}");
         assert!(!dump.contains("transient"), "{dump}");
@@ -2898,12 +3066,12 @@ mod tests {
 
         let end = module
             .begin_compute()
-            .bind_pipeline(PipelineId(0))
+            .bind_compute_pipeline(PipelineId(0))
             .write(instances)
             .dispatch(1, 1, 1)
             .end_compute();
 
-        let mut compiled = module.compile(end);
+        let mut compiled = module.compile(&Unchecked, end).unwrap();
         assert!(matches!(compiled.variables()[0].value, Value::None));
 
         compiled.set(instances, Buffer::default());
@@ -2919,12 +3087,12 @@ mod tests {
 
         let end = module
             .begin_compute()
-            .bind_pipeline(PipelineId(0))
+            .bind_compute_pipeline(PipelineId(0))
             .write(instances)
             .dispatch(1, 1, 1)
             .end_compute();
 
-        module.compile(end).set(instances, 3u32);
+        module.compile(&Unchecked, end).unwrap().set(instances, 3u32);
     }
 
     /// The formats the pipelines were built for are the graph's to keep, so an image that does
@@ -2950,7 +3118,7 @@ mod tests {
             LAYOUT,
         );
 
-        module.compile(end).set(target, other);
+        module.compile(&Unchecked, end).unwrap().set(target, other);
     }
 
     /// A module re-run over its own buffers has to wait on what the previous run left them to,
@@ -2962,12 +3130,12 @@ mod tests {
 
         let end = module
             .begin_compute()
-            .bind_pipeline(PipelineId(0))
+            .bind_compute_pipeline(PipelineId(0))
             .write(buffer)
             .dispatch(1, 1, 1)
             .end_compute();
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         assert_eq!(
             memory_barriers(&module, &compiled),
             vec![(Access::AttributeRead, Access::ComputeWrite)]
@@ -2986,13 +3154,13 @@ mod tests {
 
         let end = module
             .begin_compute()
-            .bind_pipeline(PipelineId(0))
+            .bind_compute_pipeline(PipelineId(0))
             .write(first)
             .write(second)
             .dispatch(1, 1, 1)
             .end_compute();
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         assert_eq!(
             memory_barriers(&module, &compiled),
             vec![(Access::ComputeRead, Access::ComputeWrite)]
@@ -3008,18 +3176,18 @@ mod tests {
 
         let written = module
             .begin_compute()
-            .bind_pipeline(PipelineId(0))
+            .bind_compute_pipeline(PipelineId(0))
             .write(buffer)
             .dispatch(1, 1, 1)
             .end_compute();
         let end = module
             .begin_compute()
-            .bind_pipeline(PipelineId(1))
+            .bind_compute_pipeline(PipelineId(1))
             .read(written)
             .dispatch(1, 1, 1)
             .end_compute();
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         assert_eq!(
             memory_barriers(&module, &compiled),
             vec![
@@ -3040,7 +3208,7 @@ mod tests {
 
         let dispatched = module
             .begin_compute()
-            .bind_pipeline(PipelineId(0))
+            .bind_compute_pipeline(PipelineId(0))
             .dispatch_invocations(invocations, one, one)
             .end_compute();
 
@@ -3050,7 +3218,7 @@ mod tests {
             .draw(vertices, one)
             .end_rendering();
 
-        let compiled = module.compile_all(&[dispatched, end]);
+        let compiled = module.compile_all(&Unchecked, &[dispatched, end]).unwrap();
         let sizes = compiled
             .instructions()
             .iter()
@@ -3096,7 +3264,7 @@ mod tests {
             .set_depth(DepthState::less())
             .draw(3, 1)
             .end_rendering();
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
 
         let draws = draws(&compiled);
         assert_eq!(draws.len(), 1);
@@ -3117,7 +3285,7 @@ mod tests {
             .set_depth(DepthState::less())
             .draw(3, 1)
             .end_rendering();
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
 
         let draws = draws(&compiled);
         assert_eq!(draws.len(), 1);
@@ -3138,7 +3306,7 @@ mod tests {
             .set_depth(DepthState::less())
             .draw(3, 1)
             .end_rendering();
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
 
         let barrier = image_barriers(&module, &compiled)
             .into_iter()
@@ -3166,7 +3334,7 @@ mod tests {
             .bind_graphics_pipeline(PipelineId(0))
             .draw(3, 1)
             .end_rendering();
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
 
         assert!(
             image_usage(&compiled, depth).contains(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT),
@@ -3188,7 +3356,7 @@ mod tests {
             .draw(3, 1)
             .end_rendering();
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         assert_eq!(memory_barriers(&module, &compiled).len(), 1);
     }
 
@@ -3204,7 +3372,7 @@ mod tests {
             .draw_indexed(3, 1)
             .end_rendering();
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         let instructions = compiled.instructions();
         assert_eq!(
             memory_barriers(&module, &compiled),
@@ -3239,7 +3407,7 @@ mod tests {
             .draw_indexed(3, 1)
             .end_rendering();
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         assert_eq!(
             memory_barriers(&module, &compiled),
             vec![(Access::HostWrite, Access::AttributeRead | Access::IndexRead)],
@@ -3262,7 +3430,10 @@ mod tests {
             .draw_indexed(3, 1)
             .end_rendering();
 
-        assert_eq!(memory_barriers(&module, &module.compile(end)).len(), 1);
+        assert_eq!(
+            memory_barriers(&module, &module.compile(&Unchecked, end).unwrap()).len(),
+            1
+        );
     }
 
     /// An indexed draw goes through the same state inference as a plain one; a variant missing
@@ -3282,7 +3453,7 @@ mod tests {
             .draw_indexed(6, 1)
             .end_rendering();
 
-        let draws = draws(&module.compile(end));
+        let draws = draws(&module.compile(&Unchecked, end).unwrap());
         assert_eq!(draws.len(), 1);
         assert_eq!(draws[0].0, Some(pipeline));
         assert_eq!(draws[0].1.rendering.color_formats, vec![FORMAT]);
@@ -3300,7 +3471,7 @@ mod tests {
             .draw_indexed_range(9, 2, 3, -4, 5)
             .end_rendering();
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         let instructions = compiled.instructions();
         let (_, ir) = instructions
             .iter()
@@ -3337,7 +3508,7 @@ mod tests {
             .draw(3, 1)
             .end_rendering();
 
-        let draws = draws(&module.compile(end));
+        let draws = draws(&module.compile(&Unchecked, end).unwrap());
         assert_eq!(draws.len(), 1);
         assert_eq!(draws[0].0, Some(pipeline));
         assert_eq!(draws[0].1.rendering.color_formats, vec![FORMAT]);
@@ -3360,7 +3531,7 @@ mod tests {
             .draw(3, 1)
             .end_rendering();
 
-        let draws = draws(&module.compile(end));
+        let draws = draws(&module.compile(&Unchecked, end).unwrap());
         assert_eq!(draws.len(), 1);
         assert_eq!(draws[0].1.rasterization.cull_mode, vk::CullModeFlags::BACK);
         assert_eq!(draws[0].1.rasterization.polygon_mode, vk::PolygonMode::LINE);
@@ -3382,7 +3553,7 @@ mod tests {
             .draw(3, 1)
             .end_rendering();
 
-        let draws = draws(&module.compile(end));
+        let draws = draws(&module.compile(&Unchecked, end).unwrap());
         assert_eq!(draws.len(), 2);
         assert_eq!(draws[0].1.rasterization.cull_mode, vk::CullModeFlags::NONE);
         assert_eq!(draws[1].1.rasterization.cull_mode, vk::CullModeFlags::FRONT);
@@ -3402,7 +3573,7 @@ mod tests {
             .draw(6, 1)
             .end_rendering();
 
-        let draws = draws(&module.compile(end));
+        let draws = draws(&module.compile(&Unchecked, end).unwrap());
         assert_eq!(draws.len(), 2);
         assert_eq!(draws[0], draws[1]);
         assert_eq!(draws[0].1.topology, vk::PrimitiveTopology::LINE_STRIP);
@@ -3422,7 +3593,7 @@ mod tests {
             .draw(3, 1)
             .end_rendering();
 
-        let draws = draws(&module.compile(end));
+        let draws = draws(&module.compile(&Unchecked, end).unwrap());
         assert_eq!(draws[0].0, Some(PipelineId(1)));
         assert_eq!(draws[0].1.rasterization.cull_mode, vk::CullModeFlags::BACK);
     }
@@ -3433,7 +3604,7 @@ mod tests {
 
         let end = module.begin_rendering(&[attachment]).draw(3, 1).end_rendering();
 
-        let draws = draws(&module.compile(end));
+        let draws = draws(&module.compile(&Unchecked, end).unwrap());
         assert_eq!(draws[0].0, None);
     }
 
@@ -3457,7 +3628,7 @@ mod tests {
             .draw(3, 1)
             .end_rendering();
 
-        let draws = draws(&module.compile(end));
+        let draws = draws(&module.compile(&Unchecked, end).unwrap());
         assert_eq!(draws.len(), 2);
         assert_eq!(draws[0].1.rasterization.polygon_mode, vk::PolygonMode::LINE);
         assert_eq!(draws[1].1.rasterization.polygon_mode, vk::PolygonMode::FILL);
@@ -3477,7 +3648,7 @@ mod tests {
             .draw(3, 1)
             .end_rendering();
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         let dynamic = compiled
             .instructions()
             .iter()
@@ -3508,7 +3679,7 @@ mod tests {
             .draw(3, 1)
             .end_rendering();
 
-        let draws = draws(&module.compile(end));
+        let draws = draws(&module.compile(&Unchecked, end).unwrap());
         assert_eq!(
             draws[0].1.viewports,
             vec![ResolvedViewport {
@@ -3546,7 +3717,7 @@ mod tests {
             .draw(3, 1)
             .end_rendering();
 
-        let draws = draws(&module.compile(end));
+        let draws = draws(&module.compile(&Unchecked, end).unwrap());
         assert_eq!(draws[0].1.viewports[0].width, (WIDTH / 2) as f32);
         assert_eq!(draws[0].1.viewports[0].height, (HEIGHT / 2) as f32);
     }
@@ -3564,7 +3735,7 @@ mod tests {
             .draw(3, 1)
             .end_rendering();
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         let pushed = compiled
             .instructions()
             .iter()
@@ -3597,7 +3768,8 @@ mod tests {
             .end_rendering();
 
         let pushed = module
-            .compile(end)
+            .compile(&Unchecked, end)
+            .unwrap()
             .instructions()
             .iter()
             .filter_map(|(_, ir)| match ir {
@@ -3621,7 +3793,7 @@ mod tests {
             .draw(3, 1)
             .end_rendering();
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         let (_, IR::Draw { dynamic, .. }) = compiled
             .instructions()
             .iter()
@@ -3641,13 +3813,13 @@ mod tests {
 
         let end = module
             .begin_compute()
-            .bind_pipeline(PipelineId(1))
+            .bind_compute_pipeline(PipelineId(1))
             .write(attachment)
             .push_constants(&7u32)
             .dispatch(8, 4, 1)
             .end_compute();
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         let (
             _,
             IR::Dispatch {
@@ -3707,12 +3879,12 @@ mod tests {
 
         let end = module
             .begin_compute()
-            .bind_pipeline(PipelineId(0))
+            .bind_compute_pipeline(PipelineId(0))
             .write(attachment)
             .dispatch_invocations(1920, 1080, 1)
             .end_compute();
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         assert_eq!(invocations(&module, &compiled), [1920, 1080, 1]);
     }
 
@@ -3722,12 +3894,12 @@ mod tests {
 
         let end = module
             .begin_compute()
-            .bind_pipeline(PipelineId(0))
+            .bind_compute_pipeline(PipelineId(0))
             .write(attachment)
             .dispatch_invocations_per_pixel(attachment)
             .end_compute();
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         assert_eq!(invocations(&module, &compiled), [WIDTH, HEIGHT, 1]);
     }
 
@@ -3738,12 +3910,12 @@ mod tests {
 
         let end = module
             .begin_compute()
-            .bind_pipeline(PipelineId(0))
+            .bind_compute_pipeline(PipelineId(0))
             .write(attachment)
             .dispatch_invocations_per_pixel_scaled(attachment, [0.5, 2.0, 0.25])
             .end_compute();
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         assert_eq!(invocations(&module, &compiled), [WIDTH / 2, HEIGHT * 2, 1]);
     }
 
@@ -3754,12 +3926,12 @@ mod tests {
 
         let end = module
             .begin_compute()
-            .bind_pipeline(PipelineId(0))
+            .bind_compute_pipeline(PipelineId(0))
             .write(buffer)
             .dispatch_invocations_per_element(buffer, 20)
             .end_compute();
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         assert_eq!(invocations(&module, &compiled), [40, 1, 1]);
     }
 
@@ -3770,12 +3942,12 @@ mod tests {
 
         let end = module
             .begin_compute()
-            .bind_pipeline(PipelineId(0))
+            .bind_compute_pipeline(PipelineId(0))
             .write(buffer)
             .dispatch_invocations_per_element_scaled(buffer, 20, 3.0)
             .end_compute();
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         assert_eq!(invocations(&module, &compiled), [120, 1, 1]);
     }
 
@@ -3789,12 +3961,12 @@ mod tests {
 
         let end = module
             .begin_compute()
-            .bind_pipeline(PipelineId(0))
+            .bind_compute_pipeline(PipelineId(0))
             .write(image)
             .dispatch_indirect(commands)
             .end_compute();
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         assert_eq!(
             memory_barriers(&module, &compiled),
             vec![(Access::HostWrite, Access::IndirectRead)]
@@ -3818,13 +3990,13 @@ mod tests {
 
         let end = module
             .begin_compute()
-            .bind_pipeline(PipelineId(0))
+            .bind_compute_pipeline(PipelineId(0))
             .write(image)
             .dispatch_indirect(commands)
             .dispatch_indirect_at(commands, 12)
             .end_compute();
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         assert_eq!(
             dispatch_sizes(&compiled),
             vec![
@@ -3851,7 +4023,7 @@ mod tests {
 
         let computed = module
             .begin_compute()
-            .bind_pipeline(PipelineId(0))
+            .bind_compute_pipeline(PipelineId(0))
             .write(target)
             .dispatch(8, 8, 1)
             .end_compute();
@@ -3859,7 +4031,7 @@ mod tests {
         let swapchain = module.blit(computed, swapchain);
         let end = module.present(swapchain);
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         let written = image_barriers(&module, &compiled)
             .into_iter()
             .find(|barrier| barrier.resource == target)
@@ -3881,18 +4053,18 @@ mod tests {
 
         let written = module
             .begin_compute()
-            .bind_pipeline(PipelineId(0))
+            .bind_compute_pipeline(PipelineId(0))
             .write(image)
             .dispatch(1, 1, 1)
             .end_compute();
         let end = module
             .begin_compute()
-            .bind_pipeline(PipelineId(1))
+            .bind_compute_pipeline(PipelineId(1))
             .read(written)
             .dispatch(1, 1, 1)
             .end_compute();
 
-        let barriers = image_barriers(&module, &module.compile(end));
+        let barriers = image_barriers(&module, &module.compile(&Unchecked, end).unwrap());
         assert_eq!(barriers.len(), 2);
         assert_eq!(barriers[1].src, Access::ComputeWrite);
         assert_eq!(barriers[1].dst, Access::ComputeRead);
@@ -3907,13 +4079,13 @@ mod tests {
 
         let end = module
             .begin_compute()
-            .bind_pipeline(PipelineId(0))
+            .bind_compute_pipeline(PipelineId(0))
             .read(image)
             .write(image)
             .dispatch(1, 1, 1)
             .end_compute();
 
-        let barriers = image_barriers(&module, &module.compile(end));
+        let barriers = image_barriers(&module, &module.compile(&Unchecked, end).unwrap());
         assert_eq!(barriers.len(), 1);
         assert_eq!(barriers[0].dst, Access::ComputeRW);
     }
@@ -3925,7 +4097,7 @@ mod tests {
 
         let computed = module
             .begin_compute()
-            .bind_pipeline(PipelineId(1))
+            .bind_compute_pipeline(PipelineId(1))
             .write(buffer)
             .dispatch(1, 1, 1)
             .end_compute();
@@ -3936,7 +4108,7 @@ mod tests {
             .draw(3, 1)
             .end_rendering();
 
-        let compiled = module.compile_all(&[computed, rendered]);
+        let compiled = module.compile_all(&Unchecked, &[computed, rendered]).unwrap();
         assert_eq!(
             memory_barriers(&module, &compiled),
             vec![
@@ -3956,7 +4128,7 @@ mod tests {
 
         let computed = module
             .begin_compute()
-            .bind_pipeline(PipelineId(1))
+            .bind_compute_pipeline(PipelineId(1))
             .write(buffer)
             .dispatch(1, 1, 1)
             .end_compute();
@@ -3967,7 +4139,7 @@ mod tests {
             .draw(3, 1)
             .end_rendering();
 
-        let compiled = module.compile(rendered);
+        let compiled = module.compile(&Unchecked, rendered).unwrap();
         let position = |predicate: fn(&IR) -> bool| {
             compiled
                 .instructions()
@@ -4000,7 +4172,7 @@ mod tests {
         let texture = module.transient_image(&untyped_info());
         let end = module.copy_buffer_to_image(staging, texture);
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         assert_eq!(
             memory_barriers(&module, &compiled),
             vec![(Access::HostWrite, Access::CopyRead)]
@@ -4024,11 +4196,11 @@ mod tests {
         let end = module
             .begin_rendering(&[attachment])
             .bind_graphics_pipeline(PipelineId(0))
-            .sample_image(texture)
+            .access(texture, Access::FragmentSampled)
             .draw(3, 1)
             .end_rendering();
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         let sampled = image_barriers(&module, &compiled)
             .into_iter()
             .find(|barrier| barrier.resource == texture)
@@ -4049,6 +4221,118 @@ mod tests {
         assert!(last_barrier < begin);
     }
 
+    fn descriptor_writes(program: &Program) -> Vec<(u32, u32, ir::Descriptor)> {
+        program
+            .instructions()
+            .iter()
+            .filter_map(|(_, ir)| match ir {
+                IR::WriteDescriptor {
+                    set,
+                    binding,
+                    descriptor,
+                    ..
+                } => Some((*set, *binding, *descriptor)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_rendering_descriptor_is_written_by_an_instruction_of_its_own() {
+        let (mut module, attachment) = module_with_attachment();
+        let first = module.transient_image(&untyped_info());
+        let second = module.transient_image(&untyped_info());
+
+        let end = module
+            .begin_rendering(&[attachment])
+            .bind_graphics_pipeline(PipelineId(0))
+            .bind_image(2, 4, first)
+            .bind_texture(2, 4, second, a_sampler())
+            .draw(3, 1)
+            .end_rendering();
+
+        let bindings = Declared::new(&[(2, 4, vk::DescriptorType::COMBINED_IMAGE_SAMPLER)]);
+        let compiled = module.compile(&bindings, end).unwrap();
+        // both writes survive: what the draw sees is the last one, but the first one remains in
+        // the recorded command stream
+        assert_eq!(
+            descriptor_writes(&compiled),
+            [
+                (2, 4, ir::Descriptor::SampledImage { image: first }),
+                (
+                    2,
+                    4,
+                    ir::Descriptor::CombinedImageSampler {
+                        image: second,
+                        sampler: a_sampler(),
+                    }
+                ),
+            ]
+        );
+
+        let sampled = image_barriers(&module, &compiled)
+            .into_iter()
+            .find(|barrier| barrier.resource == second)
+            .expect("the bound image should be transitioned");
+        assert_eq!(sampled.dst, Access::FragmentSampled);
+    }
+
+    #[test]
+    fn a_compute_descriptor_is_written_by_an_instruction_of_its_own() {
+        let mut module = Module::default();
+        let texture = module.transient_image(&untyped_info());
+        let end = module
+            .begin_compute()
+            .bind_compute_pipeline(PipelineId(0))
+            .bind_image(1, 3, texture)
+            .dispatch(1, 1, 1)
+            .end_compute();
+
+        let bindings = Declared::in_stages(
+            &[(1, 3, vk::DescriptorType::SAMPLED_IMAGE)],
+            vk::ShaderStageFlags::COMPUTE,
+        );
+        let compiled = module.compile(&bindings, end).unwrap();
+        assert_eq!(
+            descriptor_writes(&compiled),
+            [(1, 3, ir::Descriptor::SampledImage { image: texture })]
+        );
+
+        let sampled = image_barriers(&module, &compiled)
+            .into_iter()
+            .find(|barrier| barrier.resource == texture)
+            .expect("the bound image should be transitioned");
+        assert_eq!(sampled.dst, Access::ComputeSampled);
+    }
+
+    /// A layout transition cannot be recorded inside a region, so the barrier for an image a
+    /// descriptor names has to be emitted before the region it is written in opens.
+    #[test]
+    fn a_written_descriptor_is_transitioned_before_its_region_opens() {
+        let (mut module, attachment) = module_with_attachment();
+        let texture = module.transient_image(&untyped_info());
+        let end = module
+            .begin_rendering(&[attachment])
+            .bind_graphics_pipeline(PipelineId(0))
+            .bind_texture(0, 0, texture, a_sampler())
+            .draw(3, 1)
+            .end_rendering();
+
+        let bindings = Declared::new(&[(0, 0, vk::DescriptorType::COMBINED_IMAGE_SAMPLER)]);
+        let compiled = module.compile(&bindings, end).unwrap();
+        let instructions = compiled.instructions();
+        let barrier = instructions
+            .iter()
+            .position(|(_, ir)| matches!(ir, IR::ImageBarrier { value, .. } if module.resource_root(*value) == texture))
+            .expect("the written image should be transitioned");
+        let begin = instructions
+            .iter()
+            .position(|(_, ir)| matches!(ir, IR::BeginRendering { .. }))
+            .expect("the region should survive");
+
+        assert!(barrier < begin);
+    }
+
     #[test]
     fn sampling_the_same_image_twice_in_a_region_does_not_repeat_the_barrier() {
         let (mut module, attachment) = module_with_attachment();
@@ -4057,13 +4341,13 @@ mod tests {
         let end = module
             .begin_rendering(&[attachment])
             .bind_graphics_pipeline(PipelineId(0))
-            .sample_image(texture)
+            .access(texture, Access::FragmentSampled)
             .draw(3, 1)
-            .sample_image(texture)
+            .access(texture, Access::FragmentSampled)
             .draw(3, 1)
             .end_rendering();
 
-        let barriers = image_barriers(&module, &module.compile(end));
+        let barriers = image_barriers(&module, &module.compile(&Unchecked, end).unwrap());
         assert_eq!(barriers.iter().filter(|b| b.resource == texture).count(), 1);
     }
 
@@ -4077,11 +4361,11 @@ mod tests {
         let end = module
             .begin_rendering(&[attachment])
             .bind_graphics_pipeline(PipelineId(0))
-            .sample_image(uploaded)
+            .access(uploaded, Access::FragmentSampled)
             .draw(3, 1)
             .end_rendering();
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         let layouts = image_barriers(&module, &compiled)
             .iter()
             .filter(|barrier| barrier.resource == texture)
@@ -4110,12 +4394,12 @@ mod tests {
         let end = module
             .begin_rendering(&[attachment])
             .bind_graphics_pipeline(PipelineId(0))
-            .sample_image(uploaded)
+            .access(uploaded, Access::FragmentSampled)
             .draw(3, 1)
             .end_rendering();
 
         assert_eq!(
-            image_usage(&module.compile(end), texture),
+            image_usage(&module.compile(&Unchecked, end).unwrap(), texture),
             vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED
         );
     }
@@ -4136,7 +4420,8 @@ mod tests {
         );
 
         let regions = module
-            .compile(patch)
+            .compile(&Unchecked, patch)
+            .unwrap()
             .instructions()
             .iter()
             .filter_map(|(_, ir)| match ir {
@@ -4174,7 +4459,7 @@ mod tests {
             .draw(3, 1)
             .end_rendering();
 
-        let draws = draws(&module.compile(end));
+        let draws = draws(&module.compile(&Unchecked, end).unwrap());
         assert_eq!(draws[0].1.blend, vec![ColorBlendAttachmentState::default()]);
         assert_eq!(draws[1].1.blend, vec![BlendPreset::AlphaBlend.into()]);
         assert_ne!(draws[0].1, draws[1].1);
@@ -4199,8 +4484,8 @@ mod tests {
         let cleared = module.clear_from(target, color);
         let end = module.present(cleared);
 
-        let before = module.compile(end);
-        let mut after = module.compile(end);
+        let before = module.compile(&Unchecked, end).unwrap();
+        let mut after = module.compile(&Unchecked, end).unwrap();
         after.set(color, clear::f32::WHITE);
 
         assert_eq!(before.instructions().len(), after.instructions().len());
@@ -4221,7 +4506,7 @@ mod tests {
         let target = module.transient_image(&transient_info());
         let end = module.clear_from(target, color);
 
-        module.compile(end).set(color, 3u32);
+        module.compile(&Unchecked, end).unwrap().set(color, 3u32);
     }
 
     /// A pipeline outlives the frame it was compiled in, so an extent that is only known at
@@ -4241,7 +4526,7 @@ mod tests {
             .draw(3, 1)
             .end_rendering();
 
-        let draws = draws(&module.compile(end));
+        let draws = draws(&module.compile(&Unchecked, end).unwrap());
         assert_eq!(draws.len(), 1);
         assert!(draws[0].1.viewports.is_empty(), "{:?}", draws[0].1.viewports);
         assert!(draws[0].1.scissors.is_empty(), "{:?}", draws[0].1.scissors);
@@ -4260,12 +4545,12 @@ mod tests {
 
         let end = module
             .begin_compute()
-            .bind_pipeline(PipelineId(0))
+            .bind_compute_pipeline(PipelineId(0))
             .write(target)
             .dispatch_invocations_per_pixel(target)
             .end_compute();
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         match dispatch_sizes(&compiled).as_slice() {
             [ir::DispatchSize::InvocationsPerPixel { image, scale }] => {
                 assert_eq!(module.resource_root(*image), target);
@@ -4330,7 +4615,7 @@ mod tests {
     #[test]
     fn every_block_ends_in_a_terminator() {
         let (module, _, end) = module_with_a_conditional_clear();
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         let instructions = compiled.instructions();
 
         let terminated = |index: usize| {
@@ -4371,7 +4656,7 @@ mod tests {
     #[test]
     fn every_global_lands_before_the_first_branch() {
         let (module, _, end) = module_with_a_conditional_clear();
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
 
         let first_branch = compiled
             .instructions()
@@ -4394,7 +4679,7 @@ mod tests {
     #[test]
     fn a_constant_a_barrier_names_is_never_defined_inside_a_block() {
         let (module, _, end) = module_with_a_conditional_clear();
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         let instructions = compiled.instructions();
 
         let first_label = instructions
@@ -4431,7 +4716,7 @@ mod tests {
     #[test]
     fn a_label_is_the_first_instruction_of_its_block() {
         let (module, _, end) = module_with_a_conditional_clear();
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
 
         let mut open = None;
         for (id, ir) in compiled.instructions() {
@@ -4449,7 +4734,7 @@ mod tests {
     #[test]
     fn a_selection_lays_each_block_out_in_one_piece() {
         let (module, _, end) = module_with_a_conditional_clear();
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
 
         let mut seen = Vec::new();
         let mut current = None;
@@ -4478,7 +4763,7 @@ mod tests {
     #[test]
     fn both_arms_of_a_selection_leave_a_resource_in_the_same_layout() {
         let (module, source, end) = module_with_a_conditional_clear();
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
 
         let (merge, taken, skipped) = selection_labels(&compiled);
         let (merge, taken, skipped) = (
@@ -4514,7 +4799,7 @@ mod tests {
     #[test]
     fn an_arm_that_touches_nothing_is_still_brought_to_the_join() {
         let (module, source, end) = module_with_a_conditional_clear();
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
 
         let (merge, _, skipped) = selection_labels(&compiled);
         let barriers = compiled.instructions()[block_at(&compiled, skipped)..block_at(&compiled, merge)]
@@ -4541,7 +4826,7 @@ mod tests {
             enabled,
             |m| {
                 m.begin_compute()
-                    .bind_pipeline(PipelineId(0))
+                    .bind_compute_pipeline(PipelineId(0))
                     .write(target)
                     .read(buffer)
                     .dispatch(1, 1, 1)
@@ -4550,7 +4835,7 @@ mod tests {
             |_| target,
         );
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         assert_eq!(memory_barriers(&module, &compiled), vec![], "{}", compiled.dump());
     }
 
@@ -4565,14 +4850,14 @@ mod tests {
 
         let dispatch = |m: &mut Module, pipeline: u32| {
             m.begin_compute()
-                .bind_pipeline(PipelineId(pipeline))
+                .bind_compute_pipeline(PipelineId(pipeline))
                 .write(buffer)
                 .dispatch(1, 1, 1)
                 .end_compute()
         };
         let end = module.set_condition(enabled, |m| dispatch(m, 0), |m| dispatch(m, 1));
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         assert_eq!(
             memory_barriers(&module, &compiled),
             vec![
@@ -4596,7 +4881,7 @@ mod tests {
 
         let read_both = |m: &mut Module, target| {
             m.begin_compute()
-                .bind_pipeline(PipelineId(0))
+                .bind_compute_pipeline(PipelineId(0))
                 .write(target)
                 .read_uniform(first)
                 .read_uniform(second)
@@ -4607,7 +4892,7 @@ mod tests {
         let drawn = module.set_condition(enabled, |m| read_both(m, target), |_| target);
         let end = read_both(&mut module, drawn);
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         let (merge, _, skipped) = selection_labels(&compiled);
         let caught_up = compiled.instructions()[block_at(&compiled, skipped)..block_at(&compiled, merge)]
             .iter()
@@ -4639,7 +4924,7 @@ mod tests {
         );
 
         let end = module.release(drawn, Access::Present, DomainFlag::Present);
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         let (merge, _, skipped) = selection_labels(&compiled);
         let caught_up = compiled.instructions()[block_at(&compiled, skipped)..block_at(&compiled, merge)]
             .iter()
@@ -4662,7 +4947,7 @@ mod tests {
             .draw(3, 1)
             .end_rendering();
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         let pushed = compiled
             .instructions()
             .iter()
@@ -4691,7 +4976,7 @@ mod tests {
             .draw(3, 1)
             .end_rendering();
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         let declared = compiled
             .instructions()
             .iter()
@@ -4715,7 +5000,7 @@ mod tests {
             .draw(3, 1)
             .end_rendering();
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         let pushed = compiled
             .instructions()
             .iter()
@@ -4732,7 +5017,7 @@ mod tests {
     #[test]
     fn a_branch_target_resolves_to_the_block_it_names() {
         let (module, _, end) = module_with_a_conditional_clear();
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
 
         for (_, ir) in compiled.instructions() {
             let targets = match ir {
@@ -4750,5 +5035,70 @@ mod tests {
                 assert!(matches!(compiled.instructions()[index], (_, IR::Label { label, .. }) if label == target));
             }
         }
+    }
+    /// What a pass reaches with no binding the graph can see, ordered by the access the caller
+    /// states rather than one inferred from the kind of pass it is.
+    #[test]
+    fn a_declared_rendering_access_transitions_before_the_region_opens() {
+        let (mut module, attachment) = module_with_attachment();
+        let texture = module.transient_image(&untyped_info());
+
+        let end = module
+            .begin_rendering(&[attachment])
+            .bind_graphics_pipeline(PipelineId(0))
+            .access(texture, Access::VertexSampled)
+            .draw(3, 1)
+            .end_rendering();
+
+        let compiled = module.compile(&Unchecked, end).unwrap();
+        let sampled = image_barriers(&module, &compiled)
+            .into_iter()
+            .find(|barrier| barrier.resource == texture)
+            .expect("the declared image should be transitioned");
+        assert_eq!(sampled.dst, Access::VertexSampled);
+        assert_eq!(sampled.new_layout, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+
+        let instructions = compiled.instructions();
+        let at = |find: fn(&IR) -> bool| instructions.iter().position(|(_, ir)| find(ir)).expect("present");
+        assert!(
+            at(|ir| matches!(ir, IR::ImageBarrier { .. })) < at(|ir| matches!(ir, IR::BeginRendering { .. })),
+            "{}",
+            compiled.dump()
+        );
+    }
+    /// A fragment stage writing a storage image, an overdraw counter being the usual reason. It
+    /// is not an attachment and has no binding the graph can see, so the region declares it: the
+    /// layout, the usage and the barrier all come off that one access.
+    #[test]
+    fn a_fragment_write_declared_on_a_region_reaches_general_as_a_storage_image() {
+        let (mut module, attachment) = module_with_attachment();
+        let overdraw = module.transient_image(&untyped_info());
+
+        let end = module
+            .begin_rendering(&[attachment])
+            .bind_graphics_pipeline(PipelineId(0))
+            .access(overdraw, Access::FragmentWrite)
+            .draw(3, 1)
+            .end_rendering();
+
+        let compiled = module.compile(&Unchecked, end).unwrap();
+        let barrier = image_barriers(&module, &compiled)
+            .into_iter()
+            .find(|barrier| barrier.resource == overdraw)
+            .expect("the declared image should be transitioned");
+
+        assert_eq!(barrier.dst, Access::FragmentWrite);
+        assert_eq!(barrier.new_layout, vk::ImageLayout::GENERAL);
+        assert_eq!(image_usage(&compiled, overdraw), vk::ImageUsageFlags::STORAGE);
+
+        // and it still has to land before the region opens, since no transition can be recorded
+        // inside one
+        let instructions = compiled.instructions();
+        let at = |find: fn(&IR) -> bool| instructions.iter().position(|(_, ir)| find(ir)).expect("present");
+        assert!(
+            at(|ir| matches!(ir, IR::ImageBarrier { .. })) < at(|ir| matches!(ir, IR::BeginRendering { .. })),
+            "{}",
+            compiled.dump()
+        );
     }
 }

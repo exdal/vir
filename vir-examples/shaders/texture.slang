@@ -1,16 +1,12 @@
 struct PushConstants {
     float2 scale;
-    uint texture_index;
 };
 
 [[vk::push_constant]]
 ConstantBuffer<PushConstants> push;
 
-/// The graph's bindless table. A variable-count combined image sampler array is what it
-/// recognises as the slot textures are written into, so `texture_index` is all a draw needs
-/// to name one.
 [[vk::binding(0, 0)]]
-Sampler2D textures[];
+Sampler2D texture;
 
 struct VSOutput {
     float4 position : SV_Position;
@@ -37,5 +33,5 @@ VSOutput vs_main(uint vertex_id: SV_VertexID) {
 
 [shader("fragment")]
 float4 fs_main(VSOutput input): SV_Target {
-    return textures[push.texture_index].Sample(input.uv);
+    return texture.Sample(input.uv);
 }

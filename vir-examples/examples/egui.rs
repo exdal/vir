@@ -3,7 +3,7 @@
 //! Every example draws its controls through the same egui backend the harness owns. Here there
 //! is nothing under it: the frame clears the swapchain and hands it back, and the whole image is
 //! the UI. The backend lives in `src/egui_pass.rs`, where the font atlas and meshes exercise
-//! texture uploads, indexed draws, per-draw scissors, and bindless sampling.
+//! texture uploads, indexed draws, per-draw scissors, and ordinary descriptor binding.
 
 use ash::vk;
 use vir::{ClearValue, ValueId};

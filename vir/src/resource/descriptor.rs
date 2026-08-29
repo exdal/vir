@@ -2,49 +2,33 @@ use std::collections::BTreeMap;
 
 use ash::vk;
 
-use crate::PipelineLayout;
-
-/// A texture's slot in a [`RenderGraph`](crate::RenderGraph)'s bindless table.
-///
-/// This is the value a shader indexes its texture array with, so it is what a draw pushes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TextureId(pub u32);
-
-impl std::fmt::Display for TextureId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "@{}", self.0) }
-}
-
-/// Every descriptor set one pipeline layout declares, and the pool they came out of.
-///
-/// A pool per layout costs one object each but sizes itself exactly, so nothing has to guess
-/// how many descriptors the pipelines a graph ends up holding will want between them.
 #[derive(Debug)]
-pub struct DescriptorSets {
-    pool: vk::DescriptorPool,
-    sets: Vec<vk::DescriptorSet>,
+pub(crate) struct DescriptorArena {
+    pools: Vec<vk::DescriptorPool>,
+    max_sets: u32,
+    totals: BTreeMap<i32, (vk::DescriptorType, u32)>,
 }
 
-impl DescriptorSets {
-    pub fn sets(&self) -> &[vk::DescriptorSet] { &self.sets }
-
-    pub fn set(&self, index: u32) -> Option<vk::DescriptorSet> { self.sets.get(index as usize).copied() }
-
-    pub(crate) fn create(device: &ash::Device, layout: &PipelineLayout) -> Result<Option<Self>, vk::Result> {
-        if layout.sets.is_empty() {
+impl DescriptorArena {
+    pub(crate) fn create(
+        device: &ash::Device, max_sets: u32, totals: &BTreeMap<i32, (vk::DescriptorType, u32)>,
+    ) -> Result<Option<Self>, vk::Result> {
+        if max_sets == 0 {
             return Ok(None);
         }
 
-        let mut totals: BTreeMap<i32, (vk::DescriptorType, u32)> = BTreeMap::new();
-        let mut update_after_bind = false;
-        for set in &layout.sets {
-            update_after_bind |= set.variable_count > 0;
-            for (descriptor_type, count) in &set.sizes {
-                let entry = totals.entry(descriptor_type.as_raw()).or_insert((*descriptor_type, 0));
-                entry.1 += count;
-            }
-        }
+        let pool = Self::create_pool(device, max_sets, totals)?;
 
-        // a set with no bindings at all still has to come out of the pool
+        Ok(Some(Self {
+            pools: vec![pool],
+            max_sets,
+            totals: totals.clone(),
+        }))
+    }
+
+    fn create_pool(
+        device: &ash::Device, max_sets: u32, totals: &BTreeMap<i32, (vk::DescriptorType, u32)>,
+    ) -> Result<vk::DescriptorPool, vk::Result> {
         let sizes = totals
             .values()
             .filter(|(_, count)| *count > 0)
@@ -54,40 +38,37 @@ impl DescriptorSets {
                     .descriptor_count(*count)
             })
             .collect::<Vec<_>>();
-
-        let mut flags = vk::DescriptorPoolCreateFlags::empty();
-        if update_after_bind {
-            flags |= vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND;
-        }
-
-        let pool_info = vk::DescriptorPoolCreateInfo::default()
-            .flags(flags)
-            .max_sets(layout.sets.len() as u32)
+        let info = vk::DescriptorPoolCreateInfo::default()
+            .max_sets(max_sets)
             .pool_sizes(&sizes);
-        let pool = unsafe { device.create_descriptor_pool(&pool_info, None) }?;
-
-        let set_layouts = layout.sets.iter().map(|set| set.handle).collect::<Vec<_>>();
-        let variable_counts = layout.sets.iter().map(|set| set.variable_count).collect::<Vec<_>>();
-
-        let mut count_info =
-            vk::DescriptorSetVariableDescriptorCountAllocateInfo::default().descriptor_counts(&variable_counts);
-        let mut alloc_info = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(pool)
-            .set_layouts(&set_layouts);
-        if update_after_bind {
-            alloc_info = alloc_info.push_next(&mut count_info);
-        }
-
-        let sets = match unsafe { device.allocate_descriptor_sets(&alloc_info) } {
-            Ok(sets) => sets,
-            Err(err) => {
-                unsafe { device.destroy_descriptor_pool(pool, None) };
-                return Err(err);
-            },
-        };
-
-        Ok(Some(Self { pool, sets }))
+        unsafe { device.create_descriptor_pool(&info, None) }
     }
 
-    pub(crate) fn destroy(&self, device: &ash::Device) { unsafe { device.destroy_descriptor_pool(self.pool, None) }; }
+    pub(crate) fn allocate(
+        &mut self, device: &ash::Device, layout: vk::DescriptorSetLayout,
+    ) -> Result<vk::DescriptorSet, vk::Result> {
+        let layouts = [layout];
+        let allocate = |pool| {
+            let info = vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(pool)
+                .set_layouts(&layouts);
+            unsafe { device.allocate_descriptor_sets(&info) }.map(|sets| sets[0])
+        };
+
+        match allocate(*self.pools.last().expect("an arena always owns one pool")) {
+            Ok(set) => Ok(set),
+            Err(vk::Result::ERROR_OUT_OF_POOL_MEMORY | vk::Result::ERROR_FRAGMENTED_POOL) => {
+                let pool = Self::create_pool(device, self.max_sets, &self.totals)?;
+                self.pools.push(pool);
+                allocate(pool)
+            },
+            Err(err) => Err(err),
+        }
+    }
+
+    pub(crate) fn destroy(self, device: &ash::Device) {
+        for pool in self.pools {
+            unsafe { device.destroy_descriptor_pool(pool, None) };
+        }
+    }
 }

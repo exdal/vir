@@ -1,16 +1,12 @@
 struct PushConstants {
     float2 screen_size;
-    uint texture_index;
 };
 
 [[vk::push_constant]]
 ConstantBuffer<PushConstants> push;
 
-/// The graph's bindless table. A variable-count combined image sampler array is what it
-/// recognises as the slot textures are written into, so `texture_index` is all a draw needs
-/// to name one.
 [[vk::binding(0, 0)]]
-Sampler2D textures[];
+Sampler2D texture;
 
 /// Mirrors `egui::epaint::Vertex`. The color arrives as a packed `Color32` rather than a
 /// `float4` because reflection only derives 32-bit attribute formats, so a `uint` is what
@@ -62,6 +58,6 @@ VSOutput vs_main(VSInput input) {
 float4 fs_main(VSOutput input) : SV_Target {
     // The atlas is an _SRGB image, so the sample comes back linear and premultiplied, which
     // is the space the interpolated vertex color is already in.
-    float4 texel = textures[push.texture_index].Sample(input.uv);
+    float4 texel = texture.Sample(input.uv);
     return input.color * texel;
 }

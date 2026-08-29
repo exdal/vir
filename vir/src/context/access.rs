@@ -77,6 +77,43 @@ impl Access {
     pub fn writes(self) -> bool { self.intersects(Access::Writes) }
 
     pub fn reads(self) -> bool { !self.difference(Access::Writes | Access::None).is_empty() }
+
+    pub fn sampled_by(stages: vk::ShaderStageFlags) -> Access {
+        let mapped = [
+            (vk::ShaderStageFlags::VERTEX, Access::VertexSampled),
+            (vk::ShaderStageFlags::FRAGMENT, Access::FragmentSampled),
+            (vk::ShaderStageFlags::COMPUTE, Access::ComputeSampled),
+            (vk::ShaderStageFlags::TESSELLATION_CONTROL, Access::TessellationSampled),
+            (
+                vk::ShaderStageFlags::TESSELLATION_EVALUATION,
+                Access::TessellationSampled,
+            ),
+            (vk::ShaderStageFlags::GEOMETRY, Access::VertexSampled),
+            (vk::ShaderStageFlags::RAYGEN_KHR, Access::RayTracingSampled),
+            (vk::ShaderStageFlags::ANY_HIT_KHR, Access::RayTracingSampled),
+            (vk::ShaderStageFlags::CLOSEST_HIT_KHR, Access::RayTracingSampled),
+            (vk::ShaderStageFlags::MISS_KHR, Access::RayTracingSampled),
+            (vk::ShaderStageFlags::INTERSECTION_KHR, Access::RayTracingSampled),
+            (vk::ShaderStageFlags::CALLABLE_KHR, Access::RayTracingSampled),
+        ];
+
+        let mut access = Access::empty();
+        let mut covered = vk::ShaderStageFlags::empty();
+        for (stage, sampled) in mapped {
+            if stages.contains(stage) {
+                access |= sampled;
+                covered |= stage;
+            }
+        }
+
+        let uncovered = stages & !covered;
+        if !uncovered.is_empty() {
+            tracing::warn!(stages = ?uncovered, "no sampled access covers these stages; memory is waited on instead");
+            access |= Access::MemoryRead;
+        }
+
+        access
+    }
 }
 
 impl From<Access> for vk::AccessFlags2 {

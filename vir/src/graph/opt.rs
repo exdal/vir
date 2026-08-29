@@ -332,7 +332,7 @@ mod tests {
     use ash::vk;
 
     use super::*;
-    use crate::{DomainFlag, ImageInfo, PipelineId, Program};
+    use crate::{DomainFlag, ImageInfo, PipelineId, Program, Unchecked};
 
     const FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
 
@@ -409,7 +409,7 @@ mod tests {
         let maybe = module.set_condition(enabled, move |m| draw_into(m, drawn), move |_| drawn);
         let end = module.release(maybe, Access::BlitRead, DomainFlag::Graphics);
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         let dump = compiled.dump();
 
         let (taken, skipped) = conditional(&compiled).expect("the selection branches");
@@ -441,7 +441,7 @@ mod tests {
         let drawn = module.set_condition(enabled, move |m| draw_into(m, target), move |_| target);
         let end = module.release(drawn, Access::BlitRead, DomainFlag::Graphics);
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         let dump = compiled.dump();
 
         let (taken, skipped) = conditional(&compiled).expect("the selection branches");
@@ -463,7 +463,7 @@ mod tests {
         let maybe = module.set_condition(enabled, move |_| drawn, move |_| drawn);
         let end = module.release(maybe, Access::BlitRead, DomainFlag::Graphics);
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         let dump = compiled.dump();
 
         assert!(conditional(&compiled).is_none(), "the branch has one way to go\n{dump}");
@@ -494,7 +494,7 @@ mod tests {
         let chosen = module.set_condition(enabled, move |_| first, move |_| second);
         let end = module.release(chosen, Access::BlitRead, DomainFlag::Graphics);
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         let dump = compiled.dump();
 
         let (taken, skipped) = conditional(&compiled).expect("the selection branches");
@@ -520,7 +520,7 @@ mod tests {
             .end_rendering();
         let end = module.release(drawn, Access::BlitRead, DomainFlag::Graphics);
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         assert_eq!(
             memory_barriers(&compiled),
             vec![(Access::HostWrite, Access::AttributeRead | Access::IndexRead)],
@@ -552,7 +552,7 @@ mod tests {
             .end_rendering();
         let end = module.release(second, Access::BlitRead, DomainFlag::Graphics);
 
-        let compiled = module.compile(end);
+        let compiled = module.compile(&Unchecked, end).unwrap();
         assert_eq!(
             memory_barriers(&compiled),
             vec![

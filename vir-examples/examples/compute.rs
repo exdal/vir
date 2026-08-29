@@ -155,7 +155,7 @@ impl Example for Compute {
         let placed = module
             .begin_compute()
             .with_name("place")
-            .bind_pipeline(self.place)
+            .bind_compute_pipeline(self.place)
             .write(instances)
             .push_constants_from(push)
             .push_constant_address(INSTANCES_AT, instances)
@@ -168,7 +168,7 @@ impl Example for Compute {
         let expanded = module
             .begin_compute()
             .with_name("expand")
-            .bind_pipeline(self.expand)
+            .bind_compute_pipeline(self.expand)
             .write(vertices)
             .read(placed)
             .push_constants_from(push)
@@ -266,7 +266,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> { vir_examples::run::<Comput
 
 #[cfg(test)]
 mod tests {
-    use vir::{Access, IR, ImageInfo, Module, Program, VertexAttribute, VertexLayout, graph::ir, resource::shader};
+    use vir::{
+        Access,
+        IR,
+        ImageInfo,
+        Module,
+        Program,
+        Unchecked,
+        VertexAttribute,
+        VertexLayout,
+        graph::ir,
+        resource::shader,
+    };
 
     use super::*;
 
@@ -304,7 +315,10 @@ mod tests {
             .draw(3, 1)
             .end_rendering();
 
-        (module.compile(end), vertices)
+        (
+            module.compile(&Unchecked, end).expect("the chain should compile"),
+            vertices,
+        )
     }
 
     fn memory_barriers(program: &Program) -> Vec<(Access, Access)> {
@@ -341,7 +355,7 @@ mod tests {
             .iter()
             .rev()
             .find_map(|(_, ir)| match ir {
-                IR::BeginCompute { resources, .. } => Some(resources),
+                IR::BeginCompute { declared_access, .. } => Some(declared_access),
                 _ => None,
             })
             .expect("the compute regions should be present");

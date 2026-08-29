@@ -40,11 +40,7 @@ use vir::{
 #[derive(Clone, Copy)]
 struct PushConstants {
     screen_size: [f32; 2],
-    texture_index: u32,
 }
-
-/// Where `texture_index` sits in the block, since a draw pushes it on its own.
-const TEXTURE_INDEX_OFFSET: u32 = 8;
 
 /// egui hands over `Color32`, which is sRGB with premultiplied alpha, so an `_SRGB` format is
 /// what makes a sample come back linear the way the shader expects.
@@ -58,8 +54,7 @@ const TEXTURE_RESTING: vir::Access = vir::Access::FragmentSampled;
 struct Texture {
     image: Image,
     image_view: vk::ImageView,
-    /// The texture's slot in the graph's bindless table, which is what a draw pushes.
-    slot: vir::TextureId,
+    sampler: vk::Sampler,
     extent: vk::Extent2D,
     options: TextureOptions,
     /// Whether anything has landed in it yet, which is what says its contents are worth
@@ -74,14 +69,11 @@ impl Texture {
 }
 
 /// One primitive's slice of the frame's shared buffers.
-///
-/// The texture is already resolved to the bindless slot the draw pushes: the body that records
-/// this runs with nothing but what it was handed, and looking a texture up again there would
-/// mean sharing the pass's texture table with it.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct MeshDraw {
     clip: vk::Rect2D,
-    slot: u32,
+    texture: ImageAttachment,
+    sampler: vk::Sampler,
     index_offset: u32,
     index_count: u32,
     vertex_offset: i32,
@@ -181,9 +173,8 @@ impl EguiPass {
     }
 
     /// Hands every texture and sampler back. The device has to be idle first.
-    pub fn destroy(&mut self, graph: &mut RenderGraph, allocator: &mut PersistentAllocator) {
+    pub fn destroy(&mut self, _graph: &mut RenderGraph, allocator: &mut PersistentAllocator) {
         for (_, texture) in self.textures.drain() {
-            graph.unregister_texture(texture.slot);
             allocator.deallocate_image_view(texture.image_view);
             allocator.deallocate_image(texture.image);
         }
@@ -221,7 +212,7 @@ impl EguiPass {
     /// The deltas are taken by value because handling them is the whole contract: egui asserts
     /// on a `TexturesDelta` that is dropped with anything left in it.
     fn stage_textures(
-        &mut self, ctx: &Context, graph: &mut RenderGraph, persistent: &mut PersistentAllocator,
+        &mut self, ctx: &Context, _graph: &mut RenderGraph, persistent: &mut PersistentAllocator,
         allocator: &mut FrameAllocator, mut textures_delta: TexturesDelta,
     ) -> Result<Vec<Upload>, vk::Result> {
         let mut uploads = Vec::new();
@@ -245,7 +236,7 @@ impl EguiPass {
                     continue;
                 }
 
-                if !self.prepare_target(graph, persistent, &mut retired, *id, delta, size)? {
+                if !self.prepare_target(persistent, &mut retired, *id, delta, size)? {
                     continue;
                 }
 
@@ -276,7 +267,6 @@ impl EguiPass {
             // the only thing that says an earlier frame is done sampling these
             unsafe { ctx.device().device_wait_idle() }?;
             for texture in retired {
-                graph.unregister_texture(texture.slot);
                 persistent.deallocate_image_view(texture.image_view);
                 persistent.deallocate_image(texture.image);
             }
@@ -291,8 +281,8 @@ impl EguiPass {
     /// A whole delta that changes the size or the sampling of a texture replaces it; a partial
     /// one only ever patches what is already there.
     fn prepare_target(
-        &mut self, graph: &mut RenderGraph, allocator: &mut PersistentAllocator, retired: &mut Vec<Texture>,
-        id: egui::TextureId, delta: &ImageDelta, size: vk::Extent2D,
+        &mut self, allocator: &mut PersistentAllocator, retired: &mut Vec<Texture>, id: egui::TextureId,
+        delta: &ImageDelta, size: vk::Extent2D,
     ) -> Result<bool, vk::Result> {
         let existing = self.textures.get(&id);
 
@@ -325,7 +315,7 @@ impl EguiPass {
         let texture = Texture {
             image,
             image_view,
-            slot: graph.register_texture(image_view, sampler),
+            sampler,
             extent: size,
             options: delta.options,
             uploaded: false,
@@ -385,7 +375,6 @@ impl EguiPass {
             slots.push,
             &PushConstants {
                 screen_size: frame.screen_size_in_points,
-                texture_index: 0,
             },
         );
 
@@ -412,7 +401,7 @@ impl EguiPass {
                             draw.clip.extent.height,
                         ),
                     )
-                    .push_constants_at(TEXTURE_INDEX_OFFSET, &draw.slot)
+                    .bind_texture(0, 0, &draw.texture, draw.sampler)
                     .draw_indexed_range(
                         draw.index_count,
                         1,
@@ -464,7 +453,8 @@ impl EguiPass {
 
             draws.push(MeshDraw {
                 clip,
-                slot: texture.slot.0,
+                texture: texture.attachment(TEXTURE_RESTING.into()),
+                sampler: texture.sampler,
                 index_offset: indices.len() as u32,
                 index_count: mesh.indices.len() as u32,
                 vertex_offset: vertices.len() as i32,
@@ -517,8 +507,7 @@ impl EguiPass {
     /// A copy is not part of the frame's program: how many there are changes with whatever
     /// egui re-rastered, and that program is compiled once. They are rare enough that a module
     /// of their own, run to completion, costs less than keeping them in would. Every patch
-    /// ends in the layout the pass samples from, which is what lets the frame name no texture
-    /// at all.
+    /// ends in the layout the callback's ordinary descriptors sample from.
     fn upload(
         &mut self, ctx: &Context, graph: &mut RenderGraph, allocator: &mut FrameAllocator, uploads: Vec<Upload>,
     ) -> Result<(), vk::Result> {
@@ -561,7 +550,8 @@ impl EguiPass {
             .iter()
             .map(|(_, value)| module.release(*value, TEXTURE_RESTING, vir::DomainFlag::Graphics))
             .collect::<Vec<_>>();
-        graph.execute_blocking(ctx, &module.compile_all(&roots), &mut AllocatorKind::Frame(allocator))?;
+        let program = module.compile_all(&*graph, &roots)?;
+        graph.execute_blocking(ctx, &program, &mut AllocatorKind::Frame(allocator))?;
 
         for (id, _) in &values {
             if let Some(texture) = self.textures.get_mut(id) {
@@ -620,33 +610,20 @@ mod tests {
         );
     }
 
-    /// The vertex stage reads the screen size out of the block and the fragment stage the
-    /// texture index, so one range covers both and spans exactly the struct the pass pushes.
+    /// Only the vertex stage reads the screen size block.
     #[test]
-    fn the_push_constant_range_covers_both_stages() {
+    fn the_push_constant_range_covers_the_vertex_stage() {
         let reflect = |spirv| shader::reflect(&read_spirv(spirv)).expect("shader should reflect");
 
         let ranges = push_constant_ranges(&[reflect(EGUI_VERT_SPV), reflect(EGUI_FRAG_SPV)]);
         assert_eq!(ranges.len(), 1);
-        assert_eq!(
-            ranges[0].stage_flags,
-            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT
-        );
+        assert_eq!(ranges[0].stage_flags, vk::ShaderStageFlags::VERTEX);
         assert_eq!(ranges[0].offset, 0);
         assert_eq!(ranges[0].size as usize, size_of::<PushConstants>());
-
-        // and the index has to be the tail of the block, since a draw pushes it alone
-        assert_eq!(
-            TEXTURE_INDEX_OFFSET as usize,
-            size_of::<PushConstants>() - size_of::<u32>()
-        );
     }
 
-    /// The whole bindless path rests on this shape: a variable-count combined image sampler
-    /// array is what a pipeline layout recognises as the slot the graph's texture table is
-    /// written into, so a shader that reflects as anything else silently samples nothing.
     #[test]
-    fn the_fragment_shader_declares_the_bindless_texture_table() {
+    fn the_fragment_shader_declares_one_texture() {
         let reflection = shader::reflect(&read_spirv(EGUI_FRAG_SPV)).expect("shader should reflect");
 
         assert_eq!(
@@ -656,11 +633,12 @@ mod tests {
                 binding: 0,
                 descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
                 count: 1,
-                variable_count: true,
+                variable_count: false,
+                stages: vk::ShaderStageFlags::FRAGMENT,
             }]
         );
 
-        // and the vertex stage stays out of it, so the table is fragment-only
+        // and the vertex stage stays out of it, so the descriptor is fragment-only
         let vertex = shader::reflect(&read_spirv(EGUI_VERT_SPV)).expect("shader should reflect");
         assert!(vertex.bindings.is_empty());
     }

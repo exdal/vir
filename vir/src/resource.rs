@@ -7,9 +7,9 @@ pub mod shader;
 pub mod swapchain;
 
 pub use buffer::{Buffer, BufferInfo, MemoryLocation};
-pub use descriptor::{DescriptorSets, TextureId};
 pub use image::{BufferImageCopy, Image, ImageInfo, aspect_mask};
 pub use pipeline::{
+    BindlessDescriptorSet,
     BlendPreset,
     ColorBlendAttachmentState,
     ComputePipelineInfo,
@@ -28,7 +28,6 @@ pub use pipeline::{
     ResolvedViewport,
     SetLayout,
     StateChange,
-    TextureBinding,
     VertexAttribute,
     VertexLayout,
     Viewport,

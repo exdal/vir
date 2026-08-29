@@ -1,7 +1,8 @@
 //! Deferred shading: geometry and lighting split across two passes.
 //!
-//! The first pass draws every mesh once into a G-buffer, three color targets and a depth target
-//! rendered in one region, and shades nothing. The second pass draws a single triangle over the
+//! The geometry stage draws every mesh once into a G-buffer, three color targets and a depth
+//! target, and shades nothing. Each material occupies its own rendering region because an
+//! ordinary descriptor is pass-scoped. The lighting pass draws a single triangle over the
 //! screen and shades every pixel out of what the first one wrote, so the cost of a light no
 //! longer scales with the geometry behind it.
 //!
@@ -40,7 +41,6 @@ use vir::{
     Rect2D,
     RenderGraph,
     SamplerInfo,
-    TextureId,
     ValueId,
     allocator::Allocator,
 };
@@ -89,7 +89,6 @@ struct Vertex {
 struct GeometryPush {
     view_proj: [[f32; 4]; 4],
     base_color: [f32; 3],
-    base_color_texture: u32,
 }
 
 /// The block `deferred_lighting.slang` declares. Each `float3` is followed by a scalar that
@@ -103,9 +102,6 @@ struct LightingPush {
     light_intensity: f32,
     light_color: [f32; 3],
     specular_strength: f32,
-    albedo_index: u32,
-    normal_index: u32,
-    position_index: u32,
     mode: u32,
 }
 
@@ -128,15 +124,12 @@ impl ViewMode {
     ];
 }
 
-/// What a material asks for that the geometry pass has no texture to give it.
-const NO_TEXTURE: u32 = u32::MAX;
-
 /// Geometry as it comes off a loader, before it reaches the GPU.
 struct MeshData {
     vertices: Vec<Vertex>,
     indices: Vec<u32>,
     base_color: [f32; 3],
-    /// Indexes [`SceneData::images`], not the bindless table, which only exists once uploaded.
+    /// Indexes [`SceneData::images`].
     base_color_image: Option<usize>,
 }
 
@@ -158,15 +151,14 @@ struct Mesh {
     indices: vir::Buffer,
     index_count: u32,
     base_color: [f32; 3],
-    /// The bindless slot the draw pushes, or [`NO_TEXTURE`].
-    base_color_texture: u32,
+    /// The scalar descriptor this mesh binds before drawing.
+    base_color_texture: usize,
 }
 
 /// A material texture, uploaded once and sampled by every draw that names it.
 struct Texture {
     image: Image,
     view: vk::ImageView,
-    slot: TextureId,
 }
 
 impl Texture {
@@ -175,12 +167,11 @@ impl Texture {
     }
 }
 
-/// A G-buffer target, which is a color attachment the geometry pass writes and a bindless slot
-/// the lighting pass samples.
+/// A G-buffer target, which is a color attachment the geometry pass writes and the lighting
+/// pass samples.
 struct GTarget {
     image: Image,
     view: vk::ImageView,
-    slot: TextureId,
 }
 
 impl GTarget {
@@ -334,14 +325,13 @@ impl Deferred {
         -Vec3::new(cos_pitch * sin_yaw, sin_pitch, cos_pitch * cos_yaw).normalize_or(Vec3::NEG_Y)
     }
 
-    /// Throws away the G-buffer and everything it holds, including its bindless slots.
-    fn release_gbuffer(&mut self, graph: &mut RenderGraph, allocator: &mut PersistentAllocator) {
+    /// Throws away the G-buffer and everything it holds.
+    fn release_gbuffer(&mut self, _graph: &mut RenderGraph, allocator: &mut PersistentAllocator) {
         let Some(gbuffer) = self.gbuffer.take() else {
             return;
         };
 
         for target in gbuffer.targets() {
-            graph.unregister_texture(target.slot);
             allocator.deallocate_image_view(target.view);
             allocator.deallocate_image(target.image);
         }
@@ -350,10 +340,8 @@ impl Deferred {
         allocator.deallocate_image(gbuffer.depth);
     }
 
-    /// One color target, registered into the bindless table the lighting pass samples through.
-    fn create_target(
-        recording: &mut Recording, format: vk::Format, sampler: vk::Sampler, name: &str,
-    ) -> Result<GTarget, vk::Result> {
+    /// One color target the lighting pass samples through an ordinary descriptor.
+    fn create_target(recording: &mut Recording, format: vk::Format, name: &str) -> Result<GTarget, vk::Result> {
         let info = ImageInfo::color_target(recording.target.extent, format)
             // sampled by the lighting pass, cleared by a transfer at the top of the frame
             .with_usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
@@ -366,18 +354,16 @@ impl Deferred {
             vk::ImageViewType::TYPE_2D,
             image.subresource_range(),
         )?;
-        let slot = recording.graph.register_texture(view, sampler);
-
-        Ok(GTarget { image, view, slot })
+        Ok(GTarget { image, view })
     }
 
     /// The whole G-buffer matches the swapchain, so it is thrown away and remade with it.
     fn create_gbuffer(&mut self, recording: &mut Recording) -> Result<GBuffer, vk::Result> {
         self.release_gbuffer(recording.graph, recording.allocator);
 
-        let albedo = Self::create_target(recording, ALBEDO_FORMAT, self.sampler, "g-buffer albedo")?;
-        let normal = Self::create_target(recording, NORMAL_FORMAT, self.sampler, "g-buffer normal")?;
-        let position = Self::create_target(recording, POSITION_FORMAT, self.sampler, "g-buffer position")?;
+        let albedo = Self::create_target(recording, ALBEDO_FORMAT, "g-buffer albedo")?;
+        let normal = Self::create_target(recording, NORMAL_FORMAT, "g-buffer normal")?;
+        let position = Self::create_target(recording, POSITION_FORMAT, "g-buffer position")?;
 
         let depth_info = ImageInfo::depth_target(recording.target.extent, DEPTH_FORMAT)
             .with_usage(vk::ImageUsageFlags::TRANSFER_DST)
@@ -401,9 +387,7 @@ impl Deferred {
 
     /// Uploads every material image in one go: a staging buffer and a copy each, then a single
     /// release apiece into the layout a sample wants.
-    fn upload_textures(
-        setup: &mut Setup, images: &[ImageData], sampler: vk::Sampler,
-    ) -> Result<Vec<Texture>, vk::Result> {
+    fn upload_textures(setup: &mut Setup, images: &[ImageData]) -> Result<Vec<Texture>, vk::Result> {
         if images.is_empty() {
             return Ok(Vec::new());
         }
@@ -423,8 +407,6 @@ impl Deferred {
                 vk::ImageViewType::TYPE_2D,
                 image.subresource_range(),
             )?;
-            let slot = setup.graph.register_texture(view, sampler);
-
             let mut buffer = setup.allocator.allocate_buffer(
                 &BufferInfo::staging(size_of_val(data.pixels.as_slice()) as u64).with_name("texture staging"),
             )?;
@@ -442,18 +424,16 @@ impl Deferred {
                 index,
                 width = data.extent.width,
                 height = data.extent.height,
-                slot = slot.0,
                 "uploading"
             );
-            textures.push(Texture { image, view, slot });
+            textures.push(Texture { image, view });
             staging.push(buffer);
         }
 
-        setup.graph.execute_blocking(
-            setup.ctx,
-            &module.compile_all(&roots),
-            &mut AllocatorKind::Persistent(setup.allocator),
-        )?;
+        let program = module.compile_all(&*setup.graph, &roots)?;
+        setup
+            .graph
+            .execute_blocking(setup.ctx, &program, &mut AllocatorKind::Persistent(setup.allocator))?;
 
         for buffer in staging {
             setup.allocator.deallocate_buffer(buffer);
@@ -485,8 +465,8 @@ impl Deferred {
             base_color: data.base_color,
             base_color_texture: data
                 .base_color_image
-                .and_then(|index| textures.get(index))
-                .map_or(NO_TEXTURE, |texture| texture.slot.0),
+                .filter(|index| *index < textures.len().saturating_sub(1))
+                .unwrap_or(textures.len().saturating_sub(1)),
         })
     }
 }
@@ -504,7 +484,7 @@ impl Example for Deferred {
             None => ("DamagedHelmet.glb".to_owned(), scene::helmet()),
         };
 
-        let scene = loaded.map_err(|err| {
+        let mut scene = loaded.map_err(|err| {
             tracing::error!(%source, %err, "could not read the model");
             vk::Result::ERROR_INITIALIZATION_FAILED
         })?;
@@ -536,7 +516,13 @@ impl Example for Deferred {
                 .with_address_mode(vk::SamplerAddressMode::REPEAT),
         )?;
 
-        let textures = Self::upload_textures(setup, &scene.images, texture_sampler)?;
+        // A scalar combined-image descriptor must always be populated. Materials without an
+        // image bind this white texel, leaving their base-color factor unchanged.
+        scene.images.push(ImageData {
+            pixels: vec![255, 255, 255, 255],
+            extent: vk::Extent2D { width: 1, height: 1 },
+        });
+        let textures = Self::upload_textures(setup, &scene.images)?;
 
         Ok(Self {
             geometry_pipeline: graphics_pipeline(setup.graph, GEOMETRY_VERT_SPV, GEOMETRY_FRAG_SPV)?,
@@ -624,13 +610,14 @@ impl Example for Deferred {
                     module.import_buffer(&mesh.vertices, vir::Access::HostWrite),
                     module.import_buffer(&mesh.indices, vir::Access::HostWrite),
                     mesh.index_count,
+                    mesh.base_color_texture,
                     *push,
                 )
             })
             .collect::<Vec<_>>();
 
-        // material textures are only ever read, but the pass still has to name them for the
-        // graph to know the region samples them
+        // Material textures are imported as graph images so each mesh can bind its own scalar
+        // descriptor before drawing.
         let material_textures = self
             .textures
             .iter()
@@ -654,33 +641,29 @@ impl Example for Deferred {
         // which way the geometry pass culls is a branch, since a cull mode is baked into a
         // pipeline and both of them are worth having compiled
         let geometry = |m: &mut vir::Module, cull_mode| {
-            let mut pass = m
-                .begin_rendering_depth(&[albedo, normal, position], depth)
-                .with_name("g-buffer")
-                .bind_graphics_pipeline(self.geometry_pipeline)
-                .set_viewport(0, Rect2D::framebuffer())
-                .set_scissor(0, Rect2D::framebuffer())
-                .broadcast_color_blend(BlendPreset::Off)
-                .set_depth(DepthState::less())
-                .set_rasterization(RasterizationState {
-                    cull_mode,
-                    front_face: FRONT_FACE,
-                    ..Default::default()
-                });
-
-            for texture in &material_textures {
-                pass = pass.sample_image(*texture);
-            }
-
-            for (vertices, indices, index_count, push) in &meshes {
-                pass = pass
+            let mut filled = albedo;
+            for (vertices, indices, index_count, texture, push) in &meshes {
+                filled = m
+                    .begin_rendering_depth(&[filled, normal, position], depth)
+                    .with_name("g-buffer mesh")
+                    .bind_graphics_pipeline(self.geometry_pipeline)
+                    .set_viewport(0, Rect2D::framebuffer())
+                    .set_scissor(0, Rect2D::framebuffer())
+                    .broadcast_color_blend(BlendPreset::Off)
+                    .set_depth(DepthState::less())
+                    .set_rasterization(RasterizationState {
+                        cull_mode,
+                        front_face: FRONT_FACE,
+                        ..Default::default()
+                    })
+                    .bind_texture(0, 0, material_textures[*texture], self.texture_sampler)
                     .push_constants_from(*push)
                     .bind_vertex_buffer(0, *vertices)
                     .bind_index_buffer(*indices, vk::IndexType::UINT32)
-                    .draw_indexed(*index_count, 1);
+                    .draw_indexed(*index_count, 1)
+                    .end_rendering();
             }
-
-            pass.end_rendering()
+            filled
         };
         let filled = module.set_condition(
             cull_backfaces,
@@ -701,9 +684,9 @@ impl Example for Deferred {
                 cull_mode: vk::CullModeFlags::NONE,
                 ..Default::default()
             })
-            .sample_image(filled)
-            .sample_image(normal)
-            .sample_image(position)
+            .bind_texture(0, 0, filled, self.sampler)
+            .bind_texture(0, 1, normal, self.sampler)
+            .bind_texture(0, 2, position, self.sampler)
             .push_constants_from(lighting_push)
             .draw(3, 1)
             .end_rendering();
@@ -719,7 +702,7 @@ impl Example for Deferred {
     }
 
     fn update(&mut self, frame: &mut Frame) -> Result<(), vk::Result> {
-        let (Some(slots), Some(gbuffer)) = (self.slots.as_ref(), self.gbuffer.as_ref()) else {
+        let (Some(slots), Some(_gbuffer)) = (self.slots.as_ref(), self.gbuffer.as_ref()) else {
             return Ok(());
         };
 
@@ -732,7 +715,6 @@ impl Example for Deferred {
                 &GeometryPush {
                     view_proj,
                     base_color: mesh.base_color,
-                    base_color_texture: mesh.base_color_texture,
                 },
             );
         }
@@ -747,9 +729,6 @@ impl Example for Deferred {
                 light_intensity: self.ui.intensity,
                 light_color: [1.0, 0.97, 0.92],
                 specular_strength: self.ui.specular,
-                albedo_index: gbuffer.albedo.slot.0,
-                normal_index: gbuffer.normal.slot.0,
-                position_index: gbuffer.position.slot.0,
                 mode: self.ui.mode as u32,
             },
         );
@@ -769,7 +748,6 @@ impl Example for Deferred {
         }
 
         for texture in self.textures.drain(..) {
-            graph.unregister_texture(texture.slot);
             allocator.deallocate_image_view(texture.view);
             allocator.deallocate_image(texture.image);
         }
@@ -1041,33 +1019,30 @@ mod tests {
         assert_eq!(ranges[0].size as usize, size_of::<LightingPush>());
     }
 
-    /// Both passes name their images by bindless index, the lighting pass for the G-buffer and
-    /// the geometry pass for the material textures. Either one only works if its fragment stage
-    /// declares the table the graph writes those slots into.
     #[test]
-    fn both_fragment_stages_sample_through_the_bindless_table() {
-        let table = vec![DescriptorBinding {
+    fn fragment_stages_declare_their_scalar_textures() {
+        let texture = DescriptorBinding {
             set: 0,
             binding: 0,
             descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
             count: 1,
-            variable_count: true,
-        }];
+            variable_count: false,
+            stages: vk::ShaderStageFlags::FRAGMENT,
+        };
 
-        assert_eq!(reflect(LIGHTING_FRAG_SPV).bindings, table);
-        assert_eq!(reflect(GEOMETRY_FRAG_SPV).bindings, table);
+        assert_eq!(reflect(GEOMETRY_FRAG_SPV).bindings, vec![texture]);
+        assert_eq!(
+            reflect(LIGHTING_FRAG_SPV).bindings,
+            vec![
+                texture,
+                DescriptorBinding { binding: 1, ..texture },
+                DescriptorBinding { binding: 2, ..texture },
+            ]
+        );
 
-        // the vertex stages stay out of it, so the table is fragment-only on both sides
+        // the vertex stages stay out of them, so every descriptor is fragment-only
         assert!(reflect(GEOMETRY_VERT_SPV).bindings.is_empty());
         assert!(reflect(LIGHTING_VERT_SPV).bindings.is_empty());
-    }
-
-    /// A material with no base color texture pushes a slot the shader has to recognise as one
-    /// it must not index the table with.
-    #[test]
-    fn the_missing_texture_sentinel_is_out_of_the_tables_range() {
-        // the shader compares against a literal, so the two have to agree
-        assert_eq!(NO_TEXTURE, u32::MAX);
     }
 
     /// The base color image a material names has to survive the loader's dedup and land on a

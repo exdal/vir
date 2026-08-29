@@ -43,6 +43,36 @@ let target = frame
     .end_rendering();
 ```
 
+Scalar sampled images and combined image samplers are ordinary pass state. Their set layouts are
+reflected from the shaders, while the image values live in pass metadata outside the command IR
+and drive both the descriptor write and the image transition:
+
+```rust
+let target = frame
+    .module
+    .begin_rendering(&[target])
+    .bind_graphics_pipeline(pipeline)
+    .bind_texture(0, 3, texture, sampler)
+    .draw(3, 1)
+    .end_rendering();
+```
+
+Bindless is opt-in per pipeline. Pass the caller-owned layout and set at the index it should
+occupy; `vir` splices that layout into the reflected pipeline layout and binds the set without
+updating or destroying it. The caller is also responsible for enabling any descriptor-indexing
+features required by that layout and its shaders:
+
+```rust
+let info = GraphicsPipelineInfo::new()
+    .with_shader(vertex_spirv)
+    .with_shader(fragment_spirv)
+    .with_bindless_set(2, bindless_layout, bindless_set);
+```
+
+Images reached through an external bindless set still need `sample_image(image)` on the pass when
+the graph must synchronize them, because their descriptor contents are intentionally opaque to
+the IR.
+
 A compute pass declares its accesses, and the graph barriers the dispatches against each other and
 against any draw that later reads what they wrote:
 

@@ -106,6 +106,34 @@ pub enum VariableKind {
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+pub enum Descriptor {
+    SampledImage { image: ValueId },
+    CombinedImageSampler { image: ValueId, sampler: vk::Sampler },
+}
+
+impl Descriptor {
+    pub fn image(&self) -> ValueId {
+        match self {
+            Descriptor::SampledImage { image } | Descriptor::CombinedImageSampler { image, .. } => *image,
+        }
+    }
+
+    pub fn sampler(&self) -> Option<vk::Sampler> {
+        match self {
+            Descriptor::SampledImage { .. } => None,
+            Descriptor::CombinedImageSampler { sampler, .. } => Some(*sampler),
+        }
+    }
+
+    pub fn descriptor_type(&self) -> vk::DescriptorType {
+        match self {
+            Descriptor::SampledImage { .. } => vk::DescriptorType::SAMPLED_IMAGE,
+            Descriptor::CombinedImageSampler { .. } => vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub enum DispatchSize {
     Groups {
         x: ValueId,
@@ -246,6 +274,7 @@ pub enum IR {
         color_attachments: Vec<ValueId>,
         depth_attachment: Option<ValueId>,
         render_area: Option<ValueId>,
+        declared_access: Vec<(ValueId, Access)>,
         name: Name,
     },
     BindPipeline {
@@ -269,9 +298,12 @@ pub enum IR {
         offset: u64,
         index_type: vk::IndexType,
     },
-    SampleImage {
+    WriteDescriptor {
         pass: ValueId,
-        image: ValueId,
+        set: u32,
+        binding: u32,
+        descriptor: Descriptor,
+        access: Access,
     },
     Draw {
         pass: ValueId,
@@ -305,7 +337,7 @@ pub enum IR {
         pass: ValueId,
     },
     BeginCompute {
-        resources: Vec<(ValueId, Access)>,
+        declared_access: Vec<(ValueId, Access)>,
         name: Name,
     },
     Dispatch {
@@ -380,7 +412,7 @@ pub fn underlying_object(ir: &IR) -> UnderlyingObject {
             Some(first) => UnderlyingObject::Forwards(*first),
             None => UnderlyingObject::None,
         },
-        IR::BeginCompute { resources, .. } => match resources.first() {
+        IR::BeginCompute { declared_access, .. } => match declared_access.first() {
             Some((first, _)) => UnderlyingObject::Forwards(*first),
             None => UnderlyingObject::None,
         },
@@ -389,7 +421,7 @@ pub fn underlying_object(ir: &IR) -> UnderlyingObject {
         | IR::SetState { pass, .. }
         | IR::BindVertexBuffers { pass, .. }
         | IR::BindIndexBuffer { pass, .. }
-        | IR::SampleImage { pass, .. }
+        | IR::WriteDescriptor { pass, .. }
         | IR::Draw { pass, .. }
         | IR::DrawIndexed { pass, .. }
         | IR::CallOpaque { pass, .. }
@@ -504,9 +536,9 @@ impl IR {
             IR::Blit { .. } | IR::CopyBufferToImage { .. } => SideEffect::Memory | SideEffect::Command,
 
             IR::BeginRendering { .. } => SideEffect::Memory | SideEffect::Command | SideEffect::State,
-            IR::BeginCompute { resources, .. } => {
+            IR::BeginCompute { declared_access, .. } => {
                 let mut effects = SideEffect::Sync | SideEffect::Command | SideEffect::State;
-                for (_, access) in resources {
+                for (_, access) in declared_access {
                     if access.reads() {
                         effects |= SideEffect::Read;
                     }
@@ -522,7 +554,7 @@ impl IR {
             IR::BindVertexBuffers { .. } | IR::BindIndexBuffer { .. } => {
                 SideEffect::Read | SideEffect::State | SideEffect::Command
             },
-            IR::SampleImage { .. } => SideEffect::Read | SideEffect::Sync,
+            IR::WriteDescriptor { .. } => SideEffect::Read | SideEffect::Sync | SideEffect::State,
 
             IR::Draw { .. } | IR::DrawIndexed { .. } => SideEffect::Command | SideEffect::ReadsState,
             IR::CallOpaque { .. } => SideEffect::Command | SideEffect::ReadsState | SideEffect::Host,
@@ -615,13 +647,15 @@ impl IR {
                 color_attachments,
                 depth_attachment,
                 render_area,
+                declared_access,
                 ..
             } => {
                 color_attachments.iter().copied().for_each(&mut visit);
                 depth_attachment.iter().copied().for_each(&mut visit);
                 render_area.iter().copied().for_each(&mut visit);
+                declared_access.iter().for_each(|(id, _)| visit(*id));
             },
-            IR::BeginCompute { resources, .. } => resources.iter().for_each(|(id, _)| visit(*id)),
+            IR::BeginCompute { declared_access, .. } => declared_access.iter().for_each(|(id, _)| visit(*id)),
 
             IR::BindPipeline { pass, .. } | IR::EndRendering { pass } | IR::EndCompute { pass } => visit(*pass),
             IR::SetState { pass, change } => {
@@ -640,9 +674,9 @@ impl IR {
                 visit(*pass);
                 visit(*buffer);
             },
-            IR::SampleImage { pass, image } => {
+            IR::WriteDescriptor { pass, descriptor, .. } => {
                 visit(*pass);
-                visit(*image);
+                visit(descriptor.image());
             },
 
             IR::Draw {
@@ -742,6 +776,7 @@ impl IR {
             IR::BeginRendering {
                 color_attachments,
                 depth_attachment,
+                declared_access,
                 ..
             } => {
                 for attachment in color_attachments {
@@ -750,14 +785,17 @@ impl IR {
                 if let Some(depth) = depth_attachment {
                     fixed(*depth, Access::DepthStencilRW);
                 }
+                for (resource, access) in declared_access {
+                    fixed(*resource, *access);
+                }
             },
-            IR::BeginCompute { resources, .. } => {
-                for (resource, access) in resources {
+            IR::BeginCompute { declared_access, .. } => {
+                for (resource, access) in declared_access {
                     fixed(*resource, *access);
                 }
             },
 
-            IR::SampleImage { image, .. } => fixed(*image, Access::FragmentSampled),
+            IR::WriteDescriptor { descriptor, access, .. } => fixed(descriptor.image(), *access),
             IR::BindVertexBuffers { buffers, .. } => {
                 for buffer in buffers {
                     fixed(*buffer, Access::AttributeRead);
@@ -1283,6 +1321,7 @@ impl IR {
                 color_attachments,
                 depth_attachment,
                 render_area,
+                declared_access,
                 name,
             } => {
                 write!(
@@ -1294,9 +1333,20 @@ impl IR {
                 if let Some(depth) = depth_attachment {
                     write!(f, " depth={}", p.operand(*depth))?;
                 }
-                match render_area {
-                    Some(area) => write!(f, " area={}", p.operand(*area)),
-                    None => Ok(()),
+                if let Some(area) = render_area {
+                    write!(f, " area={}", p.operand(*area))?;
+                }
+                match declared_access.is_empty() {
+                    true => Ok(()),
+                    false => write!(
+                        f,
+                        " declared_access=[{}]",
+                        fmt_list(declared_access, |(id, access)| format!(
+                            "{}:{}",
+                            p.operand(*id),
+                            fmt_flags(*access)
+                        ))
+                    ),
                 }
             },
             IR::BindPipeline {
@@ -1334,7 +1384,22 @@ impl IR {
                     offset => write!(f, " offset={offset}"),
                 }
             },
-            IR::SampleImage { image, .. } => write!(f, "sample_image {}", p.operand(*image)),
+            IR::WriteDescriptor {
+                set,
+                binding,
+                descriptor,
+                access,
+                ..
+            } => {
+                write!(f, "write_descriptor set={set} binding={binding} ")?;
+                match descriptor {
+                    Descriptor::SampledImage { image } => write!(f, "sampled_image {}", p.operand(*image))?,
+                    Descriptor::CombinedImageSampler { image, sampler } => {
+                        write!(f, "combined_image_sampler {} sampler={sampler:?}", p.operand(*image))?
+                    },
+                }
+                write!(f, " access={}", fmt_flags(*access))
+            },
             IR::SetState { change, .. } => {
                 write!(f, "set_state ")?;
                 match change {
@@ -1426,12 +1491,12 @@ impl IR {
                 write!(f, "call.opaque body={} {}", p.operand(*body), fmt_pipeline(pipeline))
             },
             IR::EndRendering { .. } => write!(f, "end_rendering"),
-            IR::BeginCompute { resources, name } => {
+            IR::BeginCompute { declared_access, name } => {
                 write!(
                     f,
-                    "begin_compute{} resources=[{}]",
+                    "begin_compute{} declared_access=[{}]",
                     fmt_name(name),
-                    fmt_list(resources, |(id, access)| format!(
+                    fmt_list(declared_access, |(id, access)| format!(
                         "{}:{}",
                         p.operand(*id),
                         fmt_flags(*access)
@@ -1546,7 +1611,6 @@ mod tests {
 
     fn value(id: u32) -> ValueId { ValueId(id) }
 
-    /// The instructions that name resources, one of each shape the effects cover.
     fn naming() -> Vec<IR> {
         vec![
             IR::Clear {
@@ -1567,19 +1631,30 @@ mod tests {
                 color_attachments: vec![value(1)],
                 depth_attachment: Some(value(2)),
                 render_area: None,
+                declared_access: Vec::new(),
+                name: None,
+            },
+            IR::BeginRendering {
+                color_attachments: vec![value(1)],
+                depth_attachment: None,
+                render_area: None,
+                declared_access: vec![(value(2), Access::FragmentSampled)],
                 name: None,
             },
             IR::BeginCompute {
-                resources: vec![(value(1), Access::ComputeRead)],
+                declared_access: vec![(value(1), Access::ComputeRead)],
                 name: None,
             },
             IR::BeginCompute {
-                resources: vec![(value(1), Access::ComputeRead), (value(2), Access::ComputeWrite)],
+                declared_access: vec![(value(1), Access::ComputeRead), (value(2), Access::ComputeWrite)],
                 name: None,
             },
-            IR::SampleImage {
+            IR::WriteDescriptor {
                 pass: value(0),
-                image: value(1),
+                set: 0,
+                binding: 0,
+                descriptor: Descriptor::SampledImage { image: value(1) },
+                access: Access::VertexSampled,
             },
             IR::BindIndexBuffer {
                 pass: value(0),
