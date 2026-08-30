@@ -1244,6 +1244,7 @@ impl RenderGraph {
             IR::Constant(c) => match c {
                 ir::Constant::I32(v) => self.set_value(value_id, Value::I32(*v)),
                 ir::Constant::U32(v) => self.set_value(value_id, Value::U32(*v)),
+                ir::Constant::U64(v) => self.set_value(value_id, Value::U64(*v)),
                 ir::Constant::Size(v) => self.set_value(value_id, Value::Size(*v)),
                 ir::Constant::Extent2D(v) => self.set_value(value_id, Value::Extent2D(*v)),
                 ir::Constant::Extent3D(v) => self.set_value(value_id, Value::Extent3D(*v)),
@@ -1570,11 +1571,14 @@ impl RenderGraph {
                 self.set_value(value_id, Value::Reference(*pass));
                 self.ensure_batch(ctx, allocator)?;
 
+                let buffers = self.get::<Vec<ValueId>>(buffers);
+                let offsets = self.get::<Vec<ValueId>>(offsets);
                 let handles = buffers
                     .iter()
                     .map(|id| self.get::<Buffer>(id).handle())
                     .collect::<Vec<_>>();
-                self.batch()?.bind_vertex_buffers(*first_binding, &handles, offsets);
+                let offsets = offsets.iter().map(|id| self.get::<u64>(id)).collect::<Vec<_>>();
+                self.batch()?.bind_vertex_buffers(*first_binding, &handles, &offsets);
             },
             IR::BindIndexBuffer {
                 pass,

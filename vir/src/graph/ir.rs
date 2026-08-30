@@ -72,6 +72,7 @@ impl fmt::Display for SourceLocation {
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub enum Type {
+    U64,
     Image {
         format: vk::Format,
         samples: vk::SampleCountFlags,
@@ -83,6 +84,7 @@ pub enum Type {
 pub enum Constant {
     I32(i32),
     U32(u32),
+    U64(u64),
     Size(usize),
     Extent2D(vk::Extent2D),
     Extent3D(vk::Extent3D),
@@ -290,8 +292,8 @@ pub enum IR {
     BindVertexBuffers {
         pass: ValueId,
         first_binding: u32,
-        buffers: Vec<ValueId>,
-        offsets: Vec<u64>,
+        buffers: ValueId,
+        offsets: ValueId,
     },
     BindIndexBuffer {
         pass: ValueId,
@@ -700,9 +702,12 @@ impl IR {
                     _ => {},
                 }
             },
-            IR::BindVertexBuffers { pass, buffers, .. } => {
+            IR::BindVertexBuffers {
+                pass, buffers, offsets, ..
+            } => {
                 visit(*pass);
-                buffers.iter().copied().for_each(&mut visit);
+                visit(*buffers);
+                visit(*offsets);
             },
             IR::BindIndexBuffer { pass, buffer, .. } => {
                 visit(*pass);
@@ -846,11 +851,7 @@ impl IR {
                 resource: descriptor.image(),
                 access: SideEffectAccess::Operand(*access),
             }),
-            IR::BindVertexBuffers { buffers, .. } => {
-                for buffer in buffers {
-                    fixed(*buffer, Access::AttributeRead);
-                }
-            },
+            IR::BindVertexBuffers { buffers, .. } => fixed(*buffers, Access::AttributeRead),
             IR::BindIndexBuffer { buffer, .. } => fixed(*buffer, Access::IndexRead),
             IR::Dispatch {
                 size: DispatchSize::Indirect { buffer, .. },
@@ -1164,6 +1165,7 @@ impl fmt::Display for Constant {
         match self {
             Constant::I32(v) => write!(f, "{v}"),
             Constant::U32(v) => write!(f, "{v}"),
+            Constant::U64(v) => write!(f, "{v}"),
             Constant::String(v) => write!(f, "{v:?}"),
             Constant::Access(v) => write!(f, "{}", fmt_flags(*v)),
             Constant::ClearValue(v) => {
@@ -1236,6 +1238,7 @@ impl IR {
     fn fmt_with(&self, f: &mut fmt::Formatter<'_>, p: &Symbols<'_>, id: ValueId) -> fmt::Result {
         match self {
             IR::Type(ty) => match ty {
+                Type::U64 => write!(f, "type u64"),
                 Type::Image { format, samples } => {
                     write!(f, "type image {format:?} samples={}", fmt_samples(*samples))
                 },
@@ -1248,9 +1251,12 @@ impl IR {
                 name,
                 location,
             } => write!(f, "var{} {kind:?}{location} slot={slot}", fmt_name(p, name)),
-            IR::Array { ty: _, elements } => {
-                write!(f, "array [{}]", fmt_list(elements, |id| p.operand(*id).to_string()))
-            },
+            IR::Array { ty, elements } => write!(
+                f,
+                "array {} [{}]",
+                p.operand(*ty),
+                fmt_list(elements, |id| p.operand(*id).to_string())
+            ),
             IR::Index { array, index } => write!(f, "index {}[{}]", p.operand(*array), p.operand(*index)),
             IR::ConstructBuffer {
                 buffer,
@@ -1436,21 +1442,12 @@ impl IR {
                 buffers,
                 offsets,
                 ..
-            } => {
-                let bound = buffers
-                    .iter()
-                    .enumerate()
-                    .map(|(index, id)| match offsets.get(index).copied().unwrap_or(0) {
-                        0 => p.operand(*id).to_string(),
-                        offset => format!("{}@{offset}", p.operand(*id)),
-                    })
-                    .collect::<Vec<_>>();
-                write!(
-                    f,
-                    "bind_vertex_buffers first={first_binding} buffers=[{}]",
-                    bound.join(", ")
-                )
-            },
+            } => write!(
+                f,
+                "bind_vertex_buffers first={first_binding} buffers={} offsets={}",
+                p.operand(*buffers),
+                p.operand(*offsets)
+            ),
             IR::BindIndexBuffer {
                 buffer,
                 offset,

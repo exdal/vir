@@ -38,6 +38,7 @@ pub enum Value {
     Bool(bool),
     I32(i32),
     U32(u32),
+    U64(u64),
     Size(usize),
     Extent2D(vk::Extent2D),
     Extent3D(vk::Extent3D),
@@ -80,6 +81,9 @@ impl From<i32> for Value {
 }
 impl From<u32> for Value {
     fn from(v: u32) -> Self { Value::U32(v) }
+}
+impl From<u64> for Value {
+    fn from(v: u64) -> Self { Value::U64(v) }
 }
 impl From<usize> for Value {
     fn from(v: usize) -> Self { Value::Size(v) }
@@ -163,6 +167,15 @@ impl FromValue for u32 {
         match value {
             Value::U32(v) => *v,
             _ => panic!("expected U32, got {:?}", value),
+        }
+    }
+}
+
+impl FromValue for u64 {
+    fn from_value(value: &Value) -> Self {
+        match value {
+            Value::U64(v) => *v,
+            _ => panic!("expected U64, got {:?}", value),
         }
     }
 }

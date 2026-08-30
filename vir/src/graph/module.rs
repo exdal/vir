@@ -251,6 +251,13 @@ impl Default for Module {
 impl Module {
     fn get(&self, id: ValueId) -> &IR { &self.instructions[id.0 as usize] }
 
+    fn array_elements(&self, id: ValueId) -> &[ValueId] {
+        match self.get(id) {
+            IR::Array { elements, .. } => elements,
+            _ => panic!("{id} is not an array"),
+        }
+    }
+
     fn block_of(&self, id: ValueId) -> Option<LabelId> { self.instruction_block.get(id.0 as usize).copied().flatten() }
 
     fn resolve_access(&self, id: ValueId) -> Access {
@@ -482,6 +489,8 @@ impl Module {
     fn lower_i32(&mut self, v: i32) -> ValueId { self.lower_constant(ir::Constant::I32(v)) }
 
     fn lower_u32(&mut self, v: u32) -> ValueId { self.lower_constant(ir::Constant::U32(v)) }
+
+    fn lower_u64(&mut self, v: u64) -> ValueId { self.lower_constant(ir::Constant::U64(v)) }
 
     fn lower_access(&mut self, access: Access) -> ValueId { self.lower_constant(ir::Constant::Access(access)) }
 
@@ -932,9 +941,12 @@ impl Module {
                             _ => {},
                         }
                     },
-                    IR::BindVertexBuffers { pass, buffers, .. } => {
+                    IR::BindVertexBuffers {
+                        pass, buffers, offsets, ..
+                    } => {
                         stack.push(*pass);
-                        buffers.iter().rev().for_each(|v| stack.push(*v));
+                        stack.push(*offsets);
+                        stack.push(*buffers);
                     },
                     IR::BindIndexBuffer { pass, buffer, .. } => {
                         stack.push(*pass);
@@ -1250,7 +1262,7 @@ impl Module {
                     }
                     continue;
                 },
-                IR::BindVertexBuffers { buffers, .. } => (buffers.as_slice(), Access::AttributeRead),
+                IR::BindVertexBuffers { buffers, .. } => (self.array_elements(*buffers), Access::AttributeRead),
                 IR::BindIndexBuffer { buffer, .. } => (std::slice::from_ref(buffer), Access::IndexRead),
                 _ => continue,
             };
@@ -1666,7 +1678,8 @@ impl Module {
         for (_, ir) in nodes.iter() {
             match ir {
                 IR::CopyBufferToImage { buffer, .. } => used(buffer, vk::BufferUsageFlags::TRANSFER_SRC),
-                IR::BindVertexBuffers { buffers, .. } => buffers
+                IR::BindVertexBuffers { buffers, .. } => self
+                    .array_elements(*buffers)
                     .iter()
                     .for_each(|b| used(b, vk::BufferUsageFlags::VERTEX_BUFFER)),
                 IR::BindIndexBuffer { buffer, .. } => used(buffer, vk::BufferUsageFlags::INDEX_BUFFER),
@@ -2152,8 +2165,18 @@ impl Module {
             "every bound vertex buffer needs an offset"
         );
 
-        let buffers = buffers.to_vec();
-        let offsets = offsets.to_vec();
+        let buffer_ty = self.lower_type(ir::Type::Buffer);
+        let buffers = self.emit(IR::Array {
+            ty: buffer_ty,
+            elements: buffers.to_vec(),
+        });
+
+        let offset_ty = self.lower_type(ir::Type::U64);
+        let offset_elements = offsets.iter().copied().map(|offset| self.lower_u64(offset)).collect();
+        let offsets = self.emit(IR::Array {
+            ty: offset_ty,
+            elements: offset_elements,
+        });
         self.chain(Some(PassKind::Rendering), "vertex buffers", |pass| {
             IR::BindVertexBuffers {
                 pass,
@@ -2855,6 +2878,40 @@ mod tests {
             .filter(|(_, ir)| matches!(ir, IR::BindVertexBuffers { .. }))
             .count();
         assert_eq!(binds, 1);
+
+        let (_, IR::BindVertexBuffers { buffers, offsets, .. }) = instructions
+            .iter()
+            .find(|(_, ir)| matches!(ir, IR::BindVertexBuffers { .. }))
+            .expect("the vertex buffers should be bound")
+        else {
+            unreachable!()
+        };
+        let find = |wanted: ValueId| {
+            instructions
+                .iter()
+                .find_map(|(id, ir)| (*id == wanted).then_some(ir))
+                .expect("the array operand should be in the program")
+        };
+        let IR::Array {
+            ty: buffer_ty,
+            elements: buffer_elements,
+        } = find(*buffers)
+        else {
+            panic!("the buffer operand is not an array")
+        };
+        assert_eq!(buffer_elements, &[buffer]);
+        assert!(matches!(find(*buffer_ty), IR::Type(ir::Type::Buffer)));
+
+        let IR::Array {
+            ty: offset_ty,
+            elements: offset_elements,
+        } = find(*offsets)
+        else {
+            panic!("the offset operand is not an array")
+        };
+        assert!(matches!(find(*offset_ty), IR::Type(ir::Type::U64)));
+        assert_eq!(offset_elements.len(), 1);
+        assert!(matches!(find(offset_elements[0]), IR::Constant(ir::Constant::U64(0))));
 
         let position = |predicate: fn(&IR) -> bool| {
             instructions
