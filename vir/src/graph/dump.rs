@@ -40,7 +40,6 @@ pub fn dump_with(
     let mut region = 0usize;
     for (id, ir) in instructions {
         match ir {
-            IR::Type(_) => continue,
             IR::BeginRendering { .. } | IR::BeginCompute { .. } => {
                 blank_line(&mut out);
                 let _ = writeln!(out, ";{} Pass {}", indent(block + region), pass_header(&program, ir));
@@ -376,6 +375,21 @@ mod tests {
             "{barrier}"
         );
         assert!(barrier.ends_with("(ColorRead|ColorWrite)"), "{barrier}");
+    }
+
+    #[test]
+    fn types_are_dumped_as_global_definitions() {
+        let dump = dump_of_one_pass();
+        assert!(dump.contains("1 types"), "{dump}");
+        assert!(
+            dump.lines()
+                .any(|line| line.ends_with("= type image R8G8B8A8_SRGB samples=1")),
+            "{dump}"
+        );
+
+        let ty = dump.find("= type image").expect("the image type should be dumped");
+        let constant = dump.find("= const ").expect("constants should be dumped");
+        assert!(ty < constant, "type definitions should precede constants\n{dump}");
     }
 
     /// A callback is the one variable whose value the dump cannot show, so a debug build prints

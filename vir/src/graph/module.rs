@@ -137,11 +137,11 @@ fn resolve_descriptor_access(
 }
 
 fn globals_first(nodes: Vec<ir::Instr>) -> Vec<ir::Instr> {
-    let (mut globals, rest): (Vec<_>, Vec<_>) = nodes
-        .into_iter()
-        .partition(|(_, ir)| matches!(ir, IR::Type(_) | IR::Constant(_)));
-    globals.extend(rest);
-    globals
+    let (mut types, rest): (Vec<_>, Vec<_>) = nodes.into_iter().partition(|(_, ir)| matches!(ir, IR::Type(_)));
+    let (constants, rest): (Vec<_>, Vec<_>) = rest.into_iter().partition(|(_, ir)| matches!(ir, IR::Constant(_)));
+    types.extend(constants);
+    types.extend(rest);
+    types
 }
 
 fn alloc_id(next_id: &mut u32) -> ValueId {
@@ -777,6 +777,12 @@ impl Module {
     fn lower(&self, pipelines: &impl PipelineBindings, ids: &[ValueId]) -> Program {
         let mut roots = ids.to_vec();
         roots.extend(self.branch_conditions());
+        roots.extend(
+            self.instructions
+                .iter()
+                .enumerate()
+                .filter_map(|(index, ir)| matches!(ir, IR::Type(_)).then_some(ValueId(index as u32))),
+        );
 
         let mut next_id = self.instructions.len() as u32;
         let nodes = self.topo_sort(&roots);
