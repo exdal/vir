@@ -12,7 +12,7 @@ pub fn dump(instructions: &[Instr], bound: impl IntoIterator<Item = ValueId>) ->
 pub fn dump_with(
     instructions: &[Instr], bound: impl IntoIterator<Item = ValueId>, syntax_highlighting: bool,
 ) -> String {
-    let program = Symbols::with_bound(instructions, bound);
+    let program = Symbols::with_explicit_constants(instructions, bound);
     let width = instructions
         .iter()
         .map(|(id, _)| id.to_string().len())
@@ -22,13 +22,15 @@ pub fn dump_with(
     let count = |predicate: fn(&IR) -> bool| instructions.iter().filter(|(_, ir)| predicate(ir)).count();
     let passes = count(|ir| matches!(ir, IR::BeginRendering { .. } | IR::BeginCompute { .. }));
     let barriers = count(|ir| matches!(ir, IR::MemoryBarrier { .. } | IR::ImageBarrier { .. }));
-    let folded = count(|ir| matches!(ir, IR::Type(_) | IR::Constant(_)));
+    let constants = count(|ir| matches!(ir, IR::Constant(_)));
+    let types = count(|ir| matches!(ir, IR::Type(_)));
     let blocks = count(|ir| matches!(ir, IR::Label { .. }));
 
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "; render graph: {} instructions, {passes} passes, {barriers} barriers, {folded} types, {blocks} blocks",
+        "; render graph: {} instructions, {passes} passes, {barriers} barriers, {constants} constants, {types} types, \
+         {blocks} blocks",
         instructions.len()
     );
 
@@ -38,7 +40,7 @@ pub fn dump_with(
     let mut region = 0usize;
     for (id, ir) in instructions {
         match ir {
-            IR::Type(_) | IR::Constant(_) => continue,
+            IR::Type(_) => continue,
             IR::BeginRendering { .. } | IR::BeginCompute { .. } => {
                 blank_line(&mut out);
                 let _ = writeln!(out, ";{} Pass {}", indent(block + region), pass_header(&program, ir));
@@ -319,7 +321,7 @@ mod tests {
     #[test]
     fn a_resource_operand_carries_the_name_it_was_given() {
         let dump = dump_of_one_pass();
-        assert!(dump.contains("image \"target\" 64x32"), "{dump}");
+        assert!(dump.contains("image \"target\" %"), "{dump}");
         assert!(dump.contains("color=[%"), "{dump}");
         assert!(dump.contains("(target)"), "{dump}");
     }
@@ -346,19 +348,21 @@ mod tests {
 
         let dump = module.compile(&Unchecked, end).unwrap().dump();
         assert!(dump.contains("Pass \"blur\" -> \"storage\" 64x32"), "{dump}");
-        assert!(
-            dump.contains("  dispatch groups_x=8 groups_y=4 groups_z=1 pipeline=#0"),
-            "{dump}"
-        );
+        assert!(dump.contains("  dispatch groups_x=%"), "{dump}");
+        assert!(dump.lines().any(|line| line.ends_with("= const 8")), "{dump}");
+        assert!(dump.lines().any(|line| line.ends_with("= const 4")), "{dump}");
+        assert!(dump.lines().any(|line| line.ends_with("= const 1")), "{dump}");
         assert!(dump.contains("push_constants=[0..4]"), "{dump}");
         assert!(dump.contains("end_compute"), "{dump}");
     }
 
     #[test]
-    fn constants_print_where_they_are_used() {
+    fn constants_print_as_values_and_are_named_at_their_uses() {
         let dump = dump_of_one_pass();
-        assert!(dump.contains("draw verts=3 insts=1"), "{dump}");
-        assert!(!dump.contains("= const"), "{dump}");
+        assert!(dump.lines().any(|line| line.ends_with("= const 3")), "{dump}");
+        assert!(dump.lines().any(|line| line.ends_with("= const 1")), "{dump}");
+        assert!(dump.contains("draw verts=%"), "{dump}");
+        assert!(dump.contains(" insts=%"), "{dump}");
     }
 
     /// A callback is the one variable whose value the dump cannot show, so a debug build prints
@@ -405,7 +409,7 @@ mod tests {
         assert!(colored.contains("\x1b[33m64x32\x1b[0m"), "{colored}");
         assert!(colored.contains("\x1b[1;34mdraw\x1b[0m"), "{colored}");
         assert!(colored.contains("\x1b[32m\"target\"\x1b[0m"), "{colored}");
-        assert!(colored.contains("\x1b[37mverts\x1b[0m=\x1b[33m3\x1b[0m"), "{colored}");
+        assert!(colored.contains("\x1b[37mverts\x1b[0m=\x1b[36m%"), "{colored}");
         assert!(colored.lines().any(|line| line.starts_with("\x1b[90m;")), "{colored}");
     }
 
@@ -471,6 +475,10 @@ mod tests {
         let dump = module.compile(&bindings, end).unwrap().dump();
         assert!(dump.contains("write_descriptor set=1 binding=2"), "{dump}");
         assert!(dump.contains("combined_image_sampler %5(source)"), "{dump}");
-        assert!(dump.contains("access=FragmentSampled"), "{dump}");
+        assert!(dump.contains("access=%"), "{dump}");
+        assert!(
+            dump.lines().any(|line| line.ends_with("= const FragmentSampled")),
+            "{dump}"
+        );
     }
 }

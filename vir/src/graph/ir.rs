@@ -217,7 +217,7 @@ pub enum IR {
         size: Option<ValueId>,
         usage: vk::BufferUsageFlags,
         location: MemoryLocation,
-        initial_access: Access,
+        initial_access: ValueId,
         name: Name,
     },
     ConstructImage {
@@ -274,7 +274,7 @@ pub enum IR {
         color_attachments: Vec<ValueId>,
         depth_attachment: Option<ValueId>,
         render_area: Option<ValueId>,
-        declared_access: Vec<(ValueId, Access)>,
+        declared_access: Vec<(ValueId, ValueId)>,
         name: Name,
     },
     BindPipeline {
@@ -303,7 +303,7 @@ pub enum IR {
         set: u32,
         binding: u32,
         descriptor: Descriptor,
-        access: Access,
+        access: ValueId,
     },
     Draw {
         pass: ValueId,
@@ -337,7 +337,7 @@ pub enum IR {
         pass: ValueId,
     },
     BeginCompute {
-        declared_access: Vec<(ValueId, Access)>,
+        declared_access: Vec<(ValueId, ValueId)>,
         name: Name,
     },
     Dispatch {
@@ -536,18 +536,7 @@ impl IR {
             IR::Blit { .. } | IR::CopyBufferToImage { .. } => SideEffect::Memory | SideEffect::Command,
 
             IR::BeginRendering { .. } => SideEffect::Memory | SideEffect::Command | SideEffect::State,
-            IR::BeginCompute { declared_access, .. } => {
-                let mut effects = SideEffect::Sync | SideEffect::Command | SideEffect::State;
-                for (_, access) in declared_access {
-                    if access.reads() {
-                        effects |= SideEffect::Read;
-                    }
-                    if access.writes() {
-                        effects |= SideEffect::Write;
-                    }
-                }
-                effects
-            },
+            IR::BeginCompute { .. } => SideEffect::Memory | SideEffect::Sync | SideEffect::Command | SideEffect::State,
             IR::EndRendering { .. } | IR::EndCompute { .. } => SideEffect::Command,
 
             IR::BindPipeline { .. } | IR::SetState { .. } => SideEffect::State,
@@ -604,7 +593,12 @@ impl IR {
                 visit(*index);
             },
 
-            IR::ConstructBuffer { size, .. } => size.iter().copied().for_each(&mut visit),
+            IR::ConstructBuffer {
+                size, initial_access, ..
+            } => {
+                size.iter().copied().for_each(&mut visit);
+                visit(*initial_access);
+            },
             IR::ConstructImage {
                 extent,
                 base_level,
@@ -653,9 +647,15 @@ impl IR {
                 color_attachments.iter().copied().for_each(&mut visit);
                 depth_attachment.iter().copied().for_each(&mut visit);
                 render_area.iter().copied().for_each(&mut visit);
-                declared_access.iter().for_each(|(id, _)| visit(*id));
+                declared_access.iter().for_each(|(resource, access)| {
+                    visit(*resource);
+                    visit(*access);
+                });
             },
-            IR::BeginCompute { declared_access, .. } => declared_access.iter().for_each(|(id, _)| visit(*id)),
+            IR::BeginCompute { declared_access, .. } => declared_access.iter().for_each(|(resource, access)| {
+                visit(*resource);
+                visit(*access);
+            }),
 
             IR::BindPipeline { pass, .. } | IR::EndRendering { pass } | IR::EndCompute { pass } => visit(*pass),
             IR::SetState { pass, change } => {
@@ -674,9 +674,15 @@ impl IR {
                 visit(*pass);
                 visit(*buffer);
             },
-            IR::WriteDescriptor { pass, descriptor, .. } => {
+            IR::WriteDescriptor {
+                pass,
+                descriptor,
+                access,
+                ..
+            } => {
                 visit(*pass);
                 visit(descriptor.image());
+                visit(*access);
             },
 
             IR::Draw {
@@ -786,16 +792,25 @@ impl IR {
                     fixed(*depth, Access::DepthStencilRW);
                 }
                 for (resource, access) in declared_access {
-                    fixed(*resource, *access);
+                    visit(ResourceSideEffect {
+                        resource: *resource,
+                        access: SideEffectAccess::Operand(*access),
+                    });
                 }
             },
             IR::BeginCompute { declared_access, .. } => {
                 for (resource, access) in declared_access {
-                    fixed(*resource, *access);
+                    visit(ResourceSideEffect {
+                        resource: *resource,
+                        access: SideEffectAccess::Operand(*access),
+                    });
                 }
             },
 
-            IR::WriteDescriptor { descriptor, access, .. } => fixed(descriptor.image(), *access),
+            IR::WriteDescriptor { descriptor, access, .. } => visit(ResourceSideEffect {
+                resource: descriptor.image(),
+                access: SideEffectAccess::Operand(*access),
+            }),
             IR::BindVertexBuffers { buffers, .. } => {
                 for buffer in buffers {
                     fixed(*buffer, Access::AttributeRead);
@@ -822,15 +837,27 @@ impl IR {
 pub struct Symbols<'a> {
     values: HashMap<ValueId, &'a IR>,
     bound: HashSet<ValueId>,
+    inline_constants: bool,
 }
 
 impl<'a> Symbols<'a> {
     pub fn new(instructions: &'a [Instr]) -> Self { Self::with_bound(instructions, std::iter::empty()) }
 
     pub fn with_bound(instructions: &'a [Instr], bound: impl IntoIterator<Item = ValueId>) -> Self {
+        Self::with_bound_and_constants(instructions, bound, true)
+    }
+
+    pub(crate) fn with_explicit_constants(instructions: &'a [Instr], bound: impl IntoIterator<Item = ValueId>) -> Self {
+        Self::with_bound_and_constants(instructions, bound, false)
+    }
+
+    fn with_bound_and_constants(
+        instructions: &'a [Instr], bound: impl IntoIterator<Item = ValueId>, inline_constants: bool,
+    ) -> Self {
         Self {
             values: instructions.iter().map(|(id, ir)| (*id, ir)).collect(),
             bound: bound.into_iter().collect(),
+            inline_constants,
         }
     }
 
@@ -922,7 +949,9 @@ pub struct Operand<'a> {
 
 impl fmt::Display for Operand<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(constant) = self.program.constant(self.id) {
+        if self.program.inline_constants
+            && let Some(constant) = self.program.constant(self.id)
+        {
             return write!(f, "{constant}");
         }
 
@@ -1191,7 +1220,11 @@ impl IR {
                 if let Some(size) = size {
                     write!(f, " size={}", p.operand(*size))?;
                 }
-                write!(f, " usage={usage:?} {location:?} resting={initial_access:?}")?;
+                write!(
+                    f,
+                    " usage={usage:?} {location:?} resting={}",
+                    p.operand(*initial_access)
+                )?;
 
                 match (p.is_bound(id), buffer.is_null()) {
                     (true, _) => write!(f, " bound"),
@@ -1344,7 +1377,7 @@ impl IR {
                         fmt_list(declared_access, |(id, access)| format!(
                             "{}:{}",
                             p.operand(*id),
-                            fmt_flags(*access)
+                            p.operand(*access)
                         ))
                     ),
                 }
@@ -1398,7 +1431,7 @@ impl IR {
                         write!(f, "combined_image_sampler {} sampler={sampler:?}", p.operand(*image))?
                     },
                 }
-                write!(f, " access={}", fmt_flags(*access))
+                write!(f, " access={}", p.operand(*access))
             },
             IR::SetState { change, .. } => {
                 write!(f, "set_state ")?;
@@ -1499,7 +1532,7 @@ impl IR {
                     fmt_list(declared_access, |(id, access)| format!(
                         "{}:{}",
                         p.operand(*id),
-                        fmt_flags(*access)
+                        p.operand(*access)
                     ))
                 )
             },
@@ -1611,6 +1644,16 @@ mod tests {
 
     fn value(id: u32) -> ValueId { ValueId(id) }
 
+    fn named_access(id: ValueId) -> Access {
+        match id.0 {
+            10 => Access::FragmentSampled,
+            11 => Access::ComputeRead,
+            12 => Access::ComputeWrite,
+            13 => Access::VertexSampled,
+            _ => panic!("{id} does not name a test access"),
+        }
+    }
+
     fn naming() -> Vec<IR> {
         vec![
             IR::Clear {
@@ -1638,15 +1681,15 @@ mod tests {
                 color_attachments: vec![value(1)],
                 depth_attachment: None,
                 render_area: None,
-                declared_access: vec![(value(2), Access::FragmentSampled)],
+                declared_access: vec![(value(2), value(10))],
                 name: None,
             },
             IR::BeginCompute {
-                declared_access: vec![(value(1), Access::ComputeRead)],
+                declared_access: vec![(value(1), value(11))],
                 name: None,
             },
             IR::BeginCompute {
-                declared_access: vec![(value(1), Access::ComputeRead), (value(2), Access::ComputeWrite)],
+                declared_access: vec![(value(1), value(11)), (value(2), value(12))],
                 name: None,
             },
             IR::WriteDescriptor {
@@ -1654,7 +1697,7 @@ mod tests {
                 set: 0,
                 binding: 0,
                 descriptor: Descriptor::SampledImage { image: value(1) },
-                access: Access::VertexSampled,
+                access: value(13),
             },
             IR::BindIndexBuffer {
                 pass: value(0),
@@ -1681,19 +1724,20 @@ mod tests {
             let accesses = ir
                 .resource_effects()
                 .into_iter()
-                .map(|effect| effect.access.fixed().expect("these instructions fix their access"))
+                .map(|effect| match effect.access {
+                    SideEffectAccess::Fixed(access) => access,
+                    SideEffectAccess::Operand(id) => named_access(id),
+                })
                 .collect::<Vec<_>>();
 
             assert!(!accesses.is_empty(), "{ir} names no resource");
-            assert_eq!(
-                effects.reads(),
-                accesses.iter().any(|access| access.reads()),
-                "{ir} is mislabelled for reads"
+            assert!(
+                !accesses.iter().any(|access| access.reads()) || effects.reads(),
+                "{ir} is missing its read effect"
             );
-            assert_eq!(
-                effects.writes(),
-                accesses.iter().any(|access| access.writes()),
-                "{ir} is mislabelled for writes"
+            assert!(
+                !accesses.iter().any(|access| access.writes()) || effects.writes(),
+                "{ir} is missing its write effect"
             );
         }
     }
@@ -1721,11 +1765,50 @@ mod tests {
             size: None,
             usage: vk::BufferUsageFlags::empty(),
             location: MemoryLocation::GpuOnly,
-            initial_access: Access::None,
+            initial_access: value(1),
             name: None,
         };
         assert!(!buffer.is_pure(), "a construct is an identity of its own");
         assert!(buffer.is_removable_when_unused());
+    }
+
+    #[test]
+    fn lowered_accesses_are_visited_as_operands() {
+        let access = value(7);
+        let instructions = [
+            IR::ConstructBuffer {
+                buffer: Buffer::default(),
+                size: None,
+                usage: vk::BufferUsageFlags::empty(),
+                location: MemoryLocation::GpuOnly,
+                initial_access: access,
+                name: None,
+            },
+            IR::BeginRendering {
+                color_attachments: Vec::new(),
+                depth_attachment: None,
+                render_area: None,
+                declared_access: vec![(value(1), access)],
+                name: None,
+            },
+            IR::BeginCompute {
+                declared_access: vec![(value(1), access)],
+                name: None,
+            },
+            IR::WriteDescriptor {
+                pass: value(0),
+                set: 0,
+                binding: 0,
+                descriptor: Descriptor::SampledImage { image: value(1) },
+                access,
+            },
+        ];
+
+        for ir in instructions {
+            let mut operands = Vec::new();
+            ir.visit_operands(|id| operands.push(id));
+            assert!(operands.contains(&access), "{ir} does not visit its access operand");
+        }
     }
 
     #[test]

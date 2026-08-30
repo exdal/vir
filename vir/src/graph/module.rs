@@ -67,11 +67,13 @@ struct Arm {
     buffers: HashMap<ValueId, BufferState>,
 }
 
-fn resolve_descriptor_access(mut nodes: Vec<ir::Instr>, pipelines: &impl PipelineBindings) -> Vec<ir::Instr> {
+fn resolve_descriptor_access(
+    mut nodes: Vec<ir::Instr>, pipelines: &impl PipelineBindings, next_id: &mut u32,
+) -> Vec<ir::Instr> {
     let mut written: BTreeMap<(u32, u32), usize> = BTreeMap::new();
     let mut open = false;
     let mut bound: Option<PipelineId> = None;
-    let mut resolved: HashMap<usize, Access> = HashMap::new();
+    let mut resolved: BTreeMap<usize, Access> = BTreeMap::new();
 
     for (index, (_, ir)) in nodes.iter().enumerate() {
         match ir {
@@ -106,13 +108,32 @@ fn resolve_descriptor_access(mut nodes: Vec<ir::Instr>, pipelines: &impl Pipelin
         }
     }
 
+    let mut access_ids = nodes
+        .iter()
+        .filter_map(|(id, ir)| match ir {
+            IR::Constant(ir::Constant::Access(access)) => Some((*access, *id)),
+            _ => None,
+        })
+        .collect::<HashMap<_, _>>();
+    let mut constants = Vec::new();
+
     for (index, access) in resolved {
+        let access_id = match access_ids.get(&access).copied() {
+            Some(id) => id,
+            None => {
+                let id = alloc_id(next_id);
+                constants.push((id, IR::Constant(ir::Constant::Access(access))));
+                access_ids.insert(access, id);
+                id
+            },
+        };
         if let IR::WriteDescriptor { access: slot, .. } = &mut nodes[index].1 {
-            *slot = access;
+            *slot = access_id;
         }
     }
 
-    nodes
+    constants.extend(nodes);
+    constants
 }
 
 fn globals_first(nodes: Vec<ir::Instr>) -> Vec<ir::Instr> {
@@ -353,12 +374,13 @@ impl Module {
 
     pub fn declare_buffer_var(&mut self, name: &str, access: Access) -> ValueId {
         self.lower_type(ir::Type::Buffer);
+        let initial_access = self.lower_access(access);
         let resource = self.emit(IR::ConstructBuffer {
             buffer: Buffer::default(),
             size: None,
             usage: vk::BufferUsageFlags::empty(),
             location: MemoryLocation::Unknown,
-            initial_access: access,
+            initial_access,
             name: name_of(name),
         });
 
@@ -541,13 +563,14 @@ impl Module {
 
     pub fn transient_buffer(&mut self, info: &BufferInfo) -> ValueId {
         let size = self.lower_constant(ir::Constant::Size(info.size as usize));
+        let initial_access = self.lower_access(Access::None);
         self.lower_type(ir::Type::Buffer);
         self.emit(IR::ConstructBuffer {
             buffer: Buffer::default(),
             size: Some(size),
             usage: info.usage,
             location: info.location,
-            initial_access: Access::None,
+            initial_access,
             name: name_of(&info.name),
         })
     }
@@ -555,12 +578,13 @@ impl Module {
     pub fn import_buffer(&mut self, buffer: &Buffer, access: Access) -> ValueId {
         self.lower_type(ir::Type::Buffer);
         let size = self.lower_u32(buffer.size() as u32);
+        let initial_access = self.lower_access(access);
         self.emit(IR::ConstructBuffer {
             buffer: *buffer,
             size: Some(size),
             usage: vk::BufferUsageFlags::empty(),
             location: MemoryLocation::Unknown,
-            initial_access: access,
+            initial_access,
             name: None,
         })
     }
@@ -728,7 +752,7 @@ impl Module {
         let nodes = self.topo_sort(&roots);
         let nodes = self.layout_blocks(nodes, &mut next_id);
         // the barriers are what the resolved accesses are for, so this comes before them
-        let nodes = resolve_descriptor_access(nodes, pipelines);
+        let nodes = resolve_descriptor_access(nodes, pipelines, &mut next_id);
         let nodes = self.sync(nodes, &mut next_id);
         let nodes = self.simplify_cfg(nodes);
         let nodes = self.fold_barriers(nodes, &mut next_id);
@@ -768,7 +792,10 @@ impl Module {
                         stack.push(*ty);
                         elements.iter().rev().for_each(|v| stack.push(*v));
                     },
-                    IR::ConstructBuffer { size, .. } => {
+                    IR::ConstructBuffer {
+                        size, initial_access, ..
+                    } => {
+                        stack.push(*initial_access);
                         size.iter().for_each(|v| stack.push(*v));
                     },
                     IR::ConstructImage {
@@ -823,7 +850,10 @@ impl Module {
                         declared_access,
                         ..
                     } => {
-                        declared_access.iter().rev().for_each(|(id, _)| stack.push(*id));
+                        declared_access.iter().rev().for_each(|(resource, access)| {
+                            stack.push(*access);
+                            stack.push(*resource);
+                        });
                         render_area.iter().for_each(|v| stack.push(*v));
                         depth_attachment.iter().for_each(|v| stack.push(*v));
                         color_attachments.iter().rev().for_each(|v| stack.push(*v));
@@ -848,7 +878,13 @@ impl Module {
                         stack.push(*pass);
                         stack.push(*buffer);
                     },
-                    IR::WriteDescriptor { pass, descriptor, .. } => {
+                    IR::WriteDescriptor {
+                        pass,
+                        descriptor,
+                        access,
+                        ..
+                    } => {
+                        stack.push(*access);
                         stack.push(*pass);
                         stack.push(descriptor.image());
                     },
@@ -890,7 +926,10 @@ impl Module {
                         stack.push(*pass);
                     },
                     IR::BeginCompute { declared_access, .. } => {
-                        declared_access.iter().rev().for_each(|(id, _)| stack.push(*id));
+                        declared_access.iter().rev().for_each(|(resource, access)| {
+                            stack.push(*access);
+                            stack.push(*resource);
+                        });
                     },
                     IR::Dispatch { pass, size, .. } => {
                         match size {
@@ -1086,6 +1125,19 @@ impl Module {
     }
 
     fn sync(&self, nodes: Vec<ir::Instr>, next_id: &mut u32) -> Vec<ir::Instr> {
+        let access_values = nodes
+            .iter()
+            .filter_map(|(id, ir)| match ir {
+                IR::Constant(ir::Constant::Access(access)) => Some((*id, *access)),
+                _ => None,
+            })
+            .collect::<HashMap<_, _>>();
+        let resolve_access = |id: &ValueId| {
+            access_values
+                .get(id)
+                .copied()
+                .unwrap_or_else(|| panic!("{id} is not an Access constant"))
+        };
         let mut result = Vec::with_capacity(nodes.len() * 2);
         let mut image_states = HashMap::new();
         let mut buffer_states = HashMap::new();
@@ -1122,12 +1174,13 @@ impl Module {
                     continue;
                 },
                 IR::WriteDescriptor { descriptor, access, .. } => {
+                    let access = resolve_access(access);
                     if let Some(region) = open_region {
                         let root = self.resource_root(descriptor.image());
                         let sampled = region_images.entry(region).or_default();
                         match sampled.iter_mut().find(|(seen, _)| *seen == root) {
-                            Some((_, merged)) => *merged |= *access,
-                            None => sampled.push((root, *access)),
+                            Some((_, merged)) => *merged |= access,
+                            None => sampled.push((root, access)),
                         }
                     }
                     continue;
@@ -1376,18 +1429,13 @@ impl Module {
                 },
 
                 IR::ConstructBuffer { initial_access, .. } => {
-                    let last_access = resting_access!(*initial_access);
-                    buffer_states.insert(
-                        value_id,
-                        BufferState {
-                            last_access,
-                            access: *initial_access,
-                        },
-                    );
+                    let access = resolve_access(initial_access);
+                    let last_access = resting_access!(access);
+                    buffer_states.insert(value_id, BufferState { last_access, access });
                 },
 
                 IR::Acquire { resource, access } => {
-                    transition!(*resource, *access, self.resolve_access(*access));
+                    transition!(*resource, *access, resolve_access(access));
                 },
 
                 IR::Clear { attachment, .. } => {
@@ -1419,17 +1467,18 @@ impl Module {
                         transition!(image, sampled_id, access);
                     }
 
-                    for (resource, access) in declared_access {
+                    for (resource, access_id) in declared_access {
+                        let access = resolve_access(access_id);
                         if self.is_buffer(*resource) {
-                            buffer_barrier!(self.resource_root(*resource), *access);
+                            buffer_barrier!(self.resource_root(*resource), access);
                             continue;
                         }
 
                         let access_id = match access.writes() {
-                            true => emit_access!(*access),
-                            false => read_access!(*access),
+                            true => emit_access!(access),
+                            false => read_access!(access),
                         };
-                        transition!(*resource, access_id, *access);
+                        transition!(*resource, access_id, access);
                     }
 
                     let access_id = emit_access!(Access::ColorRW);
@@ -1453,17 +1502,18 @@ impl Module {
                         transition!(image, sampled_id, access);
                     }
 
-                    for (resource, access) in declared_access {
+                    for (resource, access_id) in declared_access {
+                        let access = resolve_access(access_id);
                         if self.is_buffer(*resource) {
-                            buffer_barrier!(self.resource_root(*resource), *access);
+                            buffer_barrier!(self.resource_root(*resource), access);
                             continue;
                         }
 
                         let access_id = match access.writes() {
-                            true => emit_access!(*access),
-                            false => read_access!(*access),
+                            true => emit_access!(access),
+                            false => read_access!(access),
                         };
-                        transition!(*resource, access_id, *access);
+                        transition!(*resource, access_id, access);
                     }
                 },
 
@@ -1475,7 +1525,7 @@ impl Module {
                 },
 
                 IR::Release { resource, access, .. } => {
-                    transition!(*resource, *access, self.resolve_access(*access));
+                    transition!(*resource, *access, resolve_access(access));
                 },
 
                 _ => {},
@@ -1557,8 +1607,10 @@ impl Module {
                 IR::BindIndexBuffer { buffer, .. } => used(buffer, vk::BufferUsageFlags::INDEX_BUFFER),
                 IR::BeginRendering { declared_access, .. } | IR::BeginCompute { declared_access, .. } => {
                     for (resource, access) in declared_access {
-                        if self.is_buffer(*resource) {
-                            used(resource, vk::BufferUsageFlags::from(*access));
+                        if self.is_buffer(*resource)
+                            && let Some(access) = access_of(access)
+                        {
+                            used(resource, vk::BufferUsageFlags::from(access));
                         }
                     }
                 },
@@ -2006,12 +2058,13 @@ impl Module {
             return self;
         }
 
+        let access = self.lower_access(Access::None);
         self.chain(None, "descriptor", |pass| IR::WriteDescriptor {
             pass,
             set,
             binding,
             descriptor,
-            access: Access::None,
+            access,
         })
     }
 
@@ -2166,6 +2219,17 @@ impl Module {
             return self;
         };
 
+        let existing = match self.instructions.get(open.begin.0 as usize) {
+            Some(IR::BeginRendering { declared_access, .. } | IR::BeginCompute { declared_access, .. }) => {
+                declared_access
+                    .iter()
+                    .find_map(|(id, access)| (*id == resource).then_some(*access))
+            },
+            _ => return self,
+        };
+        let merged = existing.map_or(access, |existing| self.resolve_access(existing) | access);
+        let access = self.lower_access(merged);
+
         let declared = match self.instructions.get_mut(open.begin.0 as usize) {
             Some(IR::BeginRendering { declared_access, .. } | IR::BeginCompute { declared_access, .. }) => {
                 declared_access
@@ -2174,7 +2238,7 @@ impl Module {
         };
 
         match declared.iter_mut().find(|(id, _)| *id == resource) {
-            Some((_, merged)) => *merged |= access,
+            Some((_, slot)) => *slot = access,
             None => declared.push((resource, access)),
         }
 
@@ -4088,6 +4152,40 @@ mod tests {
         let barriers = image_barriers(&module, &module.compile(&Unchecked, end).unwrap());
         assert_eq!(barriers.len(), 1);
         assert_eq!(barriers[0].dst, Access::ComputeRW);
+    }
+
+    #[test]
+    fn recorded_accesses_are_lowered_to_constants() {
+        let mut module = Module::default();
+        let buffer = module.import_buffer(&Buffer::default(), Access::HostWrite);
+        let image = module.transient_image(&untyped_info());
+
+        let _end = module
+            .begin_compute()
+            .bind_compute_pipeline(PipelineId(0))
+            .read(image)
+            .bind_image(0, 0, image)
+            .dispatch(1, 1, 1)
+            .end_compute();
+
+        let IR::ConstructBuffer { initial_access, .. } = module.get(buffer) else {
+            panic!("the imported buffer should be constructed directly");
+        };
+        assert_eq!(module.resolve_access(*initial_access), Access::HostWrite);
+
+        let declared = module.instructions.iter().find_map(|ir| match ir {
+            IR::BeginCompute { declared_access, .. } => declared_access
+                .iter()
+                .find_map(|(resource, access)| (*resource == image).then_some(*access)),
+            _ => None,
+        });
+        assert_eq!(declared.map(|id| module.resolve_access(id)), Some(Access::ComputeRead));
+
+        let descriptor = module.instructions.iter().find_map(|ir| match ir {
+            IR::WriteDescriptor { access, .. } => Some(*access),
+            _ => None,
+        });
+        assert_eq!(descriptor.map(|id| module.resolve_access(id)), Some(Access::None));
     }
 
     #[test]

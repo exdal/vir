@@ -455,7 +455,8 @@ mod tests {
             IR::WriteDescriptor { access, .. } => Some(*access),
             _ => None,
         });
+        let symbols = crate::graph::ir::Symbols::new(compiled.instructions());
 
-        assert_eq!(access, Some(Access::None));
+        assert_eq!(access.and_then(|id| symbols.access(id)), Some(Access::None));
     }
 }
