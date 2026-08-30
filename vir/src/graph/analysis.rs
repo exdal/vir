@@ -157,13 +157,13 @@ fn write_is_sound(
 }
 
 fn descriptors_are_compatible_with_pipeline(
-    value_id: &ValueId, table: &Table, pipeline: Option<PipelineId>, pipelines: &impl PipelineBindings,
+    value_id: &ValueId, table: &Table, pipeline: PipelineId, pipelines: &impl PipelineBindings,
 ) -> bool {
     // there is nothing to check the writes against without one. the graph refuses to record it
     // either way, so this is left as the warning the inference already made it
-    let Some(pipeline) = pipeline else {
+    if pipeline.is_invalid() {
         return true;
-    };
+    }
 
     let Some(bindings) = pipelines.bindings(pipeline) else {
         return true;

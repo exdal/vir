@@ -427,6 +427,7 @@ impl RenderGraph {
         let vertex = VertexLayout::interleaved(&reflections);
 
         let id = PipelineId(self.pipelines.len() as u32);
+        assert!(id.is_valid(), "exhausted valid PipelineId values");
         self.pipelines.push(DeclaredPipeline {
             bindings: merged_bindings(&reflections),
             reflections,
@@ -455,6 +456,7 @@ impl RenderGraph {
         validate_descriptor_bindings(std::slice::from_ref(&reflection), info.bindless)?;
 
         let id = PipelineId(self.pipelines.len() as u32);
+        assert!(id.is_valid(), "exhausted valid PipelineId values");
         self.pipelines.push(DeclaredPipeline {
             bindings: merged_bindings(std::slice::from_ref(&reflection)),
             reflections: vec![reflection],
@@ -478,10 +480,10 @@ impl RenderGraph {
                 _ => continue,
             };
 
-            let Some(pipeline) = pipeline else {
+            if pipeline.is_invalid() {
                 tracing::error!(%value_id, "draw or dispatch with no pipeline bound");
                 return Err(vk::Result::ERROR_UNKNOWN);
-            };
+            }
 
             let Some(declared) = self.pipelines.get(pipeline.0 as usize) else {
                 tracing::error!(%pipeline, "draw or dispatch with a pipeline that was never declared");
@@ -714,10 +716,11 @@ impl RenderGraph {
                 | IR::DrawIndexed { pipeline, .. }
                 | IR::CallOpaque { pipeline, .. }
                 | IR::Dispatch { pipeline, .. } => *pipeline,
-                _ => None,
+                _ => PipelineId::INVALID,
             };
-            let Some(layout) = pipeline
-                .and_then(|pipeline| self.pipelines.get(pipeline.0 as usize))
+            let Some(layout) = self
+                .pipelines
+                .get(pipeline.0 as usize)
                 .and_then(|pipeline| pipeline.layout.as_ref())
             else {
                 continue;
@@ -1145,9 +1148,11 @@ impl RenderGraph {
     }
 
     fn prepare_draw(
-        &mut self, pipeline: Option<PipelineId>, state: &PipelineState, dynamic: &DynamicValues, bind_descriptors: bool,
+        &mut self, pipeline: PipelineId, state: &PipelineState, dynamic: &DynamicValues, bind_descriptors: bool,
     ) -> Result<(), vk::Result> {
-        let pipeline = pipeline.ok_or(vk::Result::ERROR_UNKNOWN)?;
+        if pipeline.is_invalid() {
+            return Err(vk::Result::ERROR_UNKNOWN);
+        }
         let handle = self
             .pipelines
             .get(pipeline.0 as usize)
@@ -1189,8 +1194,11 @@ impl RenderGraph {
             .map_or([1; 3], |reflection| reflection.local_size)
     }
 
-    fn groups_for(&self, invocations: [u32; 3], pipeline: Option<PipelineId>) -> [u32; 3] {
-        let local_size = pipeline.map_or([1; 3], |pipeline| self.local_size(pipeline));
+    fn groups_for(&self, invocations: [u32; 3], pipeline: PipelineId) -> [u32; 3] {
+        let local_size = match pipeline.is_valid() {
+            true => self.local_size(pipeline),
+            false => [1; 3],
+        };
         [
             invocations[0].div_ceil(local_size[0]),
             invocations[1].div_ceil(local_size[1]),
@@ -1198,10 +1206,10 @@ impl RenderGraph {
         ]
     }
 
-    fn prepare_dispatch(
-        &mut self, pipeline: Option<PipelineId>, push_constants: &PushConstants,
-    ) -> Result<(), vk::Result> {
-        let pipeline = pipeline.ok_or(vk::Result::ERROR_UNKNOWN)?;
+    fn prepare_dispatch(&mut self, pipeline: PipelineId, push_constants: &PushConstants) -> Result<(), vk::Result> {
+        if pipeline.is_invalid() {
+            return Err(vk::Result::ERROR_UNKNOWN);
+        }
         let handle = self
             .pipelines
             .get(pipeline.0 as usize)
@@ -1633,7 +1641,7 @@ impl RenderGraph {
                 self.prepare_draw(*pipeline, state, dynamic, false)?;
 
                 let body = self.get::<PassCallback>(body);
-                let pipeline = pipeline.ok_or(vk::Result::ERROR_UNKNOWN)?;
+                let pipeline = *pipeline;
                 let descriptors = self
                     .active_descriptors
                     .iter()

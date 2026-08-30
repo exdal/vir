@@ -25,6 +25,14 @@ use crate::resource::shader::Reflection;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PipelineId(pub(crate) u32);
 
+impl PipelineId {
+    pub const INVALID: Self = Self(u32::MAX);
+
+    pub const fn is_valid(self) -> bool { self.0 != u32::MAX }
+
+    pub const fn is_invalid(self) -> bool { self.0 == u32::MAX }
+}
+
 impl std::fmt::Display for PipelineId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "#{}", self.0) }
 }

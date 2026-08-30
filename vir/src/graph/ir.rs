@@ -312,7 +312,7 @@ pub enum IR {
         instance_count: ValueId,
         first_vertex: ValueId,
         first_instance: ValueId,
-        pipeline: Option<PipelineId>,
+        pipeline: PipelineId,
         state: PipelineState,
         dynamic: DynamicValues,
     },
@@ -323,14 +323,14 @@ pub enum IR {
         first_index: ValueId,
         vertex_offset: ValueId,
         first_instance: ValueId,
-        pipeline: Option<PipelineId>,
+        pipeline: PipelineId,
         state: PipelineState,
         dynamic: DynamicValues,
     },
     CallOpaque {
         pass: ValueId,
         body: ValueId,
-        pipeline: Option<PipelineId>,
+        pipeline: PipelineId,
         state: PipelineState,
         dynamic: DynamicValues,
     },
@@ -344,7 +344,7 @@ pub enum IR {
     Dispatch {
         pass: ValueId,
         size: DispatchSize,
-        pipeline: Option<PipelineId>,
+        pipeline: PipelineId,
         push_constants: PushConstants,
     },
     EndCompute {
@@ -1673,10 +1673,10 @@ impl IR {
     }
 }
 
-fn fmt_pipeline(pipeline: &Option<PipelineId>) -> String {
-    match pipeline {
-        Some(pipeline) => format!("pipeline={pipeline}"),
-        None => "pipeline=none".into(),
+fn fmt_pipeline(pipeline: &PipelineId) -> String {
+    match pipeline.is_valid() {
+        true => format!("pipeline={pipeline}"),
+        false => "pipeline=none".into(),
     }
 }
 
@@ -1757,7 +1757,7 @@ mod tests {
                     buffer: value(1),
                     offset: 0,
                 },
-                pipeline: None,
+                pipeline: PipelineId::INVALID,
                 push_constants: PushConstants::default(),
             },
         ]

@@ -1933,7 +1933,7 @@ impl Module {
                         if in_force.pipeline.is_none() {
                             tracing::warn!(%value_id, "draw with no pipeline bound");
                         }
-                        *pipeline = in_force.pipeline;
+                        *pipeline = in_force.pipeline.unwrap_or(PipelineId::INVALID);
 
                         // an area that is only known at execute time cannot be baked into a
                         // pipeline, so anything framebuffer-relative has to be recorded instead
@@ -1956,7 +1956,7 @@ impl Module {
                         if in_force.pipeline.is_none() {
                             tracing::warn!(%value_id, "dispatch with no pipeline bound");
                         }
-                        *pipeline = in_force.pipeline;
+                        *pipeline = in_force.pipeline.unwrap_or(PipelineId::INVALID);
                         *push_constants = in_force.state.push_constants.clone();
                         regions.insert(*value_id, in_force);
                     }
@@ -2234,7 +2234,7 @@ impl Module {
             instance_count,
             first_vertex,
             first_instance,
-            pipeline: None,
+            pipeline: PipelineId::INVALID,
             state: Default::default(),
             dynamic: Default::default(),
         })
@@ -2260,7 +2260,7 @@ impl Module {
             first_index,
             vertex_offset,
             first_instance,
-            pipeline: None,
+            pipeline: PipelineId::INVALID,
             state: Default::default(),
             dynamic: Default::default(),
         })
@@ -2270,7 +2270,7 @@ impl Module {
         self.chain(Some(PassKind::Rendering), "callback", |pass| IR::CallOpaque {
             pass,
             body,
-            pipeline: None,
+            pipeline: PipelineId::INVALID,
             state: Default::default(),
             dynamic: Default::default(),
         })
@@ -2336,7 +2336,7 @@ impl Module {
         self.chain(Some(PassKind::Compute), "dispatch", |pass| IR::Dispatch {
             pass,
             size,
-            pipeline: None,
+            pipeline: PipelineId::INVALID,
             push_constants: Default::default(),
         })
     }
@@ -2566,7 +2566,7 @@ mod tests {
             .expect("the image should still be declared after compiling")
     }
 
-    fn draws(program: &Program) -> Vec<(Option<PipelineId>, PipelineState)> {
+    fn draws(program: &Program) -> Vec<(PipelineId, PipelineState)> {
         program
             .instructions()
             .iter()
@@ -2621,7 +2621,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(calls.len(), 1, "{}", compiled.dump());
-        assert_eq!(calls[0].0, Some(PipelineId(3)));
+        assert_eq!(calls[0].0, PipelineId(3));
         assert_eq!(calls[0].1.topology, vk::PrimitiveTopology::TRIANGLE_STRIP);
         assert_eq!(calls[0].1.rendering.color_formats, vec![FORMAT]);
     }
@@ -2869,7 +2869,7 @@ mod tests {
 
         let draws = draws(&compiled);
         assert_eq!(draws.len(), 1);
-        assert_eq!(draws[0].0, Some(PipelineId(0)));
+        assert_eq!(draws[0].0, PipelineId(0));
         assert_eq!(draws[0].1.rendering.color_formats, vec![FORMAT]);
     }
 
@@ -3585,7 +3585,7 @@ mod tests {
 
         let draws = draws(&module.compile(&Unchecked, end).unwrap());
         assert_eq!(draws.len(), 1);
-        assert_eq!(draws[0].0, Some(pipeline));
+        assert_eq!(draws[0].0, pipeline);
         assert_eq!(draws[0].1.rendering.color_formats, vec![FORMAT]);
         assert_eq!(draws[0].1.topology, vk::PrimitiveTopology::LINE_STRIP);
         assert!(draws[0].1.blend.iter().all(|blend| blend.blend_enable));
@@ -3640,7 +3640,7 @@ mod tests {
 
         let draws = draws(&module.compile(&Unchecked, end).unwrap());
         assert_eq!(draws.len(), 1);
-        assert_eq!(draws[0].0, Some(pipeline));
+        assert_eq!(draws[0].0, pipeline);
         assert_eq!(draws[0].1.rendering.color_formats, vec![FORMAT]);
         assert_eq!(draws[0].1.rasterization, RasterizationState::default());
         assert_eq!(draws[0].1.topology, vk::PrimitiveTopology::TRIANGLE_LIST);
@@ -3724,18 +3724,18 @@ mod tests {
             .end_rendering();
 
         let draws = draws(&module.compile(&Unchecked, end).unwrap());
-        assert_eq!(draws[0].0, Some(PipelineId(1)));
+        assert_eq!(draws[0].0, PipelineId(1));
         assert_eq!(draws[0].1.rasterization.cull_mode, vk::CullModeFlags::BACK);
     }
 
     #[test]
-    fn a_draw_with_no_bound_pipeline_infers_none() {
+    fn a_draw_with_no_bound_pipeline_infers_invalid() {
         let (mut module, attachment) = module_with_attachment();
 
         let end = module.begin_rendering(&[attachment]).draw(3, 1).end_rendering();
 
         let draws = draws(&module.compile(&Unchecked, end).unwrap());
-        assert_eq!(draws[0].0, None);
+        assert_eq!(draws[0].0, PipelineId::INVALID);
     }
 
     #[test]
@@ -3934,7 +3934,7 @@ mod tests {
         };
 
         assert_eq!(dynamic.push_constants.data, 7u32.to_ne_bytes());
-        assert_eq!(draws(&compiled)[0].0, Some(PipelineId(0)));
+        assert_eq!(draws(&compiled)[0].0, PipelineId(0));
     }
 
     #[test]
@@ -3967,7 +3967,7 @@ mod tests {
             unreachable!()
         };
 
-        assert_eq!(*pipeline, Some(PipelineId(1)));
+        assert_eq!(*pipeline, PipelineId(1));
         assert_eq!(push_constants.data, 7u32.to_ne_bytes());
         assert_eq!(
             [
