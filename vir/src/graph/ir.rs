@@ -949,10 +949,11 @@ pub struct Operand<'a> {
 
 impl fmt::Display for Operand<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.program.inline_constants
-            && let Some(constant) = self.program.constant(self.id)
-        {
-            return write!(f, "{constant}");
+        if let Some(constant) = self.program.constant(self.id) {
+            return match self.program.inline_constants {
+                true => write!(f, "{constant}"),
+                false => write!(f, "{}({constant})", self.id),
+            };
         }
 
         if let Some(IR::Variable { slot, name, .. }) = self.program.get(self.id) {

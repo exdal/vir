@@ -362,7 +362,18 @@ mod tests {
         assert!(dump.lines().any(|line| line.ends_with("= const 3")), "{dump}");
         assert!(dump.lines().any(|line| line.ends_with("= const 1")), "{dump}");
         assert!(dump.contains("draw verts=%"), "{dump}");
-        assert!(dump.contains(" insts=%"), "{dump}");
+        assert!(dump.contains("(3) insts=%"), "{dump}");
+        assert!(dump.contains("(1) pipeline=#0"), "{dump}");
+
+        let barrier = dump
+            .lines()
+            .find(|line| line.contains("barrier.image"))
+            .expect("the image barrier should be dumped");
+        assert!(
+            barrier.contains("access=%") && barrier.contains("(None) -> %"),
+            "{barrier}"
+        );
+        assert!(barrier.ends_with("(ColorRead|ColorWrite)"), "{barrier}");
     }
 
     /// A callback is the one variable whose value the dump cannot show, so a debug build prints
@@ -476,6 +487,7 @@ mod tests {
         assert!(dump.contains("write_descriptor set=1 binding=2"), "{dump}");
         assert!(dump.contains("combined_image_sampler %5(source)"), "{dump}");
         assert!(dump.contains("access=%"), "{dump}");
+        assert!(dump.contains("(FragmentSampled)"), "{dump}");
         assert!(
             dump.lines().any(|line| line.ends_with("= const FragmentSampled")),
             "{dump}"
