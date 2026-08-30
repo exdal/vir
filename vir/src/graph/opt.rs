@@ -343,7 +343,7 @@ mod tests {
 
     fn draw_into(module: &mut Module, target: ValueId) -> ValueId {
         module
-            .begin_rendering(&[target])
+            .begin_rendering([(target, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .draw(3, 1)
             .end_rendering()
@@ -512,7 +512,7 @@ mod tests {
         let indices = module.declare_buffer_var("indices", Access::HostWrite);
 
         let drawn = module
-            .begin_rendering(&[target])
+            .begin_rendering([(target, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .bind_vertex_buffer(0, vertices)
             .bind_index_buffer(indices, vk::IndexType::UINT32)
@@ -539,13 +539,13 @@ mod tests {
         let indices = module.declare_buffer_var("indices", Access::HostWrite);
 
         let first = module
-            .begin_rendering(&[target])
+            .begin_rendering([(target, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .bind_vertex_buffer(0, vertices)
             .draw(3, 1)
             .end_rendering();
         let second = module
-            .begin_rendering(&[first])
+            .begin_rendering([(first, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .bind_index_buffer(indices, vk::IndexType::UINT32)
             .draw(3, 1)

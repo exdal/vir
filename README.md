@@ -32,7 +32,7 @@ let target = frame.module.clear(frame.swapchain_image, BACKGROUND);
 
 let target = frame
     .module
-    .begin_rendering(&[target])
+    .begin_rendering([(target, Access::ColorRW)])
     .with_name("triangle")
     .bind_graphics_pipeline(pipeline)
     .set_viewport(0, Rect2D::framebuffer())
@@ -44,13 +44,16 @@ let target = frame
 ```
 
 Scalar sampled images and combined image samplers are ordinary pass state. Their set layouts are
-reflected from the shaders, while the image values live in pass metadata outside the command IR
-and drive both the descriptor write and the image transition:
+reflected from the shaders, while the pass resource list declares the image transition and the
+binding call records the descriptor write:
 
 ```rust
 let target = frame
     .module
-    .begin_rendering(&[target])
+    .begin_rendering([
+        (target, Access::ColorRW),
+        (texture, Access::FragmentSampled),
+    ])
     .bind_graphics_pipeline(pipeline)
     .bind_texture(0, 3, texture, sampler)
     .draw(3, 1)
@@ -69,9 +72,20 @@ let info = GraphicsPipelineInfo::new()
     .with_bindless_set(2, bindless_layout, bindless_set);
 ```
 
-Images reached through an external bindless set still need `sample_image(image)` on the pass when
-the graph must synchronize them, because their descriptor contents are intentionally opaque to
-the IR.
+Images reached through an external bindless set still need an entry in `begin_rendering` or
+`begin_compute` when the graph must synchronize them, because their descriptor contents are
+intentionally opaque to the IR. One resource-array value can stand for the whole set; the access
+is applied to every element while the array remains a single attachment entry:
+
+```rust
+module
+    .begin_rendering([
+        (target, Access::ColorRW),
+        (bindless_images, Access::FragmentRead),
+    ])
+    // ...
+    .end_rendering();
+```
 
 A compute pass declares its accesses, and the graph barriers the dispatches against each other and
 against any draw that later reads what they wrote:
@@ -79,9 +93,8 @@ against any draw that later reads what they wrote:
 ```rust
 frame
     .module
-    .begin_compute()
-    .bind_pipeline(place)
-    .write(instances)
+    .begin_compute([(instances, Access::ComputeWrite)])
+    .bind_compute_pipeline(place)
     .push_constants(&push)
     .dispatch_invocations(triangle_count, 1, 1)
     .end_compute();

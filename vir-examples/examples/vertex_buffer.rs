@@ -10,6 +10,7 @@
 
 use ash::vk;
 use vir::{
+    Access,
     BlendPreset,
     Buffer,
     BufferInfo,
@@ -173,7 +174,7 @@ impl Example for VertexBuffer {
 
         // one pass, two draws: only the bound buffer and the tail of the block change
         let drawn = module
-            .begin_rendering(&[target])
+            .begin_rendering([(target, Access::ColorRW)])
             .with_name("buffer geometry")
             .bind_graphics_pipeline(self.pipeline)
             .set_viewport(0, Rect2D::framebuffer())

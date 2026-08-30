@@ -20,6 +20,7 @@
 
 use ash::vk;
 use vir::{
+    Access,
     BlendPreset,
     BufferInfo,
     ClearValue,
@@ -153,10 +154,9 @@ impl Example for Compute {
         let vertices = module.declare_buffer_var("computed vertices", vir::Access::HostWrite);
 
         let placed = module
-            .begin_compute()
+            .begin_compute([(instances, Access::ComputeWrite)])
             .with_name("place")
             .bind_compute_pipeline(self.place)
-            .write(instances)
             .push_constants_from(push)
             .push_constant_address(INSTANCES_AT, instances)
             .push_constant_address(VERTICES_AT, vertices)
@@ -166,11 +166,9 @@ impl Example for Compute {
         // write vertices first so `expanded` is what the draw binds; read `placed`, not
         // `instances`, to order this dispatch after the place
         let expanded = module
-            .begin_compute()
+            .begin_compute([(vertices, Access::ComputeWrite), (placed, Access::ComputeRead)])
             .with_name("expand")
             .bind_compute_pipeline(self.expand)
-            .write(vertices)
-            .read(placed)
             .push_constants_from(push)
             .push_constant_address(INSTANCES_AT, instances)
             .push_constant_address(VERTICES_AT, vertices)
@@ -180,7 +178,7 @@ impl Example for Compute {
         let attachment = module.clear(recording.swapchain_image, BACKGROUND);
 
         let drawn = module
-            .begin_rendering(&[attachment])
+            .begin_rendering([(attachment, Access::ColorRW)])
             .with_name("computed geometry")
             .bind_graphics_pipeline(self.draw)
             .set_viewport(0, Rect2D::framebuffer())
@@ -291,16 +289,13 @@ mod tests {
         let vertices = module.transient_buffer(&transient("computed vertices").with_size(3 * VERTEX_SIZE));
 
         let placed = module
-            .begin_compute()
-            .write(instances)
+            .begin_compute([(instances, Access::ComputeWrite)])
             .push_constant_address(INSTANCES_AT, instances)
             .push_constant_address(VERTICES_AT, vertices)
             .dispatch(1, 1, 1)
             .end_compute();
         let expanded = module
-            .begin_compute()
-            .write(vertices)
-            .read(placed)
+            .begin_compute([(vertices, Access::ComputeWrite), (placed, Access::ComputeRead)])
             .dispatch(1, 1, 1)
             .end_compute();
 
@@ -310,7 +305,7 @@ mod tests {
         );
         let target = module.clear(target, BACKGROUND);
         let end = module
-            .begin_rendering(&[target])
+            .begin_rendering([(target, Access::ColorRW)])
             .bind_vertex_buffer(0, expanded)
             .draw(3, 1)
             .end_rendering();
@@ -355,7 +350,7 @@ mod tests {
             .iter()
             .rev()
             .find_map(|(_, ir)| match ir {
-                IR::BeginCompute { declared_access, .. } => Some(declared_access),
+                IR::BeginCompute { attachments, .. } => Some(attachments),
                 _ => None,
             })
             .expect("the compute regions should be present");

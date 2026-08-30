@@ -5,7 +5,7 @@
 //! both set as dynamic state and aimed at a corner of the framebuffer.
 
 use ash::vk;
-use vir::{BlendPreset, ClearValue, DynamicStateFlags, PipelineId, RasterizationState, Rect2D, ValueId};
+use vir::{Access, BlendPreset, ClearValue, DynamicStateFlags, PipelineId, RasterizationState, Rect2D, ValueId};
 use vir_examples::{Example, Frame, Recording, Setup, graphics_pipeline};
 
 const VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/triangle.vert.spv"));
@@ -83,7 +83,7 @@ impl Example for Triangle {
         let pipeline = self.pipeline;
 
         let sliding_tri = module
-            .begin_rendering(&[attachment])
+            .begin_rendering([(attachment, Access::ColorRW)])
             .with_name("sliding triangle")
             .bind_graphics_pipeline(pipeline)
             .set_viewport(0, Rect2D::framebuffer())
@@ -102,7 +102,7 @@ impl Example for Triangle {
         let drawn = module.set_condition(
             has_corner_triangle,
             |m| {
-                m.begin_rendering(&[sliding_tri])
+                m.begin_rendering([(sliding_tri, Access::ColorRW)])
                     .with_name("corner triangle")
                     .bind_graphics_pipeline(pipeline)
                     .set_dynamic_state(DynamicStateFlags::Viewport | DynamicStateFlags::Scissor)

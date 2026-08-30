@@ -211,12 +211,9 @@ fn blank_line(out: &mut String) {
 
 fn pass_header(program: &Symbols, ir: &IR) -> String {
     let (targeted, name) = match ir {
-        IR::BeginRendering {
-            color_attachments,
-            name,
-            ..
-        } => (color_attachments.clone(), name),
-        IR::BeginCompute { declared_access, name } => (declared_access.iter().map(|(id, _)| *id).collect(), name),
+        IR::BeginRendering { attachments, name, .. } | IR::BeginCompute { attachments, name } => {
+            (attachments.iter().map(|(id, _)| *id).collect::<Vec<_>>(), name)
+        },
         _ => return String::new(),
     };
 
@@ -249,7 +246,7 @@ mod tests {
     use ash::{vk, vk::Handle};
 
     use super::super::analysis::Declared;
-    use crate::{BlendPreset, Image, ImageAttachment, ImageInfo, Module, PipelineId, Rect2D, Unchecked};
+    use crate::{Access, BlendPreset, Image, ImageAttachment, ImageInfo, Module, PipelineId, Rect2D, Unchecked};
 
     const FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
 
@@ -282,7 +279,7 @@ mod tests {
         module.set_name(target, "target");
 
         let rendered = module
-            .begin_rendering(&[target])
+            .begin_rendering([(target, Access::ColorRW)])
             .with_name("triangle")
             .bind_graphics_pipeline(PipelineId(0))
             .set_viewport(0, Rect2D::framebuffer())
@@ -323,7 +320,7 @@ mod tests {
         let dump = dump_of_one_pass();
         assert!(dump.contains("= const \"target\""), "{dump}");
         assert!(dump.contains("image %") && dump.contains("(\"target\")"), "{dump}");
-        assert!(dump.contains("color=[%"), "{dump}");
+        assert!(dump.contains("attachments=[%"), "{dump}");
         assert!(dump.contains("(target)"), "{dump}");
     }
 
@@ -339,10 +336,9 @@ mod tests {
         module.set_name(target, "storage");
 
         let end = module
-            .begin_compute()
+            .begin_compute([(target, crate::Access::ComputeWrite)])
             .with_name("blur")
             .bind_compute_pipeline(PipelineId(0))
-            .write(target)
             .push_constants(&1u32)
             .dispatch(8, 4, 1)
             .end_compute();
@@ -407,7 +403,7 @@ mod tests {
         let line = line!() + 1;
         let body = module.declare_callback_var("draws");
         let end = module
-            .begin_rendering(&[target])
+            .begin_rendering([(target, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .record_from(body)
             .end_rendering();
@@ -495,7 +491,7 @@ mod tests {
         module.set_name(texture, "source");
 
         let end = module
-            .begin_rendering(&[attachment])
+            .begin_rendering([(attachment, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .bind_texture(1, 2, texture, vk::Sampler::from_raw(7))
             .draw(3, 1)

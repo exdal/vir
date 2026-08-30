@@ -9,6 +9,7 @@ use egui::{
     epaint::{ClippedPrimitive, ImageData, ImageDelta, Primitive, Vertex as EguiVertex},
 };
 use vir::{
+    Access,
     AllocatorKind,
     BlendPreset,
     Buffer,
@@ -345,7 +346,7 @@ impl EguiPass {
         let drawn = module.set_condition(
             slots.has_draws,
             |m| {
-                m.begin_rendering(&[target])
+                m.begin_rendering([(target, Access::ColorRW)])
                     .with_name("egui")
                     .bind_graphics_pipeline(pipeline)
                     .set_dynamic_state(DynamicStateFlags::Viewport | DynamicStateFlags::Scissor)

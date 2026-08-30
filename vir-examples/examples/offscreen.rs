@@ -12,7 +12,7 @@
 //! compiled again.
 
 use ash::vk;
-use vir::{BlendPreset, ClearValue, ImageInfo, PipelineId, RasterizationState, Rect2D, ValueId, clear};
+use vir::{Access, BlendPreset, ClearValue, ImageInfo, PipelineId, RasterizationState, Rect2D, ValueId, clear};
 use vir_examples::{Example, Frame, Recording, Setup, graphics_pipeline};
 
 const VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/triangle.vert.spv"));
@@ -125,7 +125,7 @@ impl Example for Offscreen {
         );
 
         let attachment = module
-            .begin_rendering(&[attachment])
+            .begin_rendering([(attachment, Access::ColorRW)])
             .with_name("offscreen triangle")
             .bind_graphics_pipeline(self.pipeline)
             .set_viewport(0, Rect2D::framebuffer())

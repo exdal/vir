@@ -274,10 +274,8 @@ pub enum IR {
     },
 
     BeginRendering {
-        color_attachments: Vec<ValueId>,
-        depth_attachment: ValueId,
+        attachments: Vec<(ValueId, ValueId)>,
         render_area: ValueId,
-        declared_access: Vec<(ValueId, ValueId)>,
         name: ValueId,
     },
     BindPipeline {
@@ -340,7 +338,7 @@ pub enum IR {
         pass: ValueId,
     },
     BeginCompute {
-        declared_access: Vec<(ValueId, ValueId)>,
+        attachments: Vec<(ValueId, ValueId)>,
         name: ValueId,
     },
     Dispatch {
@@ -407,16 +405,7 @@ pub fn underlying_object(ir: &IR) -> UnderlyingObject {
         IR::CopyBufferToImage { image, .. } => UnderlyingObject::Forwards(*image),
         IR::Acquire { resource, .. } | IR::Release { resource, .. } => UnderlyingObject::Forwards(*resource),
 
-        IR::BeginRendering {
-            color_attachments,
-            depth_attachment,
-            ..
-        } => color_attachments
-            .first()
-            .copied()
-            .or_else(|| depth_attachment.is_valid().then_some(*depth_attachment))
-            .map_or(UnderlyingObject::None, UnderlyingObject::Forwards),
-        IR::BeginCompute { declared_access, .. } => match declared_access.first() {
+        IR::BeginRendering { attachments, .. } | IR::BeginCompute { attachments, .. } => match attachments.first() {
             Some((first, _)) => UnderlyingObject::Forwards(*first),
             None => UnderlyingObject::None,
         },
@@ -661,30 +650,24 @@ impl IR {
             },
 
             IR::BeginRendering {
-                color_attachments,
-                depth_attachment,
+                attachments,
                 render_area,
-                declared_access,
                 name,
                 ..
             } => {
-                color_attachments.iter().copied().for_each(&mut visit);
-                if depth_attachment.is_valid() {
-                    visit(*depth_attachment);
-                }
-                if render_area.is_valid() {
-                    visit(*render_area);
-                }
-                declared_access.iter().for_each(|(resource, access)| {
+                attachments.iter().for_each(|(resource, access)| {
                     visit(*resource);
                     visit(*access);
                 });
+                if render_area.is_valid() {
+                    visit(*render_area);
+                }
                 if name.is_valid() {
                     visit(*name);
                 }
             },
-            IR::BeginCompute { declared_access, name } => {
-                declared_access.iter().for_each(|(resource, access)| {
+            IR::BeginCompute { attachments, name } => {
+                attachments.iter().for_each(|(resource, access)| {
                     visit(*resource);
                     visit(*access);
                 });
@@ -818,28 +801,8 @@ impl IR {
                 fixed(*image, Access::CopyWrite);
             },
 
-            IR::BeginRendering {
-                color_attachments,
-                depth_attachment,
-                declared_access,
-                ..
-            } => {
-                for attachment in color_attachments {
-                    fixed(*attachment, Access::ColorRW);
-                }
-                if depth_attachment.is_valid() {
-                    let depth = *depth_attachment;
-                    fixed(depth, Access::DepthStencilRW);
-                }
-                for (resource, access) in declared_access {
-                    visit(ResourceSideEffect {
-                        resource: *resource,
-                        access: SideEffectAccess::Operand(*access),
-                    });
-                }
-            },
-            IR::BeginCompute { declared_access, .. } => {
-                for (resource, access) in declared_access {
+            IR::BeginRendering { attachments, .. } | IR::BeginCompute { attachments, .. } => {
+                for (resource, access) in attachments {
                     visit(ResourceSideEffect {
                         resource: *resource,
                         access: SideEffectAccess::Operand(*access),
@@ -1401,38 +1364,25 @@ impl IR {
                 }
             },
             IR::BeginRendering {
-                color_attachments,
-                depth_attachment,
+                attachments,
                 render_area,
-                declared_access,
                 name,
             } => {
                 write!(
                     f,
-                    "begin_rendering{} color=[{}]",
+                    "begin_rendering{} attachments=[{}]",
                     fmt_name(p, name),
-                    fmt_list(color_attachments, |id| p.operand(*id).to_string())
+                    fmt_list(attachments, |(id, access)| format!(
+                        "{}:{}",
+                        p.operand(*id),
+                        p.operand(*access)
+                    ))
                 )?;
-                if depth_attachment.is_valid() {
-                    let depth = *depth_attachment;
-                    write!(f, " depth={}", p.operand(depth))?;
-                }
                 if render_area.is_valid() {
                     let area = *render_area;
                     write!(f, " area={}", p.operand(area))?;
                 }
-                match declared_access.is_empty() {
-                    true => Ok(()),
-                    false => write!(
-                        f,
-                        " declared_access=[{}]",
-                        fmt_list(declared_access, |(id, access)| format!(
-                            "{}:{}",
-                            p.operand(*id),
-                            p.operand(*access)
-                        ))
-                    ),
-                }
+                Ok(())
             },
             IR::BindPipeline {
                 pipeline, bind_point, ..
@@ -1567,12 +1517,12 @@ impl IR {
                 write!(f, "call.opaque body={} {}", p.operand(*body), fmt_pipeline(pipeline))
             },
             IR::EndRendering { .. } => write!(f, "end_rendering"),
-            IR::BeginCompute { declared_access, name } => {
+            IR::BeginCompute { attachments, name } => {
                 write!(
                     f,
-                    "begin_compute{} declared_access=[{}]",
+                    "begin_compute{} attachments=[{}]",
                     fmt_name(p, name),
-                    fmt_list(declared_access, |(id, access)| format!(
+                    fmt_list(attachments, |(id, access)| format!(
                         "{}:{}",
                         p.operand(*id),
                         p.operand(*access)
@@ -1693,6 +1643,8 @@ mod tests {
             11 => Access::ComputeRead,
             12 => Access::ComputeWrite,
             13 => Access::VertexSampled,
+            14 => Access::ColorRW,
+            15 => Access::DepthStencilRW,
             _ => panic!("{id} does not name a test access"),
         }
     }
@@ -1714,25 +1666,21 @@ mod tests {
                 region: None,
             },
             IR::BeginRendering {
-                color_attachments: vec![value(1)],
-                depth_attachment: value(2),
+                attachments: vec![(value(1), value(14)), (value(2), value(15))],
                 render_area: ValueId::INVALID,
-                declared_access: Vec::new(),
                 name: ValueId::INVALID,
             },
             IR::BeginRendering {
-                color_attachments: vec![value(1)],
-                depth_attachment: ValueId::INVALID,
+                attachments: vec![(value(1), value(14)), (value(2), value(10))],
                 render_area: ValueId::INVALID,
-                declared_access: vec![(value(2), value(10))],
                 name: ValueId::INVALID,
             },
             IR::BeginCompute {
-                declared_access: vec![(value(1), value(11))],
+                attachments: vec![(value(1), value(11))],
                 name: ValueId::INVALID,
             },
             IR::BeginCompute {
-                declared_access: vec![(value(1), value(11)), (value(2), value(12))],
+                attachments: vec![(value(1), value(11)), (value(2), value(12))],
                 name: ValueId::INVALID,
             },
             IR::WriteDescriptor {
@@ -1828,14 +1776,12 @@ mod tests {
                 name: ValueId::INVALID,
             },
             IR::BeginRendering {
-                color_attachments: Vec::new(),
-                depth_attachment: ValueId::INVALID,
+                attachments: vec![(value(1), access)],
                 render_area: ValueId::INVALID,
-                declared_access: vec![(value(1), access)],
                 name: ValueId::INVALID,
             },
             IR::BeginCompute {
-                declared_access: vec![(value(1), access)],
+                attachments: vec![(value(1), access)],
                 name: ValueId::INVALID,
             },
             IR::WriteDescriptor {

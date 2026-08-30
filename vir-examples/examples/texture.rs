@@ -180,7 +180,7 @@ impl Example for Texture {
         module.set_name(texture, "sample texture");
 
         Ok(module
-            .begin_rendering(&[target])
+            .begin_rendering([(target, Access::ColorRW)])
             .with_name("textured quad")
             .bind_graphics_pipeline(self.pipeline)
             .set_viewport(0, Rect2D::framebuffer())

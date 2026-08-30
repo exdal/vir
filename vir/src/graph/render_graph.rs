@@ -654,6 +654,32 @@ impl RenderGraph {
         }
     }
 
+    fn resource_elements(&self, resource: &ValueId) -> Vec<ValueId> {
+        fn append(graph: &RenderGraph, resource: ValueId, result: &mut Vec<ValueId>) {
+            let mut current = resource;
+            for _ in 0..ir::MAX_RESOLVE_DEPTH {
+                match graph.get_value(&current) {
+                    Value::Reference(next) => current = *next,
+                    Value::Slice(elements) => {
+                        for element in elements {
+                            append(graph, *element, result);
+                        }
+                        return;
+                    },
+                    _ => {
+                        result.push(resource);
+                        return;
+                    },
+                }
+            }
+            result.push(resource);
+        }
+
+        let mut result = Vec::new();
+        append(self, *resource, &mut result);
+        result
+    }
+
     fn get_value(&self, value_id: &ValueId) -> &Value { self.values.get(value_id.0 as usize).unwrap() }
 
     fn resolve_id(&self, value_id: &ValueId) -> ValueId {
@@ -1468,29 +1494,39 @@ impl RenderGraph {
                 );
             },
             IR::BeginRendering {
-                color_attachments,
-                depth_attachment,
+                attachments,
                 render_area,
                 ..
             } => {
                 self.ensure_batch(ctx, allocator)?;
                 self.open_descriptors();
 
-                let attachments = color_attachments
-                    .iter()
-                    .map(|id| self.get::<ImageAttachment>(id))
-                    .collect::<Vec<_>>();
-                let depth = depth_attachment
-                    .is_valid()
-                    .then(|| self.get::<ImageAttachment>(depth_attachment));
+                let mut color_attachments = Vec::new();
+                let mut depth_attachment = None;
+                for (resource, access) in attachments {
+                    let access = self.get::<Access>(access);
+                    if access.intersects(Access::ColorRW) {
+                        color_attachments.extend(
+                            self.resource_elements(resource)
+                                .into_iter()
+                                .map(|attachment| (self.get::<ImageAttachment>(&attachment), access)),
+                        );
+                    }
+                    if depth_attachment.is_none()
+                        && access.intersects(Access::DepthStencilRW)
+                        && let Some(attachment) = self.resource_elements(resource).into_iter().next()
+                    {
+                        depth_attachment = Some((self.get::<ImageAttachment>(&attachment), access));
+                    }
+                }
 
                 let extent = match render_area.is_valid() {
                     true => self.get::<vk::Extent2D>(render_area),
                     // a depth-only region sizes itself off the depth attachment instead
-                    false => attachments
+                    false => color_attachments
                         .first()
-                        .or(depth.as_ref())
-                        .map(|attachment| vk::Extent2D {
+                        .or(depth_attachment.as_ref())
+                        .map(|(attachment, _)| vk::Extent2D {
                             width: attachment.extent().width,
                             height: attachment.extent().height,
                         })
@@ -1500,21 +1536,21 @@ impl RenderGraph {
                 let render_area = vk::Rect2D::default().extent(extent);
                 self.render_area = render_area;
 
-                let attachment_infos = attachments
+                let attachment_infos = color_attachments
                     .iter()
-                    .map(|attachment| {
+                    .map(|(attachment, access)| {
                         vk::RenderingAttachmentInfo::default()
                             .image_view(attachment.image_view())
-                            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                            .image_layout((*access).into())
                             .load_op(vk::AttachmentLoadOp::LOAD)
                             .store_op(vk::AttachmentStoreOp::STORE)
                     })
                     .collect::<Vec<_>>();
 
-                let depth_info = depth.as_ref().map(|attachment| {
+                let depth_info = depth_attachment.as_ref().map(|(attachment, access)| {
                     vk::RenderingAttachmentInfo::default()
                         .image_view(attachment.image_view())
-                        .image_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                        .image_layout((*access).into())
                         .load_op(vk::AttachmentLoadOp::LOAD)
                         .store_op(vk::AttachmentStoreOp::STORE)
                 });
@@ -1522,12 +1558,8 @@ impl RenderGraph {
                 self.batch()?
                     .begin_rendering(render_area, &attachment_infos, depth_info.as_ref());
 
-                match color_attachments
-                    .first()
-                    .copied()
-                    .or_else(|| depth_attachment.is_valid().then_some(*depth_attachment))
-                {
-                    Some(first) => self.set_value(value_id, Value::Reference(first)),
+                match attachments.first() {
+                    Some((first, _)) => self.set_value(value_id, Value::Reference(*first)),
                     None => self.set_value(value_id, Value::None),
                 }
             },
@@ -1675,10 +1707,10 @@ impl RenderGraph {
                 self.batch()?.end_rendering();
                 self.open_descriptors();
             },
-            IR::BeginCompute { declared_access, .. } => {
+            IR::BeginCompute { attachments, .. } => {
                 self.ensure_batch(ctx, allocator)?;
                 self.open_descriptors();
-                match declared_access.first() {
+                match attachments.first() {
                     Some((first, _)) => self.set_value(value_id, Value::Reference(*first)),
                     None => self.set_value(value_id, Value::None),
                 }

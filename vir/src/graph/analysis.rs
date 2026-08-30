@@ -265,7 +265,7 @@ mod tests {
         let texture = target(&mut module);
 
         module
-            .begin_rendering(&[attachment])
+            .begin_rendering([(attachment, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(0));
         writes(&mut module, texture);
         let end = module.draw(3, 1).end_rendering();
@@ -310,7 +310,7 @@ mod tests {
         let attachment = target(&mut module);
         let texture = target(&mut module);
         let end = module
-            .begin_rendering(&[attachment])
+            .begin_rendering([(attachment, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .draw(3, 1)
             .bind_texture(0, 0, texture, a_sampler())
@@ -369,13 +369,13 @@ mod tests {
         let attachment = target(&mut module);
         let texture = target(&mut module);
         let first = module
-            .begin_rendering(&[attachment])
+            .begin_rendering([(attachment, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .bind_texture(0, 0, texture, a_sampler())
             .draw(3, 1)
             .end_rendering();
         let end = module
-            .begin_rendering(&[first])
+            .begin_rendering([(first, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .draw(3, 1)
             .end_rendering();

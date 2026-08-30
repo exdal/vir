@@ -730,44 +730,56 @@ impl Module {
         self.emit(IR::Clear { attachment, color })
     }
 
-    pub fn begin_rendering(&mut self, color_attachments: &[ValueId]) -> &mut Self {
-        self.begin_rendering_with(color_attachments, None, None)
+    fn lower_attachments(
+        &mut self, attachments: impl IntoIterator<Item = (ValueId, Access)>,
+    ) -> Vec<(ValueId, ValueId)> {
+        let mut merged = Vec::<(ValueId, Access)>::new();
+        for (resource, access) in attachments {
+            match merged.iter_mut().find(|(seen, _)| *seen == resource) {
+                Some((_, merged_access)) => *merged_access |= access,
+                None => merged.push((resource, access)),
+            }
+        }
+
+        merged
+            .into_iter()
+            .map(|(resource, access)| (resource, self.lower_access(access)))
+            .collect()
     }
 
-    pub fn begin_rendering_depth(&mut self, color_attachments: &[ValueId], depth: ValueId) -> &mut Self {
-        self.begin_rendering_with(color_attachments, Some(depth), None)
+    /// Opens a rendering pass over its complete explicit resource-access list. Color and depth
+    /// accesses become Vulkan rendering attachments; every other entry is synchronization-only.
+    /// A resource-array value applies its access to every element.
+    pub fn begin_rendering(&mut self, attachments: impl IntoIterator<Item = (ValueId, Access)>) -> &mut Self {
+        self.begin_rendering_with(attachments, None)
     }
 
-    pub fn begin_rendering_area(&mut self, color_attachments: &[ValueId], render_area: vk::Extent2D) -> &mut Self {
-        let render_area = self.lower_constant(ir::Constant::Extent2D(render_area));
-        self.begin_rendering_with(color_attachments, None, Some(render_area))
-    }
-
-    pub fn begin_rendering_depth_area(
-        &mut self, color_attachments: &[ValueId], depth: ValueId, render_area: vk::Extent2D,
+    pub fn begin_rendering_area(
+        &mut self, attachments: impl IntoIterator<Item = (ValueId, Access)>, render_area: vk::Extent2D,
     ) -> &mut Self {
         let render_area = self.lower_constant(ir::Constant::Extent2D(render_area));
-        self.begin_rendering_with(color_attachments, Some(depth), Some(render_area))
+        self.begin_rendering_with(attachments, Some(render_area))
     }
 
     fn begin_rendering_with(
-        &mut self, color_attachments: &[ValueId], depth_attachment: Option<ValueId>, render_area: Option<ValueId>,
+        &mut self, attachments: impl IntoIterator<Item = (ValueId, Access)>, render_area: Option<ValueId>,
     ) -> &mut Self {
-        let depth_attachment = depth_attachment.unwrap_or(ValueId::INVALID);
+        let attachments = self.lower_attachments(attachments);
         let render_area = render_area.unwrap_or(ValueId::INVALID);
         let id = self.emit(IR::BeginRendering {
-            color_attachments: color_attachments.to_vec(),
-            depth_attachment,
+            attachments,
             render_area,
-            declared_access: Vec::new(),
             name: ValueId::INVALID,
         });
         self.open_pass(PassKind::Rendering, id)
     }
 
-    pub fn begin_compute(&mut self) -> &mut Self {
+    /// Opens a compute pass over its complete explicit resource-access list. A resource-array
+    /// value applies its access to every element.
+    pub fn begin_compute(&mut self, attachments: impl IntoIterator<Item = (ValueId, Access)>) -> &mut Self {
+        let attachments = self.lower_attachments(attachments);
         let id = self.emit(IR::BeginCompute {
-            declared_access: Vec::new(),
+            attachments,
             name: ValueId::INVALID,
         });
         self.open_pass(PassKind::Compute, id)
@@ -907,27 +919,21 @@ impl Module {
                         stack.push(*buffer);
                     },
                     IR::BeginRendering {
-                        color_attachments,
-                        depth_attachment,
+                        attachments,
                         render_area,
-                        declared_access,
                         name,
                         ..
                     } => {
                         if name.is_valid() {
                             stack.push(*name);
                         }
-                        declared_access.iter().rev().for_each(|(resource, access)| {
+                        attachments.iter().rev().for_each(|(resource, access)| {
                             stack.push(*access);
                             stack.push(*resource);
                         });
                         if render_area.is_valid() {
                             stack.push(*render_area);
                         }
-                        if depth_attachment.is_valid() {
-                            stack.push(*depth_attachment);
-                        }
-                        color_attachments.iter().rev().for_each(|v| stack.push(*v));
                     },
                     IR::BindPipeline { pass, .. } => {
                         stack.push(*pass);
@@ -999,11 +1005,11 @@ impl Module {
                     IR::EndRendering { pass } => {
                         stack.push(*pass);
                     },
-                    IR::BeginCompute { declared_access, name } => {
+                    IR::BeginCompute { attachments, name } => {
                         if name.is_valid() {
                             stack.push(*name);
                         }
-                        declared_access.iter().rev().for_each(|(resource, access)| {
+                        attachments.iter().rev().for_each(|(resource, access)| {
                             stack.push(*access);
                             stack.push(*resource);
                         });
@@ -1279,7 +1285,7 @@ impl Module {
             }
         }
 
-        // which declared_access are still named past each label, walked backwards so every label
+        // which pass attachments are still named past each label, walked backwards so every label
         // sees what comes after it. a selection is the only construct there is, so program
         // order is the whole of what can follow a merge
         let mut live_after: HashMap<LabelId, HashSet<ValueId>> = HashMap::new();
@@ -1533,39 +1539,26 @@ impl Module {
                     transition!(*image, write_id, Access::CopyWrite);
                 },
 
-                IR::BeginRendering {
-                    color_attachments,
-                    depth_attachment,
-                    declared_access,
-                    ..
-                } => {
+                IR::BeginRendering { attachments, .. } => {
                     for (image, access) in region_images.get(&value_id).cloned().into_iter().flatten() {
                         let sampled_id = read_access!(access);
                         transition!(image, sampled_id, access);
                     }
 
-                    for (resource, access_id) in declared_access {
+                    for (resource, access_id) in attachments {
                         let access = resolve_access(access_id);
-                        if self.is_buffer(*resource) {
-                            buffer_barrier!(self.resource_root(*resource), access);
-                            continue;
+                        for resource in self.resource_elements(*resource) {
+                            if self.is_buffer(resource) {
+                                buffer_barrier!(self.resource_root(resource), access);
+                                continue;
+                            }
+
+                            let access_id = match access.writes() {
+                                true => emit_access!(access),
+                                false => read_access!(access),
+                            };
+                            transition!(resource, access_id, access);
                         }
-
-                        let access_id = match access.writes() {
-                            true => emit_access!(access),
-                            false => read_access!(access),
-                        };
-                        transition!(*resource, access_id, access);
-                    }
-
-                    let access_id = emit_access!(Access::ColorRW);
-                    for attachment in color_attachments {
-                        transition!(*attachment, access_id, Access::ColorRW);
-                    }
-
-                    if depth_attachment.is_valid() {
-                        let depth_id = emit_access!(Access::DepthStencilRW);
-                        transition!(*depth_attachment, depth_id, Access::DepthStencilRW);
                     }
 
                     for (buffer, access) in region_buffers.get(&value_id).cloned().into_iter().flatten() {
@@ -1573,24 +1566,26 @@ impl Module {
                     }
                 },
 
-                IR::BeginCompute { declared_access, .. } => {
+                IR::BeginCompute { attachments, .. } => {
                     for (image, access) in region_images.get(&value_id).cloned().into_iter().flatten() {
                         let sampled_id = read_access!(access);
                         transition!(image, sampled_id, access);
                     }
 
-                    for (resource, access_id) in declared_access {
+                    for (resource, access_id) in attachments {
                         let access = resolve_access(access_id);
-                        if self.is_buffer(*resource) {
-                            buffer_barrier!(self.resource_root(*resource), access);
-                            continue;
-                        }
+                        for resource in self.resource_elements(*resource) {
+                            if self.is_buffer(resource) {
+                                buffer_barrier!(self.resource_root(resource), access);
+                                continue;
+                            }
 
-                        let access_id = match access.writes() {
-                            true => emit_access!(access),
-                            false => read_access!(access),
-                        };
-                        transition!(*resource, access_id, access);
+                            let access_id = match access.writes() {
+                                true => emit_access!(access),
+                                false => read_access!(access),
+                            };
+                            transition!(resource, access_id, access);
+                        }
                     }
                 },
 
@@ -1624,7 +1619,41 @@ impl Module {
     /// The roots an instruction takes a barrier on, which is the whole of what reads the
     /// state a join records.
     fn resource_uses(&self, ir: &IR, uses: &mut Vec<ValueId>) {
-        ir.visit_resource_side_effects(|effect| uses.push(self.resource_root(effect.resource)));
+        ir.visit_resource_side_effects(|effect| {
+            uses.extend(
+                self.resource_elements(effect.resource)
+                    .into_iter()
+                    .map(|resource| self.resource_root(resource)),
+            );
+        });
+    }
+
+    fn resource_elements(&self, resource: ValueId) -> Vec<ValueId> {
+        fn append(module: &Module, resource: ValueId, result: &mut Vec<ValueId>) {
+            let mut current = resource;
+            for _ in 0..ir::MAX_RESOLVE_DEPTH {
+                let Some(instruction) = module.instructions.get(current.0 as usize) else {
+                    break;
+                };
+                match instruction {
+                    IR::Array { elements, .. } => {
+                        for element in elements {
+                            append(module, *element, result);
+                        }
+                        return;
+                    },
+                    _ => match ir::underlying_object(instruction) {
+                        ir::UnderlyingObject::Forwards(next) => current = next,
+                        _ => break,
+                    },
+                }
+            }
+            result.push(resource);
+        }
+
+        let mut result = Vec::new();
+        append(self, resource, &mut result);
+        result
     }
 
     fn resource_root(&self, id: ValueId) -> ValueId {
@@ -1683,12 +1712,14 @@ impl Module {
                     .iter()
                     .for_each(|b| used(b, vk::BufferUsageFlags::VERTEX_BUFFER)),
                 IR::BindIndexBuffer { buffer, .. } => used(buffer, vk::BufferUsageFlags::INDEX_BUFFER),
-                IR::BeginRendering { declared_access, .. } | IR::BeginCompute { declared_access, .. } => {
-                    for (resource, access) in declared_access {
-                        if self.is_buffer(*resource)
-                            && let Some(access) = access_of(access)
-                        {
-                            used(resource, vk::BufferUsageFlags::from(access));
+                IR::BeginRendering { attachments, .. } | IR::BeginCompute { attachments, .. } => {
+                    for (resource, access) in attachments {
+                        for resource in self.resource_elements(*resource) {
+                            if self.is_buffer(resource)
+                                && let Some(access) = access_of(access)
+                            {
+                                used(&resource, vk::BufferUsageFlags::from(access));
+                            }
                         }
                     }
                 },
@@ -1821,17 +1852,28 @@ impl Module {
         for (value_id, ir) in nodes.iter_mut() {
             match ir {
                 IR::BeginRendering {
-                    color_attachments,
-                    depth_attachment,
+                    attachments,
                     render_area,
                     ..
                 } => {
                     let mut rendering = RenderingState::default();
                     let mut attachment_extent = None;
                     let mut samples_from_color = false;
+                    let mut color_attachments = Vec::new();
+                    let mut depth_attachment = None;
 
-                    for (index, attachment) in color_attachments.iter().enumerate() {
-                        let Some(image) = self.resolve_image(*attachment) else {
+                    for (resource, access) in attachments.iter() {
+                        let access = self.resolve_access(*access);
+                        if access.intersects(Access::ColorRW) {
+                            color_attachments.extend(self.resource_elements(*resource));
+                        }
+                        if depth_attachment.is_none() && access.intersects(Access::DepthStencilRW) {
+                            depth_attachment = self.resource_elements(*resource).into_iter().next();
+                        }
+                    }
+
+                    for (index, attachment) in color_attachments.into_iter().enumerate() {
+                        let Some(image) = self.resolve_image(attachment) else {
                             tracing::warn!(%attachment, "cannot infer attachment type; pipelines may not match");
                             continue;
                         };
@@ -1853,8 +1895,8 @@ impl Module {
                         rendering.color_formats.push(image.format);
                     }
 
-                    if depth_attachment.is_valid() {
-                        match self.resolve_image(*depth_attachment) {
+                    if let Some(depth_attachment) = depth_attachment {
+                        match self.resolve_image(depth_attachment) {
                             Some(image) => {
                                 rendering.depth_format = Some(image.format);
 
@@ -2301,60 +2343,6 @@ impl Module {
 
     pub fn end_rendering(&mut self) -> ValueId { self.end_pass(PassKind::Rendering, |pass| IR::EndRendering { pass }) }
 
-    pub fn access(&mut self, resource: ValueId, access: Access) -> &mut Self {
-        let Some(open) = self.ongoing_pass else {
-            tracing::error!(%resource, "an access was declared outside of a pass; it is dropped");
-            return self;
-        };
-
-        let existing = match self.instructions.get(open.begin.0 as usize) {
-            Some(IR::BeginRendering { declared_access, .. } | IR::BeginCompute { declared_access, .. }) => {
-                declared_access
-                    .iter()
-                    .find_map(|(id, access)| (*id == resource).then_some(*access))
-            },
-            _ => return self,
-        };
-        let merged = existing.map_or(access, |existing| self.resolve_access(existing) | access);
-        let access = self.lower_access(merged);
-
-        let declared = match self.instructions.get_mut(open.begin.0 as usize) {
-            Some(IR::BeginRendering { declared_access, .. } | IR::BeginCompute { declared_access, .. }) => {
-                declared_access
-            },
-            _ => return self,
-        };
-
-        match declared.iter_mut().find(|(id, _)| *id == resource) {
-            Some((_, slot)) => *slot = access,
-            None => declared.push((resource, access)),
-        }
-
-        self
-    }
-
-    /// [`Self::access`] for the compute accesses, which only a compute pass reaches anything by.
-    fn compute_access(&mut self, resource: ValueId, access: Access) -> &mut Self {
-        if self.ongoing_pass.is_some_and(|open| open.kind != PassKind::Compute) {
-            tracing::error!(%resource, "a compute access was declared in a rendering pass; it is dropped");
-            return self;
-        }
-
-        self.access(resource, access)
-    }
-
-    pub fn read(&mut self, resource: ValueId) -> &mut Self { self.compute_access(resource, Access::ComputeRead) }
-
-    pub fn write(&mut self, resource: ValueId) -> &mut Self { self.compute_access(resource, Access::ComputeWrite) }
-
-    pub fn read_write(&mut self, resource: ValueId) -> &mut Self { self.compute_access(resource, Access::ComputeRW) }
-
-    pub fn sample_image(&mut self, image: ValueId) -> &mut Self { self.compute_access(image, Access::ComputeSampled) }
-
-    pub fn read_uniform(&mut self, buffer: ValueId) -> &mut Self {
-        self.compute_access(buffer, Access::ComputeUniformRead)
-    }
-
     fn dispatch_size(&mut self, size: ir::DispatchSize) -> &mut Self {
         self.chain(Some(PassKind::Compute), "dispatch", |pass| IR::Dispatch {
             pass,
@@ -2626,7 +2614,7 @@ mod tests {
         let body = module.declare_callback_var("draws");
 
         let end = module
-            .begin_rendering(&[target])
+            .begin_rendering([(target, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(3))
             .set_primitive_topology(vk::PrimitiveTopology::TRIANGLE_STRIP)
             .broadcast_color_blend(BlendPreset::AlphaBlend)
@@ -2660,9 +2648,8 @@ mod tests {
 
         let cleared = module.clear(sampled, clear::f32::BLACK);
         let drawn = module
-            .begin_rendering(&[swapchain])
+            .begin_rendering([(swapchain, Access::ColorRW), (cleared, Access::FragmentSampled)])
             .bind_graphics_pipeline(PipelineId(0))
-            .access(cleared, Access::FragmentSampled)
             .record_from(body)
             .end_rendering();
         let end = module.present(drawn);
@@ -2702,7 +2689,7 @@ mod tests {
         let body = module.declare_callback_var("draws");
 
         let end = module
-            .begin_rendering(&[target])
+            .begin_rendering([(target, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .record_from(body)
             .end_rendering();
@@ -2735,7 +2722,7 @@ mod tests {
         let target = module.transient_image(&transient_info());
 
         let rendered = module
-            .begin_rendering(&[target])
+            .begin_rendering([(target, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .draw(3, 1)
             .end_rendering();
@@ -2860,7 +2847,7 @@ mod tests {
         let buffer = module.import_buffer(&Buffer::default(), Access::HostWrite);
 
         let end = module
-            .begin_rendering(&[attachment])
+            .begin_rendering([(attachment, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .bind_vertex_buffer(0, buffer)
             .draw(3, 1)
@@ -2942,15 +2929,14 @@ mod tests {
         ));
 
         let written = module
-            .begin_compute()
+            .begin_compute([(scratch, Access::ComputeWrite)])
             .bind_compute_pipeline(PipelineId(0))
-            .write(scratch)
             .push_constant_address(0, scratch)
             .dispatch(1, 1, 1)
             .end_compute();
 
         let end = module
-            .begin_rendering(&[attachment])
+            .begin_rendering([(attachment, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .bind_vertex_buffer(0, written)
             .draw(3, 1)
@@ -2986,15 +2972,13 @@ mod tests {
         ));
 
         let written = module
-            .begin_compute()
+            .begin_compute([(scratch, Access::ComputeWrite)])
             .bind_compute_pipeline(PipelineId(0))
-            .write(scratch)
             .dispatch(1, 1, 1)
             .end_compute();
         let end = module
-            .begin_compute()
+            .begin_compute([(written, Access::ComputeRead)])
             .bind_compute_pipeline(PipelineId(0))
-            .read(written)
             .dispatch(1, 1, 1)
             .end_compute();
 
@@ -3017,7 +3001,7 @@ mod tests {
         ));
 
         let end = module
-            .begin_compute()
+            .begin_compute([])
             .bind_compute_pipeline(PipelineId(0))
             .push_constant_address(0, scratch)
             .dispatch(1, 1, 1)
@@ -3039,15 +3023,13 @@ mod tests {
         let instances = module.declare_buffer_var("instances", Access::HostWrite);
 
         let written = module
-            .begin_compute()
+            .begin_compute([(instances, Access::ComputeWrite)])
             .bind_compute_pipeline(PipelineId(0))
-            .write(instances)
             .dispatch(1, 1, 1)
             .end_compute();
         let end = module
-            .begin_compute()
+            .begin_compute([(written, Access::ComputeRead)])
             .bind_compute_pipeline(PipelineId(0))
-            .read(written)
             .dispatch(1, 1, 1)
             .end_compute();
 
@@ -3075,15 +3057,13 @@ mod tests {
         let instances = module.declare_buffer_var("instances", Access::HostWrite);
 
         let written = module
-            .begin_compute()
+            .begin_compute([(instances, Access::ComputeWrite)])
             .bind_compute_pipeline(PipelineId(0))
-            .write(instances)
             .dispatch(1, 1, 1)
             .end_compute();
         let end = module
-            .begin_compute()
+            .begin_compute([(written, Access::ComputeRead)])
             .bind_compute_pipeline(PipelineId(0))
-            .read(written)
             .dispatch(1, 1, 1)
             .end_compute();
 
@@ -3105,15 +3085,14 @@ mod tests {
         let vertices = module.declare_buffer_var("vertices", Access::HostWrite);
 
         let written = module
-            .begin_compute()
+            .begin_compute([(vertices, Access::ComputeWrite)])
             .bind_compute_pipeline(PipelineId(0))
-            .write(vertices)
             .push_constant_address(0, vertices)
             .dispatch(1, 1, 1)
             .end_compute();
 
         let end = module
-            .begin_rendering(&[attachment])
+            .begin_rendering([(attachment, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .bind_vertex_buffer(0, written)
             .draw(3, 1)
@@ -3145,7 +3124,7 @@ mod tests {
         let target = module.declare_image_var("target", FORMAT, vk::SampleCountFlags::TYPE_1, LAYOUT);
 
         let end = module
-            .begin_rendering(&[target])
+            .begin_rendering([(target, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .set_viewport(0, Rect2D::framebuffer())
             .set_dynamic_state(DynamicStateFlags::None)
@@ -3167,7 +3146,7 @@ mod tests {
         let target = module.declare_image_var("target", FORMAT, vk::SampleCountFlags::TYPE_1, LAYOUT);
 
         let end = module
-            .begin_rendering(&[target])
+            .begin_rendering([(target, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .draw(3, 1)
             .end_rendering();
@@ -3194,16 +3173,13 @@ mod tests {
         let elements = module.declare_buffer_var("elements", Access::HostWrite);
 
         let painted = module
-            .begin_compute()
+            .begin_compute([(target, Access::ComputeWrite)])
             .bind_compute_pipeline(PipelineId(0))
-            .write(target)
             .dispatch_invocations_per_pixel(target)
             .end_compute();
         let end = module
-            .begin_compute()
+            .begin_compute([(elements, Access::ComputeWrite), (painted, Access::ComputeRead)])
             .bind_compute_pipeline(PipelineId(0))
-            .write(elements)
-            .read(painted)
             .dispatch_invocations_per_element(elements, 16)
             .end_compute();
 
@@ -3231,9 +3207,8 @@ mod tests {
         let instances = module.declare_buffer_var("instances", Access::HostWrite);
 
         let end = module
-            .begin_compute()
+            .begin_compute([(instances, Access::ComputeWrite)])
             .bind_compute_pipeline(PipelineId(0))
-            .write(instances)
             .dispatch(1, 1, 1)
             .end_compute();
 
@@ -3252,9 +3227,8 @@ mod tests {
         let instances = module.declare_buffer_var("instances", Access::HostWrite);
 
         let end = module
-            .begin_compute()
+            .begin_compute([(instances, Access::ComputeWrite)])
             .bind_compute_pipeline(PipelineId(0))
-            .write(instances)
             .dispatch(1, 1, 1)
             .end_compute();
 
@@ -3273,9 +3247,8 @@ mod tests {
         let instances = module.declare_buffer_var("instances", Access::HostWrite);
 
         let end = module
-            .begin_compute()
+            .begin_compute([(instances, Access::ComputeWrite)])
             .bind_compute_pipeline(PipelineId(0))
-            .write(instances)
             .dispatch(1, 1, 1)
             .end_compute();
 
@@ -3291,7 +3264,7 @@ mod tests {
         let target = module.declare_image_var("target", FORMAT, vk::SampleCountFlags::TYPE_1, LAYOUT);
 
         let end = module
-            .begin_rendering(&[target])
+            .begin_rendering([(target, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .draw(3, 1)
             .end_rendering();
@@ -3316,9 +3289,8 @@ mod tests {
         let buffer = module.import_buffer(&Buffer::default(), Access::AttributeRead);
 
         let end = module
-            .begin_compute()
+            .begin_compute([(buffer, Access::ComputeWrite)])
             .bind_compute_pipeline(PipelineId(0))
-            .write(buffer)
             .dispatch(1, 1, 1)
             .end_compute();
 
@@ -3340,10 +3312,8 @@ mod tests {
         let second = module.import_buffer(&Buffer::default(), Access::ComputeRead);
 
         let end = module
-            .begin_compute()
+            .begin_compute([(first, Access::ComputeWrite), (second, Access::ComputeWrite)])
             .bind_compute_pipeline(PipelineId(0))
-            .write(first)
-            .write(second)
             .dispatch(1, 1, 1)
             .end_compute();
 
@@ -3362,15 +3332,13 @@ mod tests {
         let buffer = module.import_buffer(&Buffer::default(), Access::ComputeRead);
 
         let written = module
-            .begin_compute()
+            .begin_compute([(buffer, Access::ComputeWrite)])
             .bind_compute_pipeline(PipelineId(0))
-            .write(buffer)
             .dispatch(1, 1, 1)
             .end_compute();
         let end = module
-            .begin_compute()
+            .begin_compute([(written, Access::ComputeRead)])
             .bind_compute_pipeline(PipelineId(1))
-            .read(written)
             .dispatch(1, 1, 1)
             .end_compute();
 
@@ -3394,13 +3362,13 @@ mod tests {
         let one = module.constant_u32(1);
 
         let dispatched = module
-            .begin_compute()
+            .begin_compute([])
             .bind_compute_pipeline(PipelineId(0))
             .dispatch_invocations(invocations, one, one)
             .end_compute();
 
         let end = module
-            .begin_rendering(&[attachment])
+            .begin_rendering([(attachment, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .draw(vertices, one)
             .end_rendering();
@@ -3446,7 +3414,7 @@ mod tests {
         let depth = module.transient_image(&depth_info());
 
         let end = module
-            .begin_rendering_depth(&[attachment], depth)
+            .begin_rendering([(attachment, Access::ColorRW), (depth, Access::DepthStencilRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .set_depth(DepthState::less())
             .draw(3, 1)
@@ -3467,7 +3435,7 @@ mod tests {
         let (mut module, attachment) = module_with_attachment();
 
         let end = module
-            .begin_rendering(&[attachment])
+            .begin_rendering([(attachment, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .set_depth(DepthState::less())
             .draw(3, 1)
@@ -3488,7 +3456,7 @@ mod tests {
         let depth = module.transient_image(&depth_info());
 
         let end = module
-            .begin_rendering_depth(&[attachment], depth)
+            .begin_rendering([(attachment, Access::ColorRW), (depth, Access::DepthStencilRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .set_depth(DepthState::less())
             .draw(3, 1)
@@ -3517,7 +3485,7 @@ mod tests {
         });
 
         let end = module
-            .begin_rendering_depth(&[attachment], depth)
+            .begin_rendering([(attachment, Access::ColorRW), (depth, Access::DepthStencilRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .draw(3, 1)
             .end_rendering();
@@ -3535,7 +3503,7 @@ mod tests {
         let buffer = module.import_buffer(&Buffer::default(), Access::HostWrite);
 
         let end = module
-            .begin_rendering(&[attachment])
+            .begin_rendering([(attachment, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .bind_vertex_buffer(0, buffer)
             .draw(3, 1)
@@ -3553,7 +3521,7 @@ mod tests {
         let indices = module.import_buffer(&Buffer::default(), Access::HostWrite);
 
         let end = module
-            .begin_rendering(&[attachment])
+            .begin_rendering([(attachment, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .bind_index_buffer(indices, vk::IndexType::UINT32)
             .draw_indexed(3, 1)
@@ -3587,7 +3555,7 @@ mod tests {
         let indices = module.import_buffer(&Buffer::default(), Access::HostWrite);
 
         let end = module
-            .begin_rendering(&[attachment])
+            .begin_rendering([(attachment, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .bind_vertex_buffer(0, vertices)
             .bind_index_buffer(indices, vk::IndexType::UINT32)
@@ -3609,7 +3577,7 @@ mod tests {
         let indices = module.import_buffer(&Buffer::default(), Access::HostWrite);
 
         let end = module
-            .begin_rendering(&[attachment])
+            .begin_rendering([(attachment, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .bind_index_buffer(indices, vk::IndexType::UINT32)
             .draw_indexed(3, 1)
@@ -3632,7 +3600,7 @@ mod tests {
         let indices = module.import_buffer(&Buffer::default(), Access::HostWrite);
 
         let end = module
-            .begin_rendering(&[attachment])
+            .begin_rendering([(attachment, Access::ColorRW)])
             .bind_graphics_pipeline(pipeline)
             .set_primitive_topology(vk::PrimitiveTopology::LINE_STRIP)
             .broadcast_color_blend(BlendPreset::PremultipliedAlphaBlend)
@@ -3653,7 +3621,7 @@ mod tests {
         let (mut module, attachment) = module_with_attachment();
 
         let end = module
-            .begin_rendering(&[attachment])
+            .begin_rendering([(attachment, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .draw_indexed_range(9, 2, 3, -4, 5)
             .end_rendering();
@@ -3690,7 +3658,7 @@ mod tests {
         let pipeline = PipelineId(0);
 
         let end = module
-            .begin_rendering(&[attachment])
+            .begin_rendering([(attachment, Access::ColorRW)])
             .bind_graphics_pipeline(pipeline)
             .draw(3, 1)
             .end_rendering();
@@ -3708,7 +3676,7 @@ mod tests {
         let (mut module, attachment) = module_with_attachment();
 
         let end = module
-            .begin_rendering(&[attachment])
+            .begin_rendering([(attachment, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .set_rasterization(RasterizationState {
                 cull_mode: vk::CullModeFlags::BACK,
@@ -3730,7 +3698,7 @@ mod tests {
         let pipeline = PipelineId(0);
 
         let end = module
-            .begin_rendering(&[attachment])
+            .begin_rendering([(attachment, Access::ColorRW)])
             .bind_graphics_pipeline(pipeline)
             .draw(3, 1)
             .set_rasterization(RasterizationState {
@@ -3753,7 +3721,7 @@ mod tests {
         let (mut module, attachment) = module_with_attachment();
 
         let end = module
-            .begin_rendering(&[attachment])
+            .begin_rendering([(attachment, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .set_primitive_topology(vk::PrimitiveTopology::LINE_STRIP)
             .draw(3, 1)
@@ -3771,7 +3739,7 @@ mod tests {
         let (mut module, attachment) = module_with_attachment();
 
         let end = module
-            .begin_rendering(&[attachment])
+            .begin_rendering([(attachment, Access::ColorRW)])
             .set_rasterization(RasterizationState {
                 cull_mode: vk::CullModeFlags::BACK,
                 ..Default::default()
@@ -3789,7 +3757,10 @@ mod tests {
     fn a_draw_with_no_bound_pipeline_infers_invalid() {
         let (mut module, attachment) = module_with_attachment();
 
-        let end = module.begin_rendering(&[attachment]).draw(3, 1).end_rendering();
+        let end = module
+            .begin_rendering([(attachment, Access::ColorRW)])
+            .draw(3, 1)
+            .end_rendering();
 
         let draws = draws(&module.compile(&Unchecked, end).unwrap());
         assert_eq!(draws[0].0, PipelineId::INVALID);
@@ -3801,7 +3772,7 @@ mod tests {
         let pipeline = PipelineId(0);
 
         let attachment = module
-            .begin_rendering(&[attachment])
+            .begin_rendering([(attachment, Access::ColorRW)])
             .bind_graphics_pipeline(pipeline)
             .set_rasterization(RasterizationState {
                 polygon_mode: vk::PolygonMode::LINE,
@@ -3810,7 +3781,7 @@ mod tests {
             .draw(3, 1)
             .end_rendering();
         let end = module
-            .begin_rendering(&[attachment])
+            .begin_rendering([(attachment, Access::ColorRW)])
             .bind_graphics_pipeline(pipeline)
             .draw(3, 1)
             .end_rendering();
@@ -3827,7 +3798,7 @@ mod tests {
         let (mut module, attachment) = module_with_attachment();
 
         let end = module
-            .begin_rendering(&[attachment])
+            .begin_rendering([(attachment, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .set_viewport(0, Rect2D::relative(0.0, 0.0, 0.5, 0.5))
             .draw(3, 1)
@@ -3858,7 +3829,7 @@ mod tests {
         let (mut module, attachment) = module_with_attachment();
 
         let end = module
-            .begin_rendering(&[attachment])
+            .begin_rendering([(attachment, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .set_dynamic_state(DynamicStateFlags::None)
             .set_viewport(0, Rect2D::relative(0.0, 0.0, 0.5, 1.0))
@@ -3893,7 +3864,7 @@ mod tests {
 
         let end = module
             .begin_rendering_area(
-                &[attachment],
+                [(attachment, Access::ColorRW)],
                 vk::Extent2D {
                     width: WIDTH / 2,
                     height: HEIGHT / 2,
@@ -3914,7 +3885,7 @@ mod tests {
         let (mut module, attachment) = module_with_attachment();
 
         let end = module
-            .begin_rendering(&[attachment])
+            .begin_rendering([(attachment, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .push_constants(&[1.0f32, 2.0])
             .draw(3, 1)
@@ -3947,7 +3918,7 @@ mod tests {
         let (mut module, attachment) = module_with_attachment();
 
         let end = module
-            .begin_rendering(&[attachment])
+            .begin_rendering([(attachment, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .draw(3, 1)
             .push_constants(&7u32)
@@ -3974,7 +3945,7 @@ mod tests {
         let (mut module, attachment) = module_with_attachment();
 
         let end = module
-            .begin_rendering(&[attachment])
+            .begin_rendering([(attachment, Access::ColorRW)])
             .push_constants(&7u32)
             .bind_graphics_pipeline(PipelineId(0))
             .draw(3, 1)
@@ -3999,9 +3970,8 @@ mod tests {
         let (mut module, attachment) = module_with_attachment();
 
         let end = module
-            .begin_compute()
+            .begin_compute([(attachment, Access::ComputeWrite)])
             .bind_compute_pipeline(PipelineId(1))
-            .write(attachment)
             .push_constants(&7u32)
             .dispatch(8, 4, 1)
             .end_compute();
@@ -4065,9 +4035,8 @@ mod tests {
         let (mut module, attachment) = module_with_attachment();
 
         let end = module
-            .begin_compute()
+            .begin_compute([(attachment, Access::ComputeWrite)])
             .bind_compute_pipeline(PipelineId(0))
-            .write(attachment)
             .dispatch_invocations(1920, 1080, 1)
             .end_compute();
 
@@ -4080,9 +4049,8 @@ mod tests {
         let (mut module, attachment) = module_with_attachment();
 
         let end = module
-            .begin_compute()
+            .begin_compute([(attachment, Access::ComputeWrite)])
             .bind_compute_pipeline(PipelineId(0))
-            .write(attachment)
             .dispatch_invocations_per_pixel(attachment)
             .end_compute();
 
@@ -4096,9 +4064,8 @@ mod tests {
         let (mut module, attachment) = module_with_attachment();
 
         let end = module
-            .begin_compute()
+            .begin_compute([(attachment, Access::ComputeWrite)])
             .bind_compute_pipeline(PipelineId(0))
-            .write(attachment)
             .dispatch_invocations_per_pixel_scaled(attachment, [0.5, 2.0, 0.25])
             .end_compute();
 
@@ -4112,9 +4079,8 @@ mod tests {
         let buffer = module.import_buffer(&Buffer::new(vk::Buffer::null(), 800, 0, None), Access::HostWrite);
 
         let end = module
-            .begin_compute()
+            .begin_compute([(buffer, Access::ComputeWrite)])
             .bind_compute_pipeline(PipelineId(0))
-            .write(buffer)
             .dispatch_invocations_per_element(buffer, 20)
             .end_compute();
 
@@ -4128,9 +4094,8 @@ mod tests {
         let buffer = module.import_buffer(&Buffer::new(vk::Buffer::null(), 800, 0, None), Access::HostWrite);
 
         let end = module
-            .begin_compute()
+            .begin_compute([(buffer, Access::ComputeWrite)])
             .bind_compute_pipeline(PipelineId(0))
-            .write(buffer)
             .dispatch_invocations_per_element_scaled(buffer, 20, 3.0)
             .end_compute();
 
@@ -4147,9 +4112,8 @@ mod tests {
         let commands = module.import_buffer(&Buffer::new(vk::Buffer::null(), 12, 0, None), Access::HostWrite);
 
         let end = module
-            .begin_compute()
+            .begin_compute([(image, Access::ComputeWrite)])
             .bind_compute_pipeline(PipelineId(0))
-            .write(image)
             .dispatch_indirect(commands)
             .end_compute();
 
@@ -4176,9 +4140,8 @@ mod tests {
         let commands = module.import_buffer(&Buffer::new(vk::Buffer::null(), 24, 0, None), Access::HostWrite);
 
         let end = module
-            .begin_compute()
+            .begin_compute([(image, Access::ComputeWrite)])
             .bind_compute_pipeline(PipelineId(0))
-            .write(image)
             .dispatch_indirect(commands)
             .dispatch_indirect_at(commands, 12)
             .end_compute();
@@ -4209,9 +4172,8 @@ mod tests {
         let target = module.transient_image(&untyped_info());
 
         let computed = module
-            .begin_compute()
+            .begin_compute([(target, Access::ComputeWrite)])
             .bind_compute_pipeline(PipelineId(0))
-            .write(target)
             .dispatch(8, 8, 1)
             .end_compute();
         // the region's value stands in for what it wrote, so the blit reads the dispatch
@@ -4239,15 +4201,13 @@ mod tests {
         let image = module.transient_image(&untyped_info());
 
         let written = module
-            .begin_compute()
+            .begin_compute([(image, Access::ComputeWrite)])
             .bind_compute_pipeline(PipelineId(0))
-            .write(image)
             .dispatch(1, 1, 1)
             .end_compute();
         let end = module
-            .begin_compute()
+            .begin_compute([(written, Access::ComputeRead)])
             .bind_compute_pipeline(PipelineId(1))
-            .read(written)
             .dispatch(1, 1, 1)
             .end_compute();
 
@@ -4265,10 +4225,8 @@ mod tests {
         let image = module.transient_image(&untyped_info());
 
         let end = module
-            .begin_compute()
+            .begin_compute([(image, Access::ComputeRead), (image, Access::ComputeWrite)])
             .bind_compute_pipeline(PipelineId(0))
-            .read(image)
-            .write(image)
             .dispatch(1, 1, 1)
             .end_compute();
 
@@ -4278,15 +4236,155 @@ mod tests {
     }
 
     #[test]
+    fn rendering_resources_share_one_access_tagged_attachment_list() {
+        let (mut module, color) = module_with_attachment();
+        let depth = module.transient_image(&depth_info());
+        let sampled = module.transient_image(&untyped_info());
+        let uniform = module.import_buffer(&Buffer::default(), Access::HostWrite);
+
+        let _end = module
+            .begin_rendering([
+                (color, Access::ColorRW),
+                (depth, Access::DepthStencilRW),
+                (sampled, Access::FragmentSampled),
+                (uniform, Access::FragmentUniformRead),
+            ])
+            .end_rendering();
+
+        let attachments = module
+            .instructions
+            .iter()
+            .find_map(|ir| match ir {
+                IR::BeginRendering { attachments, .. } => Some(attachments.clone()),
+                _ => None,
+            })
+            .expect("the rendering region should be present");
+        let attachments = attachments
+            .iter()
+            .map(|(resource, access)| (*resource, module.resolve_access(*access)))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            attachments,
+            vec![
+                (color, Access::ColorRW),
+                (depth, Access::DepthStencilRW),
+                (sampled, Access::FragmentSampled),
+                (uniform, Access::FragmentUniformRead),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_resource_array_is_one_attachment_and_synchronizes_every_element() {
+        let (mut module, target) = module_with_attachment();
+        let first = module.transient_image(&untyped_info());
+        let second = module.transient_image(&untyped_info());
+        let image_type = module.lower_type(ir::Type::Image {
+            format: FORMAT,
+            samples: vk::SampleCountFlags::TYPE_1,
+        });
+        let bindless_images = module.emit(IR::Array {
+            ty: image_type,
+            elements: vec![first, second],
+        });
+
+        let end = module
+            .begin_rendering([(target, Access::ColorRW), (bindless_images, Access::FragmentRead)])
+            .bind_graphics_pipeline(PipelineId(0))
+            .draw(3, 1)
+            .end_rendering();
+
+        let compiled = module.compile(&Unchecked, end).unwrap();
+        let attachments = compiled
+            .instructions()
+            .iter()
+            .find_map(|(_, ir)| match ir {
+                IR::BeginRendering { attachments, .. } => Some(attachments),
+                _ => None,
+            })
+            .expect("the rendering region should be present");
+        assert_eq!(attachments.len(), 2);
+        assert_eq!(attachments[1].0, bindless_images);
+        assert_eq!(draws(&compiled)[0].1.rendering.color_formats, vec![FORMAT]);
+
+        let barriers = image_barriers(&module, &compiled);
+        for image in [first, second] {
+            let barrier = barriers
+                .iter()
+                .find(|barrier| barrier.resource == image)
+                .expect("every resource-array element should be transitioned");
+            assert_eq!(barrier.dst, Access::FragmentRead);
+            assert_eq!(image_usage(&compiled, image), vk::ImageUsageFlags::STORAGE);
+        }
+    }
+
+    #[test]
+    fn a_merged_attachment_access_keeps_its_rendering_role() {
+        let (mut module, color) = module_with_attachment();
+        let sampled = module.transient_image(&untyped_info());
+
+        let end = module
+            .begin_rendering([
+                (color, Access::ColorRW),
+                (color, Access::FragmentRead),
+                (sampled, Access::FragmentSampled),
+            ])
+            .bind_graphics_pipeline(PipelineId(0))
+            .draw(3, 1)
+            .end_rendering();
+
+        let compiled = module.compile(&Unchecked, end).unwrap();
+        let attachments = compiled
+            .instructions()
+            .iter()
+            .find_map(|(_, ir)| match ir {
+                IR::BeginRendering { attachments, .. } => Some(attachments),
+                _ => None,
+            })
+            .expect("the rendering region should be present");
+        assert_eq!(attachments.len(), 2);
+        assert_eq!(attachments[0].0, color);
+        assert_eq!(
+            access_constant(&module, &compiled, &attachments[0].1),
+            Access::ColorRW | Access::FragmentRead
+        );
+        assert_eq!(attachments[1].0, sampled);
+        assert_eq!(draws(&compiled)[0].1.rendering.color_formats, vec![FORMAT]);
+    }
+
+    #[test]
+    fn an_area_only_region_keeps_sync_resources_out_of_rendering_state() {
+        let mut module = Module::default();
+        let sampled = module.transient_image(&untyped_info());
+
+        let end = module
+            .begin_rendering_area([(sampled, Access::FragmentSampled)], extent_2d())
+            .bind_graphics_pipeline(PipelineId(0))
+            .draw(3, 1)
+            .end_rendering();
+
+        let compiled = module.compile(&Unchecked, end).unwrap();
+        let state = &draws(&compiled)[0].1.rendering;
+        assert!(state.color_formats.is_empty());
+        assert_eq!(state.depth_format, None);
+
+        let barrier = image_barriers(&module, &compiled)
+            .into_iter()
+            .find(|barrier| barrier.resource == sampled)
+            .expect("the sync-only image should still be transitioned");
+        assert_eq!(barrier.dst, Access::FragmentSampled);
+    }
+
+    #[test]
     fn recorded_accesses_are_lowered_to_constants() {
         let mut module = Module::default();
         let buffer = module.import_buffer(&Buffer::default(), Access::HostWrite);
         let image = module.transient_image(&untyped_info());
 
         let _end = module
-            .begin_compute()
+            .begin_compute([(image, Access::ComputeRead)])
             .bind_compute_pipeline(PipelineId(0))
-            .read(image)
             .bind_image(0, 0, image)
             .dispatch(1, 1, 1)
             .end_compute();
@@ -4296,13 +4394,13 @@ mod tests {
         };
         assert_eq!(module.resolve_access(*initial_access), Access::HostWrite);
 
-        let declared = module.instructions.iter().find_map(|ir| match ir {
-            IR::BeginCompute { declared_access, .. } => declared_access
+        let recorded = module.instructions.iter().find_map(|ir| match ir {
+            IR::BeginCompute { attachments, .. } => attachments
                 .iter()
                 .find_map(|(resource, access)| (*resource == image).then_some(*access)),
             _ => None,
         });
-        assert_eq!(declared.map(|id| module.resolve_access(id)), Some(Access::ComputeRead));
+        assert_eq!(recorded.map(|id| module.resolve_access(id)), Some(Access::ComputeRead));
 
         let descriptor = module.instructions.iter().find_map(|ir| match ir {
             IR::WriteDescriptor { access, .. } => Some(*access),
@@ -4317,13 +4415,12 @@ mod tests {
         let buffer = module.import_buffer(&Buffer::default(), Access::HostWrite);
 
         let computed = module
-            .begin_compute()
+            .begin_compute([(buffer, Access::ComputeWrite)])
             .bind_compute_pipeline(PipelineId(1))
-            .write(buffer)
             .dispatch(1, 1, 1)
             .end_compute();
         let rendered = module
-            .begin_rendering(&[attachment])
+            .begin_rendering([(attachment, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .bind_vertex_buffer(0, buffer)
             .draw(3, 1)
@@ -4348,13 +4445,12 @@ mod tests {
         let buffer = module.import_buffer(&Buffer::default(), Access::HostWrite);
 
         let computed = module
-            .begin_compute()
+            .begin_compute([(buffer, Access::ComputeWrite)])
             .bind_compute_pipeline(PipelineId(1))
-            .write(buffer)
             .dispatch(1, 1, 1)
             .end_compute();
         let rendered = module
-            .begin_rendering(&[attachment])
+            .begin_rendering([(attachment, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .bind_vertex_buffer(0, computed)
             .draw(3, 1)
@@ -4415,9 +4511,8 @@ mod tests {
         let texture = module.transient_image(&untyped_info());
 
         let end = module
-            .begin_rendering(&[attachment])
+            .begin_rendering([(attachment, Access::ColorRW), (texture, Access::FragmentSampled)])
             .bind_graphics_pipeline(PipelineId(0))
-            .access(texture, Access::FragmentSampled)
             .draw(3, 1)
             .end_rendering();
 
@@ -4465,7 +4560,7 @@ mod tests {
         let second = module.transient_image(&untyped_info());
 
         let end = module
-            .begin_rendering(&[attachment])
+            .begin_rendering([(attachment, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .bind_image(2, 4, first)
             .bind_texture(2, 4, second, a_sampler())
@@ -4503,7 +4598,7 @@ mod tests {
         let mut module = Module::default();
         let texture = module.transient_image(&untyped_info());
         let end = module
-            .begin_compute()
+            .begin_compute([])
             .bind_compute_pipeline(PipelineId(0))
             .bind_image(1, 3, texture)
             .dispatch(1, 1, 1)
@@ -4533,7 +4628,7 @@ mod tests {
         let (mut module, attachment) = module_with_attachment();
         let texture = module.transient_image(&untyped_info());
         let end = module
-            .begin_rendering(&[attachment])
+            .begin_rendering([(attachment, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .bind_texture(0, 0, texture, a_sampler())
             .draw(3, 1)
@@ -4560,11 +4655,13 @@ mod tests {
         let texture = module.transient_image(&untyped_info());
 
         let end = module
-            .begin_rendering(&[attachment])
+            .begin_rendering([
+                (attachment, Access::ColorRW),
+                (texture, Access::FragmentSampled),
+                (texture, Access::FragmentSampled),
+            ])
             .bind_graphics_pipeline(PipelineId(0))
-            .access(texture, Access::FragmentSampled)
             .draw(3, 1)
-            .access(texture, Access::FragmentSampled)
             .draw(3, 1)
             .end_rendering();
 
@@ -4580,9 +4677,8 @@ mod tests {
         let uploaded = module.copy_buffer_to_image(staging, texture);
 
         let end = module
-            .begin_rendering(&[attachment])
+            .begin_rendering([(attachment, Access::ColorRW), (uploaded, Access::FragmentSampled)])
             .bind_graphics_pipeline(PipelineId(0))
-            .access(uploaded, Access::FragmentSampled)
             .draw(3, 1)
             .end_rendering();
 
@@ -4613,9 +4709,8 @@ mod tests {
         let uploaded = module.copy_buffer_to_image(staging, texture);
 
         let end = module
-            .begin_rendering(&[attachment])
+            .begin_rendering([(attachment, Access::ColorRW), (uploaded, Access::FragmentSampled)])
             .bind_graphics_pipeline(PipelineId(0))
-            .access(uploaded, Access::FragmentSampled)
             .draw(3, 1)
             .end_rendering();
 
@@ -4673,7 +4768,7 @@ mod tests {
         let (mut module, attachment) = module_with_attachment();
 
         let end = module
-            .begin_rendering(&[attachment])
+            .begin_rendering([(attachment, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .draw(3, 1)
             .broadcast_color_blend(BlendPreset::AlphaBlend)
@@ -4740,7 +4835,7 @@ mod tests {
         let target = module.transient_image_sized(&transient_info(), extent);
 
         let end = module
-            .begin_rendering(&[target])
+            .begin_rendering([(target, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .set_viewport(0, Rect2D::framebuffer())
             .set_dynamic_state(DynamicStateFlags::None)
@@ -4765,9 +4860,8 @@ mod tests {
         let target = module.transient_image_sized(&transient_info(), extent);
 
         let end = module
-            .begin_compute()
+            .begin_compute([(target, Access::ComputeWrite)])
             .bind_compute_pipeline(PipelineId(0))
-            .write(target)
             .dispatch_invocations_per_pixel(target)
             .end_compute();
 
@@ -5046,10 +5140,8 @@ mod tests {
         let end = module.set_condition(
             enabled,
             |m| {
-                m.begin_compute()
+                m.begin_compute([(target, Access::ComputeWrite), (buffer, Access::ComputeRead)])
                     .bind_compute_pipeline(PipelineId(0))
-                    .write(target)
-                    .read(buffer)
                     .dispatch(1, 1, 1)
                     .end_compute()
             },
@@ -5070,9 +5162,8 @@ mod tests {
         let enabled = module.declare_bool_var("enabled", true);
 
         let dispatch = |m: &mut Module, pipeline: u32| {
-            m.begin_compute()
+            m.begin_compute([(buffer, Access::ComputeWrite)])
                 .bind_compute_pipeline(PipelineId(pipeline))
-                .write(buffer)
                 .dispatch(1, 1, 1)
                 .end_compute()
         };
@@ -5101,13 +5192,14 @@ mod tests {
         let enabled = module.declare_bool_var("enabled", true);
 
         let read_both = |m: &mut Module, target| {
-            m.begin_compute()
-                .bind_compute_pipeline(PipelineId(0))
-                .write(target)
-                .read_uniform(first)
-                .read_uniform(second)
-                .dispatch(1, 1, 1)
-                .end_compute()
+            m.begin_compute([
+                (target, Access::ComputeWrite),
+                (first, Access::ComputeUniformRead),
+                (second, Access::ComputeUniformRead),
+            ])
+            .bind_compute_pipeline(PipelineId(0))
+            .dispatch(1, 1, 1)
+            .end_compute()
         };
 
         let drawn = module.set_condition(enabled, |m| read_both(m, target), |_| target);
@@ -5134,7 +5226,7 @@ mod tests {
         let drawn = module.set_condition(
             enabled,
             |m| {
-                m.begin_rendering(&[target])
+                m.begin_rendering([(target, Access::ColorRW)])
                     .bind_graphics_pipeline(PipelineId(0))
                     .bind_vertex_buffer(0, vertices)
                     .bind_index_buffer(indices, vk::IndexType::UINT32)
@@ -5162,7 +5254,7 @@ mod tests {
         let block = module.declare_bytes_var("push block", 16);
 
         let end = module
-            .begin_rendering(&[target])
+            .begin_rendering([(target, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .push_constants_from(block)
             .draw(3, 1)
@@ -5191,7 +5283,7 @@ mod tests {
         let block = module.declare_bytes_var("push block", 16);
 
         let end = module
-            .begin_rendering(&[target])
+            .begin_rendering([(target, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .push_constants_from(block)
             .draw(3, 1)
@@ -5214,7 +5306,7 @@ mod tests {
         let block = module.declare_bytes_var("push block", 16);
 
         let end = module
-            .begin_rendering(&[target])
+            .begin_rendering([(target, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .push_constants_from(block)
             .push_constants(&7u32)
@@ -5265,9 +5357,8 @@ mod tests {
         let texture = module.transient_image(&untyped_info());
 
         let end = module
-            .begin_rendering(&[attachment])
+            .begin_rendering([(attachment, Access::ColorRW), (texture, Access::VertexSampled)])
             .bind_graphics_pipeline(PipelineId(0))
-            .access(texture, Access::VertexSampled)
             .draw(3, 1)
             .end_rendering();
 
@@ -5296,9 +5387,8 @@ mod tests {
         let overdraw = module.transient_image(&untyped_info());
 
         let end = module
-            .begin_rendering(&[attachment])
+            .begin_rendering([(attachment, Access::ColorRW), (overdraw, Access::FragmentWrite)])
             .bind_graphics_pipeline(PipelineId(0))
-            .access(overdraw, Access::FragmentWrite)
             .draw(3, 1)
             .end_rendering();
 

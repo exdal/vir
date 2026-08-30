@@ -644,7 +644,12 @@ impl Example for Deferred {
             let mut filled = albedo;
             for (vertices, indices, index_count, texture, push) in &meshes {
                 filled = m
-                    .begin_rendering_depth(&[filled, normal, position], depth)
+                    .begin_rendering([
+                        (filled, Access::ColorRW),
+                        (normal, Access::ColorRW),
+                        (position, Access::ColorRW),
+                        (depth, Access::DepthStencilRW),
+                    ])
                     .with_name("g-buffer mesh")
                     .bind_graphics_pipeline(self.geometry_pipeline)
                     .set_viewport(0, Rect2D::framebuffer())
@@ -674,7 +679,7 @@ impl Example for Deferred {
         // `filled` carries the albedo target out of the region; the other two are the same
         // region's writes, so naming them by the value that went in is what orders the sample
         let shaded = module
-            .begin_rendering(&[recording.swapchain_image])
+            .begin_rendering([(recording.swapchain_image, Access::ColorRW)])
             .with_name("deferred lighting")
             .bind_graphics_pipeline(self.lighting_pipeline)
             .set_viewport(0, Rect2D::framebuffer())
