@@ -1239,6 +1239,7 @@ impl RenderGraph {
                 ir::Constant::Size(v) => self.set_value(value_id, Value::Size(*v)),
                 ir::Constant::Extent2D(v) => self.set_value(value_id, Value::Extent2D(*v)),
                 ir::Constant::Extent3D(v) => self.set_value(value_id, Value::Extent3D(*v)),
+                ir::Constant::String(v) => self.set_value(value_id, Value::String(v.clone())),
                 ir::Constant::Access(v) => self.set_value(value_id, Value::Access(*v)),
                 ir::Constant::ClearValue(v) => self.set_value(value_id, Value::ClearValue(*v)),
             },
@@ -1260,12 +1261,15 @@ impl RenderGraph {
             } => {
                 let buffer = if buffer.is_null() {
                     allocator.allocate_buffer(&BufferInfo {
-                        size: size.map_or(0, |size| self.get::<usize>(&size) as u64),
+                        size: match size.is_valid() {
+                            true => self.get::<usize>(size) as u64,
+                            false => 0,
+                        },
                         usage: *usage,
                         location: *location,
-                        name: match name {
-                            Some(name) => name.to_string(),
-                            None => format!("transient buffer {value_id}"),
+                        name: match name.is_valid() {
+                            true => self.get::<Arc<str>>(name).to_string(),
+                            false => format!("transient buffer {value_id}"),
                         },
                     })?
                 } else {
@@ -1289,7 +1293,10 @@ impl RenderGraph {
                 initial_layout,
                 name,
             } => {
-                let extent = extent.map_or_else(vk::Extent3D::default, |extent| self.get::<vk::Extent3D>(&extent));
+                let extent = match extent.is_valid() {
+                    true => self.get::<vk::Extent3D>(extent),
+                    false => vk::Extent3D::default(),
+                };
                 let subresource_range = vk::ImageSubresourceRange {
                     aspect_mask: resource::aspect_mask(*format),
                     base_mip_level: self.get::<u32>(base_level),
@@ -1308,9 +1315,9 @@ impl RenderGraph {
                         array_layers: subresource_range.layer_count,
                         samples: *samples,
                         location: MemoryLocation::GpuOnly,
-                        name: match name {
-                            Some(name) => name.to_string(),
-                            None => format!("transient image {value_id}"),
+                        name: match name.is_valid() {
+                            true => self.get::<Arc<str>>(name).to_string(),
+                            false => format!("transient image {value_id}"),
                         },
                     })?
                 } else {
@@ -1464,12 +1471,14 @@ impl RenderGraph {
                     .iter()
                     .map(|id| self.get::<ImageAttachment>(id))
                     .collect::<Vec<_>>();
-                let depth = depth_attachment.map(|id| self.get::<ImageAttachment>(&id));
+                let depth = depth_attachment
+                    .is_valid()
+                    .then(|| self.get::<ImageAttachment>(depth_attachment));
 
-                let extent = match render_area {
-                    Some(id) => self.get::<vk::Extent2D>(id),
+                let extent = match render_area.is_valid() {
+                    true => self.get::<vk::Extent2D>(render_area),
                     // a depth-only region sizes itself off the depth attachment instead
-                    None => attachments
+                    false => attachments
                         .first()
                         .or(depth.as_ref())
                         .map(|attachment| vk::Extent2D {
@@ -1504,8 +1513,12 @@ impl RenderGraph {
                 self.batch()?
                     .begin_rendering(render_area, &attachment_infos, depth_info.as_ref());
 
-                match color_attachments.first().or(depth_attachment.as_ref()) {
-                    Some(first) => self.set_value(value_id, Value::Reference(*first)),
+                match color_attachments
+                    .first()
+                    .copied()
+                    .or_else(|| depth_attachment.is_valid().then_some(*depth_attachment))
+                {
+                    Some(first) => self.set_value(value_id, Value::Reference(first)),
                     None => self.set_value(value_id, Value::None),
                 }
             },

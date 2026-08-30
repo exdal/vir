@@ -236,9 +236,10 @@ fn pass_header(program: &Symbols, ir: &IR) -> String {
         .collect::<Vec<_>>()
         .join(", ");
 
+    let name = program.string(*name);
     match (name, targets.is_empty()) {
-        (Some(name), true) => format!("\"{name}\""),
-        (Some(name), false) => format!("\"{name}\" -> {targets}"),
+        (Some(name), true) => format!("{name:?}"),
+        (Some(name), false) => format!("{name:?} -> {targets}"),
         (None, true) => String::new(),
         (None, false) => format!("-> {targets}"),
     }
@@ -321,7 +322,8 @@ mod tests {
     #[test]
     fn a_resource_operand_carries_the_name_it_was_given() {
         let dump = dump_of_one_pass();
-        assert!(dump.contains("image \"target\" %"), "{dump}");
+        assert!(dump.contains("= const \"target\""), "{dump}");
+        assert!(dump.contains("image %") && dump.contains("(\"target\")"), "{dump}");
         assert!(dump.contains("color=[%"), "{dump}");
         assert!(dump.contains("(target)"), "{dump}");
     }
@@ -398,8 +400,8 @@ mod tests {
 
         let dump = module.compile(&Unchecked, end).unwrap().dump();
         let expected = match cfg!(debug_assertions) {
-            true => format!("var \"draws\" Callback({}:{line}) slot=", file!()),
-            false => "var \"draws\" Callback slot=".to_string(),
+            true => format!("(\"draws\") Callback({}:{line}) slot=", file!()),
+            false => "(\"draws\") Callback slot=".to_string(),
         };
         assert!(dump.contains(&expected), "{expected}\n{dump}");
     }
@@ -457,14 +459,17 @@ mod tests {
 
         let dump = module.compile(&Unchecked, end).unwrap().dump();
         assert!(dump.contains("4 blocks"), "{dump}");
-        assert!(dump.contains("var \"animate\" Bool"), "{dump}");
+        assert!(dump.contains("(\"animate\") Bool"), "{dump}");
         assert!(dump.contains("= label 0:"), "{dump}");
         assert!(dump.contains("selection_merge label 1"), "{dump}");
-        assert!(dump.contains("branch_cond %5(animate) -> label 2, label 3"), "{dump}");
+        assert!(
+            dump.contains("branch_cond %") && dump.contains("(animate) -> label 2, label 3"),
+            "{dump}"
+        );
         assert!(dump.contains("branch label 1"), "{dump}");
-        assert!(dump.contains("color=%6(hue)"), "{dump}");
+        assert!(dump.contains("color=%") && dump.contains("(hue)"), "{dump}");
         assert!(dump.contains("phi ["), "{dump}");
-        assert!(dump.contains("\n%12 =   selection_merge"), "{dump}");
+        assert!(dump.contains("=   selection_merge"), "{dump}");
     }
     /// A descriptor write is an instruction of its region, so it reads back as one of its lines.
     #[test]

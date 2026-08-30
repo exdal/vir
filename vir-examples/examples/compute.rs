@@ -382,12 +382,19 @@ mod tests {
     #[test]
     fn the_usage_of_each_transient_comes_out_of_the_graph() {
         let compiled = compiled_chain().0;
+        let instructions = compiled.instructions();
+        let is_named = |name: &ValueId, wanted: &str| {
+            name.is_valid() && {
+                instructions.iter().any(|(id, ir)| {
+                    matches!(ir, IR::Constant(ir::Constant::String(value)) if id == name && value.as_ref() == wanted)
+                })
+            }
+        };
         let usage_of = |wanted: &str| {
-            compiled
-                .instructions()
+            instructions
                 .iter()
                 .find_map(|(_, ir)| match ir {
-                    IR::ConstructBuffer { usage, name, .. } if name.as_deref() == Some(wanted) => Some(*usage),
+                    IR::ConstructBuffer { usage, name, .. } if is_named(name, wanted) => Some(*usage),
                     _ => None,
                 })
                 .expect("both transients should be constructed")

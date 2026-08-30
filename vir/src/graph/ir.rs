@@ -79,13 +79,14 @@ pub enum Type {
     Buffer,
 }
 
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum Constant {
     I32(i32),
     U32(u32),
     Size(usize),
     Extent2D(vk::Extent2D),
     Extent3D(vk::Extent3D),
+    String(Arc<str>),
     Access(Access),
     ClearValue(ClearValue),
 }
@@ -200,7 +201,7 @@ pub enum IR {
     Variable {
         slot: u32,
         kind: VariableKind,
-        name: Name,
+        name: ValueId,
         location: SourceLocation,
     },
     Array {
@@ -214,17 +215,17 @@ pub enum IR {
 
     ConstructBuffer {
         buffer: Buffer,
-        size: Option<ValueId>,
+        size: ValueId,
         usage: vk::BufferUsageFlags,
         location: MemoryLocation,
         initial_access: ValueId,
-        name: Name,
+        name: ValueId,
     },
     ConstructImage {
         image: Image,
         image_view: vk::ImageView,
         view_type: vk::ImageViewType,
-        extent: Option<ValueId>,
+        extent: ValueId,
         format: vk::Format,
         samples: vk::SampleCountFlags,
         base_level: ValueId,
@@ -233,7 +234,7 @@ pub enum IR {
         layer_count: ValueId,
         usage: vk::ImageUsageFlags,
         initial_layout: vk::ImageLayout,
-        name: Name,
+        name: ValueId,
     },
 
     AcquireNextImage {
@@ -272,10 +273,10 @@ pub enum IR {
 
     BeginRendering {
         color_attachments: Vec<ValueId>,
-        depth_attachment: Option<ValueId>,
-        render_area: Option<ValueId>,
+        depth_attachment: ValueId,
+        render_area: ValueId,
         declared_access: Vec<(ValueId, ValueId)>,
-        name: Name,
+        name: ValueId,
     },
     BindPipeline {
         pass: ValueId,
@@ -338,7 +339,7 @@ pub enum IR {
     },
     BeginCompute {
         declared_access: Vec<(ValueId, ValueId)>,
-        name: Name,
+        name: ValueId,
     },
     Dispatch {
         pass: ValueId,
@@ -408,10 +409,11 @@ pub fn underlying_object(ir: &IR) -> UnderlyingObject {
             color_attachments,
             depth_attachment,
             ..
-        } => match color_attachments.first().or(depth_attachment.as_ref()) {
-            Some(first) => UnderlyingObject::Forwards(*first),
-            None => UnderlyingObject::None,
-        },
+        } => color_attachments
+            .first()
+            .copied()
+            .or_else(|| depth_attachment.is_valid().then_some(*depth_attachment))
+            .map_or(UnderlyingObject::None, UnderlyingObject::Forwards),
         IR::BeginCompute { declared_access, .. } => match declared_access.first() {
             Some((first, _)) => UnderlyingObject::Forwards(*first),
             None => UnderlyingObject::None,
@@ -578,11 +580,16 @@ impl IR {
         match self {
             IR::Type(_)
             | IR::Constant(_)
-            | IR::Variable { .. }
             | IR::Label { .. }
             | IR::SelectionMerge { .. }
             | IR::Branch { .. }
             | IR::Return => {},
+
+            IR::Variable { name, .. } => {
+                if name.is_valid() {
+                    visit(*name);
+                }
+            },
 
             IR::Array { ty, elements } => {
                 visit(*ty);
@@ -594,10 +601,18 @@ impl IR {
             },
 
             IR::ConstructBuffer {
-                size, initial_access, ..
+                size,
+                initial_access,
+                name,
+                ..
             } => {
-                size.iter().copied().for_each(&mut visit);
+                if size.is_valid() {
+                    visit(*size);
+                }
                 visit(*initial_access);
+                if name.is_valid() {
+                    visit(*name);
+                }
             },
             IR::ConstructImage {
                 extent,
@@ -605,13 +620,19 @@ impl IR {
                 level_count,
                 base_layer,
                 layer_count,
+                name,
                 ..
             } => {
-                extent.iter().copied().for_each(&mut visit);
+                if extent.is_valid() {
+                    visit(*extent);
+                }
                 visit(*base_level);
                 visit(*level_count);
                 visit(*base_layer);
                 visit(*layer_count);
+                if name.is_valid() {
+                    visit(*name);
+                }
             },
 
             IR::AcquireNextImage { swapchain } => visit(*swapchain),
@@ -642,20 +663,33 @@ impl IR {
                 depth_attachment,
                 render_area,
                 declared_access,
+                name,
                 ..
             } => {
                 color_attachments.iter().copied().for_each(&mut visit);
-                depth_attachment.iter().copied().for_each(&mut visit);
-                render_area.iter().copied().for_each(&mut visit);
+                if depth_attachment.is_valid() {
+                    visit(*depth_attachment);
+                }
+                if render_area.is_valid() {
+                    visit(*render_area);
+                }
                 declared_access.iter().for_each(|(resource, access)| {
                     visit(*resource);
                     visit(*access);
                 });
+                if name.is_valid() {
+                    visit(*name);
+                }
             },
-            IR::BeginCompute { declared_access, .. } => declared_access.iter().for_each(|(resource, access)| {
-                visit(*resource);
-                visit(*access);
-            }),
+            IR::BeginCompute { declared_access, name } => {
+                declared_access.iter().for_each(|(resource, access)| {
+                    visit(*resource);
+                    visit(*access);
+                });
+                if name.is_valid() {
+                    visit(*name);
+                }
+            },
 
             IR::BindPipeline { pass, .. } | IR::EndRendering { pass } | IR::EndCompute { pass } => visit(*pass),
             IR::SetState { pass, change } => {
@@ -788,8 +822,9 @@ impl IR {
                 for attachment in color_attachments {
                     fixed(*attachment, Access::ColorRW);
                 }
-                if let Some(depth) = depth_attachment {
-                    fixed(*depth, Access::DepthStencilRW);
+                if depth_attachment.is_valid() {
+                    let depth = *depth_attachment;
+                    fixed(depth, Access::DepthStencilRW);
                 }
                 for (resource, access) in declared_access {
                     visit(ResourceSideEffect {
@@ -881,6 +916,13 @@ impl<'a> Symbols<'a> {
         }
     }
 
+    pub(crate) fn string(&self, id: ValueId) -> Option<&'a str> {
+        match self.constant(id)? {
+            Constant::String(string) => Some(string),
+            _ => None,
+        }
+    }
+
     pub fn side_effect_access(&self, effect: &ResourceSideEffect) -> Option<Access> {
         match effect.access {
             SideEffectAccess::Fixed(access) => Some(access),
@@ -917,7 +959,7 @@ impl<'a> Symbols<'a> {
     pub fn name(&self, id: ValueId) -> Option<&str> {
         let (resource, through_array) = self.resolve(id)?;
         let name = match resource {
-            IR::ConstructImage { name, .. } | IR::ConstructBuffer { name, .. } => name.as_deref()?,
+            IR::ConstructImage { name, .. } | IR::ConstructBuffer { name, .. } => self.string(*name)?,
             IR::SwapchainImage { .. } => return Some("swapchain"),
             _ => return None,
         };
@@ -933,7 +975,7 @@ impl<'a> Symbols<'a> {
             return None;
         };
 
-        match self.constant((*extent)?)? {
+        match self.constant(*extent)? {
             Constant::Extent3D(extent) => Some(*extent),
             _ => None,
         }
@@ -957,7 +999,7 @@ impl fmt::Display for Operand<'_> {
         }
 
         if let Some(IR::Variable { slot, name, .. }) = self.program.get(self.id) {
-            return match name {
+            return match self.program.string(*name) {
                 Some(name) => write!(f, "{}({name})", self.id),
                 None => write!(f, "$slot{slot}"),
             };
@@ -1015,10 +1057,10 @@ fn fmt_layout(layout: vk::ImageLayout) -> String { format!("{layout:?}").trim_en
 
 fn fmt_samples(samples: vk::SampleCountFlags) -> String { samples.as_raw().to_string() }
 
-fn fmt_name(name: &Name) -> String {
-    match name {
-        Some(name) => format!(" \"{name}\""),
-        None => String::new(),
+fn fmt_name(program: &Symbols<'_>, name: &ValueId) -> String {
+    match name.is_valid() {
+        true => format!(" {}", program.operand(*name)),
+        false => String::new(),
     }
 }
 
@@ -1122,6 +1164,7 @@ impl fmt::Display for Constant {
         match self {
             Constant::I32(v) => write!(f, "{v}"),
             Constant::U32(v) => write!(f, "{v}"),
+            Constant::String(v) => write!(f, "{v:?}"),
             Constant::Access(v) => write!(f, "{}", fmt_flags(*v)),
             Constant::ClearValue(v) => {
                 let color = unsafe { v.0.color.float32 };
@@ -1204,7 +1247,7 @@ impl IR {
                 kind,
                 name,
                 location,
-            } => write!(f, "var{} {kind:?}{location} slot={slot}", fmt_name(name)),
+            } => write!(f, "var{} {kind:?}{location} slot={slot}", fmt_name(p, name)),
             IR::Array { ty: _, elements } => {
                 write!(f, "array [{}]", fmt_list(elements, |id| p.operand(*id).to_string()))
             },
@@ -1217,8 +1260,8 @@ impl IR {
                 initial_access,
                 name,
             } => {
-                write!(f, "buffer{}", fmt_name(name))?;
-                if let Some(size) = size {
+                write!(f, "buffer{}", fmt_name(p, name))?;
+                if size.is_valid() {
                     write!(f, " size={}", p.operand(*size))?;
                 }
                 write!(
@@ -1248,8 +1291,8 @@ impl IR {
                 initial_layout,
                 name,
             } => {
-                write!(f, "image{}", fmt_name(name))?;
-                if let Some(extent) = extent {
+                write!(f, "image{}", fmt_name(p, name))?;
+                if extent.is_valid() {
                     write!(f, " {}", p.operand(*extent))?;
                 }
                 write!(f, " {format:?}")?;
@@ -1361,14 +1404,16 @@ impl IR {
                 write!(
                     f,
                     "begin_rendering{} color=[{}]",
-                    fmt_name(name),
+                    fmt_name(p, name),
                     fmt_list(color_attachments, |id| p.operand(*id).to_string())
                 )?;
-                if let Some(depth) = depth_attachment {
-                    write!(f, " depth={}", p.operand(*depth))?;
+                if depth_attachment.is_valid() {
+                    let depth = *depth_attachment;
+                    write!(f, " depth={}", p.operand(depth))?;
                 }
-                if let Some(area) = render_area {
-                    write!(f, " area={}", p.operand(*area))?;
+                if render_area.is_valid() {
+                    let area = *render_area;
+                    write!(f, " area={}", p.operand(area))?;
                 }
                 match declared_access.is_empty() {
                     true => Ok(()),
@@ -1529,7 +1574,7 @@ impl IR {
                 write!(
                     f,
                     "begin_compute{} declared_access=[{}]",
-                    fmt_name(name),
+                    fmt_name(p, name),
                     fmt_list(declared_access, |(id, access)| format!(
                         "{}:{}",
                         p.operand(*id),
@@ -1673,25 +1718,25 @@ mod tests {
             },
             IR::BeginRendering {
                 color_attachments: vec![value(1)],
-                depth_attachment: Some(value(2)),
-                render_area: None,
+                depth_attachment: value(2),
+                render_area: ValueId::INVALID,
                 declared_access: Vec::new(),
-                name: None,
+                name: ValueId::INVALID,
             },
             IR::BeginRendering {
                 color_attachments: vec![value(1)],
-                depth_attachment: None,
-                render_area: None,
+                depth_attachment: ValueId::INVALID,
+                render_area: ValueId::INVALID,
                 declared_access: vec![(value(2), value(10))],
-                name: None,
+                name: ValueId::INVALID,
             },
             IR::BeginCompute {
                 declared_access: vec![(value(1), value(11))],
-                name: None,
+                name: ValueId::INVALID,
             },
             IR::BeginCompute {
                 declared_access: vec![(value(1), value(11)), (value(2), value(12))],
-                name: None,
+                name: ValueId::INVALID,
             },
             IR::WriteDescriptor {
                 pass: value(0),
@@ -1763,11 +1808,11 @@ mod tests {
 
         let buffer = IR::ConstructBuffer {
             buffer: Buffer::default(),
-            size: None,
+            size: ValueId::INVALID,
             usage: vk::BufferUsageFlags::empty(),
             location: MemoryLocation::GpuOnly,
             initial_access: value(1),
-            name: None,
+            name: ValueId::INVALID,
         };
         assert!(!buffer.is_pure(), "a construct is an identity of its own");
         assert!(buffer.is_removable_when_unused());
@@ -1779,22 +1824,22 @@ mod tests {
         let instructions = [
             IR::ConstructBuffer {
                 buffer: Buffer::default(),
-                size: None,
+                size: ValueId::INVALID,
                 usage: vk::BufferUsageFlags::empty(),
                 location: MemoryLocation::GpuOnly,
                 initial_access: access,
-                name: None,
+                name: ValueId::INVALID,
             },
             IR::BeginRendering {
                 color_attachments: Vec::new(),
-                depth_attachment: None,
-                render_area: None,
+                depth_attachment: ValueId::INVALID,
+                render_area: ValueId::INVALID,
                 declared_access: vec![(value(1), access)],
-                name: None,
+                name: ValueId::INVALID,
             },
             IR::BeginCompute {
                 declared_access: vec![(value(1), access)],
-                name: None,
+                name: ValueId::INVALID,
             },
             IR::WriteDescriptor {
                 pass: value(0),
@@ -1809,6 +1854,10 @@ mod tests {
             let mut operands = Vec::new();
             ir.visit_operands(|id| operands.push(id));
             assert!(operands.contains(&access), "{ir} does not visit its access operand");
+            assert!(
+                !operands.contains(&ValueId::INVALID),
+                "{ir} visits its invalid name operand"
+            );
         }
     }
 

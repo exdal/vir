@@ -145,6 +145,7 @@ fn globals_first(nodes: Vec<ir::Instr>) -> Vec<ir::Instr> {
 }
 
 fn alloc_id(next_id: &mut u32) -> ValueId {
+    assert_ne!(*next_id, u32::MAX, "exhausted valid ValueId values");
     let id = ValueId(*next_id);
     *next_id += 1;
     id
@@ -261,6 +262,7 @@ impl Module {
 
     fn emit(&mut self, ir: IR) -> ValueId {
         let id = ValueId(self.instructions.len() as u32);
+        assert!(id.is_valid(), "exhausted valid ValueId values");
         self.instructions.push(ir);
         self.instruction_block.push(self.current_block);
         id
@@ -345,10 +347,11 @@ impl Module {
     ) -> ValueId {
         let slot = self.variables.len() as u32;
         let name: ir::Name = Some(Arc::from(name));
+        let lowered_name = self.lower_name(name.clone());
         let id = self.emit(IR::Variable {
             slot,
             kind,
-            name: name.clone(),
+            name: lowered_name,
             location,
         });
         self.variables.push(Variable {
@@ -375,13 +378,14 @@ impl Module {
     pub fn declare_buffer_var(&mut self, name: &str, access: Access) -> ValueId {
         self.lower_type(ir::Type::Buffer);
         let initial_access = self.lower_access(access);
+        let lowered_name = self.lower_name(name_of(name));
         let resource = self.emit(IR::ConstructBuffer {
             buffer: Buffer::default(),
-            size: None,
+            size: ValueId::INVALID,
             usage: vk::BufferUsageFlags::empty(),
             location: MemoryLocation::Unknown,
             initial_access,
-            name: name_of(name),
+            name: lowered_name,
         });
 
         self.declare_resource_var(ir::VariableKind::Buffer, name, resource)
@@ -395,12 +399,13 @@ impl Module {
         let base_layer = self.lower_u32(0);
         let layer_count = self.lower_u32(1);
         self.lower_type(ir::Type::Image { format, samples });
+        let lowered_name = self.lower_name(name_of(name));
 
         let resource = self.emit(IR::ConstructImage {
             image: Image::default(),
             image_view: vk::ImageView::null(),
             view_type: vk::ImageViewType::TYPE_2D,
-            extent: None,
+            extent: ValueId::INVALID,
             format,
             samples,
             base_level,
@@ -409,7 +414,7 @@ impl Module {
             layer_count,
             usage: vk::ImageUsageFlags::empty(),
             initial_layout: layout,
-            name: name_of(name),
+            name: lowered_name,
         });
 
         self.declare_resource_var(ir::VariableKind::ImageAttachment, name, resource)
@@ -469,7 +474,7 @@ impl Module {
         if let Some(&id) = self.constants.get(&constant) {
             return id;
         }
-        let id = self.emit(IR::Constant(constant));
+        let id = self.emit(IR::Constant(constant.clone()));
         self.constants.insert(constant, id);
         id
     }
@@ -480,12 +485,19 @@ impl Module {
 
     fn lower_access(&mut self, access: Access) -> ValueId { self.lower_constant(ir::Constant::Access(access)) }
 
+    fn lower_string(&mut self, string: Arc<str>) -> ValueId { self.lower_constant(ir::Constant::String(string)) }
+
+    fn lower_name(&mut self, name: ir::Name) -> ValueId {
+        name.map_or(ValueId::INVALID, |name| self.lower_string(name))
+    }
+
     fn lower_image_attachment(&mut self, attachment: &ImageAttachment, name: ir::Name) -> (ValueId, ValueId) {
         let extent = self.lower_constant(ir::Constant::Extent3D(attachment.extent()));
         let base_level = self.lower_u32(attachment.base_level());
         let level_count = self.lower_u32(attachment.level_count());
         let base_layer = self.lower_u32(attachment.base_layer());
         let layer_count = self.lower_u32(attachment.layer_count());
+        let name = self.lower_name(name);
 
         let ty_instr = self.lower_type(ir::Type::Image {
             format: attachment.format(),
@@ -500,7 +512,7 @@ impl Module {
             image: *attachment.image(),
             image_view: attachment.image_view(),
             view_type,
-            extent: Some(extent),
+            extent,
             format: attachment.format(),
             samples: attachment.samples(),
             base_level,
@@ -525,6 +537,7 @@ impl Module {
         let level_count = self.lower_u32(info.mip_levels);
         let base_layer = self.lower_u32(0);
         let layer_count = self.lower_u32(info.array_layers);
+        let name = self.lower_name(name_of(&info.name));
 
         self.lower_type(ir::Type::Image {
             format: info.format,
@@ -540,7 +553,7 @@ impl Module {
             image: Image::default(),
             image_view: vk::ImageView::null(),
             view_type,
-            extent: Some(extent),
+            extent,
             format: info.format,
             samples: info.samples,
             base_level,
@@ -549,7 +562,7 @@ impl Module {
             layer_count,
             usage: info.usage,
             initial_layout: vk::ImageLayout::UNDEFINED,
-            name: name_of(&info.name),
+            name,
         })
     }
 
@@ -564,14 +577,15 @@ impl Module {
     pub fn transient_buffer(&mut self, info: &BufferInfo) -> ValueId {
         let size = self.lower_constant(ir::Constant::Size(info.size as usize));
         let initial_access = self.lower_access(Access::None);
+        let name = self.lower_name(name_of(&info.name));
         self.lower_type(ir::Type::Buffer);
         self.emit(IR::ConstructBuffer {
             buffer: Buffer::default(),
-            size: Some(size),
+            size,
             usage: info.usage,
             location: info.location,
             initial_access,
-            name: name_of(&info.name),
+            name,
         })
     }
 
@@ -581,23 +595,37 @@ impl Module {
         let initial_access = self.lower_access(access);
         self.emit(IR::ConstructBuffer {
             buffer: *buffer,
-            size: Some(size),
+            size,
             usage: vk::BufferUsageFlags::empty(),
             location: MemoryLocation::Unknown,
             initial_access,
-            name: None,
+            name: ValueId::INVALID,
         })
     }
 
     pub fn set_name(&mut self, id: ValueId, name: impl Into<Arc<str>>) -> ValueId {
+        if !matches!(
+            self.instructions.get(id.0 as usize),
+            Some(
+                IR::ConstructImage { .. }
+                    | IR::ConstructBuffer { .. }
+                    | IR::BeginRendering { .. }
+                    | IR::BeginCompute { .. }
+            )
+        ) {
+            tracing::warn!(%id, "value cannot carry a name; the name is dropped");
+            return id;
+        }
+
+        let name = self.lower_string(name.into());
         match self.instructions.get_mut(id.0 as usize) {
             Some(
                 IR::ConstructImage { name: slot, .. }
                 | IR::ConstructBuffer { name: slot, .. }
                 | IR::BeginRendering { name: slot, .. }
                 | IR::BeginCompute { name: slot, .. },
-            ) => *slot = Some(name.into()),
-            _ => tracing::warn!(%id, "value cannot carry a name; the name is dropped"),
+            ) => *slot = name,
+            _ => unreachable!("the name target was checked above"),
         }
 
         id
@@ -716,12 +744,14 @@ impl Module {
     fn begin_rendering_with(
         &mut self, color_attachments: &[ValueId], depth_attachment: Option<ValueId>, render_area: Option<ValueId>,
     ) -> &mut Self {
+        let depth_attachment = depth_attachment.unwrap_or(ValueId::INVALID);
+        let render_area = render_area.unwrap_or(ValueId::INVALID);
         let id = self.emit(IR::BeginRendering {
             color_attachments: color_attachments.to_vec(),
             depth_attachment,
             render_area,
             declared_access: Vec::new(),
-            name: None,
+            name: ValueId::INVALID,
         });
         self.open_pass(PassKind::Rendering, id)
     }
@@ -729,7 +759,7 @@ impl Module {
     pub fn begin_compute(&mut self) -> &mut Self {
         let id = self.emit(IR::BeginCompute {
             declared_access: Vec::new(),
-            name: None,
+            name: ValueId::INVALID,
         });
         self.open_pass(PassKind::Compute, id)
     }
@@ -787,16 +817,28 @@ impl Module {
                 match ir {
                     IR::Constant(_) => {},
                     IR::Type(_) => {},
-                    IR::Variable { .. } => {},
+                    IR::Variable { name, .. } => {
+                        if name.is_valid() {
+                            stack.push(*name);
+                        }
+                    },
                     IR::Array { ty, elements } => {
                         stack.push(*ty);
                         elements.iter().rev().for_each(|v| stack.push(*v));
                     },
                     IR::ConstructBuffer {
-                        size, initial_access, ..
+                        size,
+                        initial_access,
+                        name,
+                        ..
                     } => {
+                        if name.is_valid() {
+                            stack.push(*name);
+                        }
                         stack.push(*initial_access);
-                        size.iter().for_each(|v| stack.push(*v));
+                        if size.is_valid() {
+                            stack.push(*size);
+                        }
                     },
                     IR::ConstructImage {
                         extent,
@@ -804,13 +846,19 @@ impl Module {
                         level_count,
                         base_layer,
                         layer_count,
+                        name,
                         ..
                     } => {
+                        if name.is_valid() {
+                            stack.push(*name);
+                        }
                         stack.push(*layer_count);
                         stack.push(*base_layer);
                         stack.push(*level_count);
                         stack.push(*base_level);
-                        extent.iter().for_each(|v| stack.push(*v));
+                        if extent.is_valid() {
+                            stack.push(*extent);
+                        }
                     },
                     IR::AcquireNextImage { swapchain } => {
                         stack.push(*swapchain);
@@ -848,14 +896,22 @@ impl Module {
                         depth_attachment,
                         render_area,
                         declared_access,
+                        name,
                         ..
                     } => {
+                        if name.is_valid() {
+                            stack.push(*name);
+                        }
                         declared_access.iter().rev().for_each(|(resource, access)| {
                             stack.push(*access);
                             stack.push(*resource);
                         });
-                        render_area.iter().for_each(|v| stack.push(*v));
-                        depth_attachment.iter().for_each(|v| stack.push(*v));
+                        if render_area.is_valid() {
+                            stack.push(*render_area);
+                        }
+                        if depth_attachment.is_valid() {
+                            stack.push(*depth_attachment);
+                        }
                         color_attachments.iter().rev().for_each(|v| stack.push(*v));
                     },
                     IR::BindPipeline { pass, .. } => {
@@ -925,7 +981,10 @@ impl Module {
                     IR::EndRendering { pass } => {
                         stack.push(*pass);
                     },
-                    IR::BeginCompute { declared_access, .. } => {
+                    IR::BeginCompute { declared_access, name } => {
+                        if name.is_valid() {
+                            stack.push(*name);
+                        }
                         declared_access.iter().rev().for_each(|(resource, access)| {
                             stack.push(*access);
                             stack.push(*resource);
@@ -1486,9 +1545,9 @@ impl Module {
                         transition!(*attachment, access_id, Access::ColorRW);
                     }
 
-                    if let Some(depth) = depth_attachment {
+                    if depth_attachment.is_valid() {
                         let depth_id = emit_access!(Access::DepthStencilRW);
-                        transition!(*depth, depth_id, Access::DepthStencilRW);
+                        transition!(*depth_attachment, depth_id, Access::DepthStencilRW);
                     }
 
                     for (buffer, access) in region_buffers.get(&value_id).cloned().into_iter().flatten() {
@@ -1693,7 +1752,7 @@ impl Module {
             } => Some(ImageType {
                 format: *format,
                 samples: *samples,
-                extent: match extent.and_then(|extent| self.instructions.get(extent.0 as usize)) {
+                extent: match self.instructions.get(extent.0 as usize) {
                     Some(IR::Constant(ir::Constant::Extent3D(extent))) => Some(*extent),
                     _ => None,
                 },
@@ -1712,7 +1771,7 @@ impl Module {
             // a transient buffer has no handle to ask, and one sized by a variable or bound to
             // one has no size to read here at all
             IR::ConstructBuffer { buffer, size, .. } if buffer.is_null() => {
-                match size.and_then(|size| self.instructions.get(size.0 as usize)) {
+                match self.instructions.get(size.0 as usize) {
                     Some(IR::Constant(ir::Constant::U32(size))) => Some(*size as u64),
                     _ => None,
                 }
@@ -1775,8 +1834,8 @@ impl Module {
                         rendering.color_formats.push(image.format);
                     }
 
-                    if let Some(attachment) = depth_attachment {
-                        match self.resolve_image(*attachment) {
+                    if depth_attachment.is_valid() {
+                        match self.resolve_image(*depth_attachment) {
                             Some(image) => {
                                 rendering.depth_format = Some(image.format);
 
@@ -1789,22 +1848,22 @@ impl Module {
                                     });
                                 } else if image.samples != rendering.samples {
                                     tracing::warn!(
-                                        %attachment,
+                                        attachment = %depth_attachment,
                                         "depth attachment sample count differs from the color attachments"
                                     );
                                 }
                             },
                             None => {
-                                tracing::warn!(%attachment, "cannot infer depth attachment type; pipelines may not match")
+                                tracing::warn!(attachment = %depth_attachment, "cannot infer depth attachment type; pipelines may not match")
                             },
                         }
                     }
 
                     // framebuffer-relative state resolves against this, so it has to match the
                     // area the region is opened with
-                    let extent = match render_area {
-                        Some(id) => self.resolve_extent_2d(*id),
-                        None => attachment_extent,
+                    let extent = match render_area.is_valid() {
+                        true => self.resolve_extent_2d(*render_area),
+                        false => attachment_extent,
                     };
                     regions.insert(
                         *value_id,
@@ -3116,7 +3175,8 @@ mod tests {
             .end_compute();
 
         let dump = module.compile(&Unchecked, end).unwrap().dump();
-        assert!(dump.contains("buffer \"instances\""), "{dump}");
+        assert!(dump.contains("= const \"instances\""), "{dump}");
+        assert!(dump.contains("buffer %") && dump.contains("(\"instances\")"), "{dump}");
         assert!(dump.contains(" bound"), "{dump}");
         assert!(!dump.contains("transient"), "{dump}");
     }

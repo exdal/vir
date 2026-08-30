@@ -7,6 +7,14 @@ use crate::{Access, AcquiredSwapchain, Buffer, ClearValue, ImageAttachment, Pass
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ValueId(pub u32);
 
+impl ValueId {
+    pub const INVALID: Self = Self(u32::MAX);
+
+    pub const fn is_valid(self) -> bool { self.0 != u32::MAX }
+
+    pub const fn is_invalid(self) -> bool { self.0 == u32::MAX }
+}
+
 impl fmt::Display for ValueId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "%{}", self.0) }
 }
@@ -33,6 +41,7 @@ pub enum Value {
     Size(usize),
     Extent2D(vk::Extent2D),
     Extent3D(vk::Extent3D),
+    String(Arc<str>),
     ImageAttachment(ImageAttachment),
     Buffer(Buffer),
     Bytes(Arc<[u8]>),
@@ -80,6 +89,9 @@ impl From<vk::Extent2D> for Value {
 }
 impl From<vk::Extent3D> for Value {
     fn from(v: vk::Extent3D) -> Self { Value::Extent3D(v) }
+}
+impl From<Arc<str>> for Value {
+    fn from(v: Arc<str>) -> Self { Value::String(v) }
 }
 impl From<ClearValue> for Value {
     fn from(v: ClearValue) -> Self { Value::ClearValue(v) }
@@ -178,6 +190,15 @@ impl FromValue for vk::Extent3D {
         match value {
             Value::Extent3D(v) => *v,
             _ => panic!("expected Extent3D, got {:?}", value),
+        }
+    }
+}
+
+impl FromValue for Arc<str> {
+    fn from_value(value: &Value) -> Self {
+        match value {
+            Value::String(v) => v.clone(),
+            _ => panic!("expected String, got {:?}", value),
         }
     }
 }
