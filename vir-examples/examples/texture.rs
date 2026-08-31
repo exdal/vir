@@ -239,6 +239,7 @@ mod tests {
                 count: 1,
                 variable_count: false,
                 stages: vk::ShaderStageFlags::FRAGMENT,
+                access: Access::FragmentSampled,
             }]
         );
 

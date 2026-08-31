@@ -69,48 +69,76 @@ struct Arm {
 
 fn resolve_descriptor_access(
     mut nodes: Vec<ir::Instr>, pipelines: &impl PipelineBindings, next_id: &mut u32,
-) -> Vec<ir::Instr> {
+) -> Result<Vec<ir::Instr>, vk::Result> {
     let mut written: BTreeMap<(u32, u32), usize> = BTreeMap::new();
-    let mut open = false;
-    let mut bound: Option<PipelineId> = None;
     let mut resolved: BTreeMap<usize, Access> = BTreeMap::new();
+    let mut open = false;
+    let mut failed = false;
 
-    for (index, (_, ir)) in nodes.iter().enumerate() {
-        match ir {
+    for (index, (value_id, node)) in nodes.iter().enumerate() {
+        match node {
             IR::BeginRendering { .. } | IR::BeginCompute { .. } => {
                 written.clear();
                 open = true;
-                bound = None;
             },
             IR::EndRendering { .. } | IR::EndCompute { .. } => {
                 open = false;
-                bound = None;
             },
-            IR::BindPipeline { pipeline, .. } => bound = Some(*pipeline),
+            IR::WriteDescriptor { set, binding, .. } => {
+                if !open {
+                    tracing::error!(%value_id, set, binding, "a descriptor is written outside of any pass");
+                    failed = true;
+                    continue;
+                }
 
-            IR::WriteDescriptor { set, binding, .. } if open => {
                 written.insert((*set, *binding), index);
+                resolved.insert(index, Access::None);
             },
+            IR::Draw { pipeline, .. }
+            | IR::DrawIndexed { pipeline, .. }
+            | IR::CallOpaque { pipeline, .. }
+            | IR::Dispatch { pipeline, .. } => {
+                if written.is_empty() {
+                    continue;
+                }
 
-            IR::Draw { .. } | IR::DrawIndexed { .. } | IR::CallOpaque { .. } | IR::Dispatch { .. } => {
-                let Some(bindings) = bound.and_then(|pipeline| pipelines.bindings(pipeline)) else {
+                if pipeline.is_invalid() {
+                    tracing::error!(%value_id, "descriptors are consumed before a pipeline is bound");
+                    failed = true;
+                    continue;
+                }
+                let Some(bindings) = pipelines.bindings(*pipeline) else {
+                    tracing::error!(
+                        %value_id,
+                        %pipeline,
+                        "the bound pipeline has no reflection available for its active descriptors"
+                    );
+                    failed = true;
                     continue;
                 };
 
                 for binding in bindings {
-                    if let Some(at) = written.get(&(binding.set, binding.binding)) {
-                        *resolved.entry(*at).or_insert(Access::empty()) |= Access::sampled_by(binding.stages);
-                    }
+                    let Some(index) = written.get(&(binding.set, binding.binding)) else {
+                        continue;
+                    };
+                    let access = resolved
+                        .get_mut(index)
+                        .expect("every active descriptor write must have an access accumulator");
+                    let combined = access.difference(Access::None) | binding.access.difference(Access::None);
+                    *access = if combined.is_empty() { Access::None } else { combined };
                 }
             },
-
             _ => {},
         }
     }
 
+    if failed {
+        return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+    }
+
     let mut access_ids = nodes
         .iter()
-        .filter_map(|(id, ir)| match ir {
+        .filter_map(|(id, node)| match node {
             IR::Constant(ir::Constant::Access(access)) => Some((*access, *id)),
             _ => None,
         })
@@ -133,7 +161,7 @@ fn resolve_descriptor_access(
     }
 
     constants.extend(nodes);
-    constants
+    Ok(constants)
 }
 
 fn globals_first(nodes: Vec<ir::Instr>) -> Vec<ir::Instr> {
@@ -790,12 +818,12 @@ impl Module {
     }
 
     pub fn compile_all(&self, pipelines: &impl PipelineBindings, ids: &[ValueId]) -> Result<Program, vk::Result> {
-        let program = self.lower(pipelines, ids);
+        let program = self.lower(pipelines, ids)?;
         analyze_descriptors(&program, pipelines)?;
         Ok(program)
     }
 
-    fn lower(&self, pipelines: &impl PipelineBindings, ids: &[ValueId]) -> Program {
+    fn lower(&self, pipelines: &impl PipelineBindings, ids: &[ValueId]) -> Result<Program, vk::Result> {
         let mut roots = ids.to_vec();
         roots.extend(self.branch_conditions());
         roots.extend(
@@ -808,8 +836,9 @@ impl Module {
         let mut next_id = self.instructions.len() as u32;
         let nodes = self.topo_sort(&roots);
         let nodes = self.layout_blocks(nodes, &mut next_id);
+        let nodes = self.infer(nodes);
         // the barriers are what the resolved accesses are for, so this comes before them
-        let nodes = resolve_descriptor_access(nodes, pipelines, &mut next_id);
+        let nodes = resolve_descriptor_access(nodes, pipelines, &mut next_id)?;
         let nodes = self.sync(nodes, &mut next_id);
         let nodes = self.simplify_cfg(nodes);
         let nodes = self.fold_barriers(nodes, &mut next_id);
@@ -822,9 +851,7 @@ impl Module {
             .enumerate()
             .map(|(slot, id)| (*id, slot as u32))
             .collect();
-        let nodes = self.infer(nodes);
-
-        Program::new(nodes, self.variables.clone(), slots)
+        Ok(Program::new(nodes, self.variables.clone(), slots))
     }
 
     fn topo_sort(&self, roots: &[ValueId]) -> Vec<ir::Instr> {
@@ -4382,7 +4409,7 @@ mod tests {
         let buffer = module.import_buffer(&Buffer::default(), Access::HostWrite);
         let image = module.transient_image(&untyped_info());
 
-        let _end = module
+        let end = module
             .begin_compute([(image, Access::ComputeRead)])
             .bind_compute_pipeline(PipelineId(0))
             .bind_image(0, 0, image)
@@ -4406,7 +4433,22 @@ mod tests {
             IR::WriteDescriptor { access, .. } => Some(*access),
             _ => None,
         });
-        assert_eq!(descriptor.map(|id| module.resolve_access(id)), Some(Access::None));
+        let descriptor = descriptor.expect("the descriptor write should name its access");
+        assert!(descriptor.is_valid());
+        assert_eq!(module.resolve_access(descriptor), Access::None);
+
+        let bindings = Declared::with_access(
+            &[(0, 0, vk::DescriptorType::SAMPLED_IMAGE)],
+            vk::ShaderStageFlags::COMPUTE,
+            Access::ComputeWrite,
+        );
+        let compiled = module.compile(&bindings, end).unwrap();
+        let access = compiled.instructions().iter().find_map(|(_, ir)| match ir {
+            IR::WriteDescriptor { access, .. } => Some(*access),
+            _ => None,
+        });
+        let symbols = ir::Symbols::new(compiled.instructions());
+        assert_eq!(access.and_then(|id| symbols.access(id)), Some(Access::ComputeWrite));
     }
 
     #[test]

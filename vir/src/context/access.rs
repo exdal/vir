@@ -58,8 +58,36 @@ bitflags! {
         const TessellationSampled = 1 << 38;
         const TessellationRead = 1 << 39;
         const TessellationUniformRead = 1 << 40;
+        const VertexWrite = 1 << 41;
+        const VertexRW = Self::VertexRead.bits() | Self::VertexWrite.bits();
+        const TessellationControlSampled = 1 << 42;
+        const TessellationControlRead = 1 << 43;
+        const TessellationControlWrite = 1 << 44;
+        const TessellationControlRW = Self::TessellationControlRead.bits() | Self::TessellationControlWrite.bits();
+        const TessellationControlUniformRead = 1 << 45;
+        const TessellationEvaluationSampled = 1 << 46;
+        const TessellationEvaluationRead = 1 << 47;
+        const TessellationEvaluationWrite = 1 << 48;
+        const TessellationEvaluationRW = Self::TessellationEvaluationRead.bits() | Self::TessellationEvaluationWrite.bits();
+        const TessellationEvaluationUniformRead = 1 << 49;
+        const GeometrySampled = 1 << 50;
+        const GeometryRead = 1 << 51;
+        const GeometryWrite = 1 << 52;
+        const GeometryRW = Self::GeometryRead.bits() | Self::GeometryWrite.bits();
+        const GeometryUniformRead = 1 << 53;
+        const InputAttachmentRead = 1 << 54;
+        const VertexAccelerationStructureRead = 1 << 55;
+        const TessellationControlAccelerationStructureRead = 1 << 56;
+        const TessellationEvaluationAccelerationStructureRead = 1 << 57;
+        const GeometryAccelerationStructureRead = 1 << 58;
+        const FragmentAccelerationStructureRead = 1 << 59;
+        const ComputeAccelerationStructureRead = 1 << 60;
         const Writes = Self::ColorWrite.bits()
             | Self::DepthStencilWrite.bits()
+            | Self::VertexWrite.bits()
+            | Self::TessellationControlWrite.bits()
+            | Self::TessellationEvaluationWrite.bits()
+            | Self::GeometryWrite.bits()
             | Self::FragmentWrite.bits()
             | Self::ComputeWrite.bits()
             | Self::RayTracingWrite.bits()
@@ -83,12 +111,15 @@ impl Access {
             (vk::ShaderStageFlags::VERTEX, Access::VertexSampled),
             (vk::ShaderStageFlags::FRAGMENT, Access::FragmentSampled),
             (vk::ShaderStageFlags::COMPUTE, Access::ComputeSampled),
-            (vk::ShaderStageFlags::TESSELLATION_CONTROL, Access::TessellationSampled),
+            (
+                vk::ShaderStageFlags::TESSELLATION_CONTROL,
+                Access::TessellationControlSampled,
+            ),
             (
                 vk::ShaderStageFlags::TESSELLATION_EVALUATION,
-                Access::TessellationSampled,
+                Access::TessellationEvaluationSampled,
             ),
-            (vk::ShaderStageFlags::GEOMETRY, Access::VertexSampled),
+            (vk::ShaderStageFlags::GEOMETRY, Access::GeometrySampled),
             (vk::ShaderStageFlags::RAYGEN_KHR, Access::RayTracingSampled),
             (vk::ShaderStageFlags::ANY_HIT_KHR, Access::RayTracingSampled),
             (vk::ShaderStageFlags::CLOSEST_HIT_KHR, Access::RayTracingSampled),
@@ -110,6 +141,100 @@ impl Access {
         if !uncovered.is_empty() {
             tracing::warn!(stages = ?uncovered, "no sampled access covers these stages; memory is waited on instead");
             access |= Access::MemoryRead;
+        }
+
+        access
+    }
+
+    pub(crate) fn shader_read_by(stage: vk::ShaderStageFlags) -> Access {
+        Self::by_shader_stage(
+            stage,
+            Access::VertexRead,
+            Access::TessellationControlRead,
+            Access::TessellationEvaluationRead,
+            Access::GeometryRead,
+            Access::FragmentRead,
+            Access::ComputeRead,
+            Access::RayTracingRead,
+            Access::MemoryRead,
+        )
+    }
+
+    pub(crate) fn shader_write_by(stage: vk::ShaderStageFlags) -> Access {
+        Self::by_shader_stage(
+            stage,
+            Access::VertexWrite,
+            Access::TessellationControlWrite,
+            Access::TessellationEvaluationWrite,
+            Access::GeometryWrite,
+            Access::FragmentWrite,
+            Access::ComputeWrite,
+            Access::RayTracingWrite,
+            Access::MemoryWrite,
+        )
+    }
+
+    pub(crate) fn uniform_by(stage: vk::ShaderStageFlags) -> Access {
+        Self::by_shader_stage(
+            stage,
+            Access::VertexUniformRead,
+            Access::TessellationControlUniformRead,
+            Access::TessellationEvaluationUniformRead,
+            Access::GeometryUniformRead,
+            Access::FragmentUniformRead,
+            Access::ComputeUniformRead,
+            Access::RayTracingUniformRead,
+            Access::MemoryRead,
+        )
+    }
+
+    pub(crate) fn acceleration_structure_read_by(stage: vk::ShaderStageFlags) -> Access {
+        Self::by_shader_stage(
+            stage,
+            Access::VertexAccelerationStructureRead,
+            Access::TessellationControlAccelerationStructureRead,
+            Access::TessellationEvaluationAccelerationStructureRead,
+            Access::GeometryAccelerationStructureRead,
+            Access::FragmentAccelerationStructureRead,
+            Access::ComputeAccelerationStructureRead,
+            Access::RayTracingRead,
+            Access::MemoryRead,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn by_shader_stage(
+        stages: vk::ShaderStageFlags, vertex: Access, tessellation_control: Access, tessellation_evaluation: Access,
+        geometry: Access, fragment: Access, compute: Access, ray_tracing: Access, fallback: Access,
+    ) -> Access {
+        let mapped = [
+            (vk::ShaderStageFlags::VERTEX, vertex),
+            (vk::ShaderStageFlags::TESSELLATION_CONTROL, tessellation_control),
+            (vk::ShaderStageFlags::TESSELLATION_EVALUATION, tessellation_evaluation),
+            (vk::ShaderStageFlags::GEOMETRY, geometry),
+            (vk::ShaderStageFlags::FRAGMENT, fragment),
+            (vk::ShaderStageFlags::COMPUTE, compute),
+            (vk::ShaderStageFlags::RAYGEN_KHR, ray_tracing),
+            (vk::ShaderStageFlags::ANY_HIT_KHR, ray_tracing),
+            (vk::ShaderStageFlags::CLOSEST_HIT_KHR, ray_tracing),
+            (vk::ShaderStageFlags::MISS_KHR, ray_tracing),
+            (vk::ShaderStageFlags::INTERSECTION_KHR, ray_tracing),
+            (vk::ShaderStageFlags::CALLABLE_KHR, ray_tracing),
+        ];
+
+        let mut access = Access::empty();
+        let mut covered = vk::ShaderStageFlags::empty();
+        for (stage, mapped_access) in mapped {
+            if stages.contains(stage) {
+                access |= mapped_access;
+                covered |= stage;
+            }
+        }
+
+        let uncovered = stages & !covered;
+        if !uncovered.is_empty() {
+            tracing::warn!(stages = ?uncovered, "no access covers these shader stages; memory is waited on instead");
+            access |= fallback;
         }
 
         access
@@ -136,6 +261,9 @@ impl From<Access> for vk::AccessFlags2 {
         }
         if access.contains(Access::VertexRead) {
             flags |= vk::AccessFlags2::SHADER_READ;
+        }
+        if access.contains(Access::VertexWrite) {
+            flags |= vk::AccessFlags2::SHADER_WRITE;
         }
         if access.contains(Access::AttributeRead) {
             flags |= vk::AccessFlags2::VERTEX_ATTRIBUTE_READ;
@@ -233,6 +361,41 @@ impl From<Access> for vk::AccessFlags2 {
         if access.contains(Access::TessellationUniformRead) {
             flags |= vk::AccessFlags2::UNIFORM_READ;
         }
+        if access.intersects(
+            Access::TessellationControlSampled | Access::TessellationEvaluationSampled | Access::GeometrySampled,
+        ) {
+            flags |= vk::AccessFlags2::SHADER_SAMPLED_READ;
+        }
+        if access
+            .intersects(Access::TessellationControlRead | Access::TessellationEvaluationRead | Access::GeometryRead)
+        {
+            flags |= vk::AccessFlags2::SHADER_READ;
+        }
+        if access
+            .intersects(Access::TessellationControlWrite | Access::TessellationEvaluationWrite | Access::GeometryWrite)
+        {
+            flags |= vk::AccessFlags2::SHADER_WRITE;
+        }
+        if access.intersects(
+            Access::TessellationControlUniformRead
+                | Access::TessellationEvaluationUniformRead
+                | Access::GeometryUniformRead,
+        ) {
+            flags |= vk::AccessFlags2::UNIFORM_READ;
+        }
+        if access.contains(Access::InputAttachmentRead) {
+            flags |= vk::AccessFlags2::INPUT_ATTACHMENT_READ;
+        }
+        if access.intersects(
+            Access::VertexAccelerationStructureRead
+                | Access::TessellationControlAccelerationStructureRead
+                | Access::TessellationEvaluationAccelerationStructureRead
+                | Access::GeometryAccelerationStructureRead
+                | Access::FragmentAccelerationStructureRead
+                | Access::ComputeAccelerationStructureRead,
+        ) {
+            flags |= vk::AccessFlags2::ACCELERATION_STRUCTURE_READ_KHR;
+        }
         flags
     }
 }
@@ -256,6 +419,9 @@ impl From<Access> for vk::PipelineStageFlags2 {
             flags |= vk::PipelineStageFlags2::VERTEX_SHADER;
         }
         if access.contains(Access::VertexRead) {
+            flags |= vk::PipelineStageFlags2::VERTEX_SHADER;
+        }
+        if access.contains(Access::VertexWrite) {
             flags |= vk::PipelineStageFlags2::VERTEX_SHADER;
         }
         if access.contains(Access::VertexUniformRead) {
@@ -358,6 +524,45 @@ impl From<Access> for vk::PipelineStageFlags2 {
             flags |= vk::PipelineStageFlags2::TESSELLATION_CONTROL_SHADER
                 | vk::PipelineStageFlags2::TESSELLATION_EVALUATION_SHADER;
         }
+        if access.intersects(
+            Access::TessellationControlSampled
+                | Access::TessellationControlRead
+                | Access::TessellationControlWrite
+                | Access::TessellationControlUniformRead
+                | Access::TessellationControlAccelerationStructureRead,
+        ) {
+            flags |= vk::PipelineStageFlags2::TESSELLATION_CONTROL_SHADER;
+        }
+        if access.intersects(
+            Access::TessellationEvaluationSampled
+                | Access::TessellationEvaluationRead
+                | Access::TessellationEvaluationWrite
+                | Access::TessellationEvaluationUniformRead
+                | Access::TessellationEvaluationAccelerationStructureRead,
+        ) {
+            flags |= vk::PipelineStageFlags2::TESSELLATION_EVALUATION_SHADER;
+        }
+        if access.intersects(
+            Access::GeometrySampled
+                | Access::GeometryRead
+                | Access::GeometryWrite
+                | Access::GeometryUniformRead
+                | Access::GeometryAccelerationStructureRead,
+        ) {
+            flags |= vk::PipelineStageFlags2::GEOMETRY_SHADER;
+        }
+        if access.contains(Access::InputAttachmentRead) {
+            flags |= vk::PipelineStageFlags2::FRAGMENT_SHADER;
+        }
+        if access.contains(Access::VertexAccelerationStructureRead) {
+            flags |= vk::PipelineStageFlags2::VERTEX_SHADER;
+        }
+        if access.contains(Access::FragmentAccelerationStructureRead) {
+            flags |= vk::PipelineStageFlags2::FRAGMENT_SHADER;
+        }
+        if access.contains(Access::ComputeAccelerationStructureRead) {
+            flags |= vk::PipelineStageFlags2::COMPUTE_SHADER;
+        }
         flags
     }
 }
@@ -382,7 +587,11 @@ impl From<Access> for vk::ImageLayout {
                 | Access::VertexSampled
                 | Access::ComputeSampled
                 | Access::RayTracingSampled
-                | Access::TessellationSampled,
+                | Access::TessellationSampled
+                | Access::TessellationControlSampled
+                | Access::TessellationEvaluationSampled
+                | Access::GeometrySampled
+                | Access::InputAttachmentRead,
         ) {
             return vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
         }
@@ -390,6 +599,14 @@ impl From<Access> for vk::ImageLayout {
             Access::FragmentRead
                 | Access::FragmentWrite
                 | Access::FragmentRW
+                | Access::VertexRead
+                | Access::VertexWrite
+                | Access::TessellationControlRead
+                | Access::TessellationControlWrite
+                | Access::TessellationEvaluationRead
+                | Access::TessellationEvaluationWrite
+                | Access::GeometryRead
+                | Access::GeometryWrite
                 | Access::ComputeRead
                 | Access::ComputeWrite
                 | Access::RayTracingRead
@@ -412,7 +629,16 @@ impl From<Access> for vk::BufferUsageFlags {
     fn from(access: Access) -> Self {
         let mut usage = vk::BufferUsageFlags::empty();
 
-        if access.intersects(Access::MemoryRW | Access::FragmentRW | Access::ComputeRW | Access::RayTracingRW) {
+        if access.intersects(
+            Access::MemoryRW
+                | Access::VertexRW
+                | Access::TessellationControlRW
+                | Access::TessellationEvaluationRW
+                | Access::GeometryRW
+                | Access::FragmentRW
+                | Access::ComputeRW
+                | Access::RayTracingRW,
+        ) {
             usage |= vk::BufferUsageFlags::STORAGE_BUFFER;
         }
         if access.intersects(
@@ -421,6 +647,9 @@ impl From<Access> for vk::BufferUsageFlags {
                 | Access::VertexUniformRead
                 | Access::FragmentUniformRead
                 | Access::TessellationUniformRead
+                | Access::TessellationControlUniformRead
+                | Access::TessellationEvaluationUniformRead
+                | Access::GeometryUniformRead
                 | Access::RayTracingUniformRead,
         ) {
             usage |= vk::BufferUsageFlags::UNIFORM_BUFFER;
@@ -458,7 +687,10 @@ impl From<Access> for vk::ImageUsageFlags {
                 | Access::ComputeSampled
                 | Access::RayTracingSampled
                 | Access::VertexSampled
-                | Access::TessellationSampled,
+                | Access::TessellationSampled
+                | Access::TessellationControlSampled
+                | Access::TessellationEvaluationSampled
+                | Access::GeometrySampled,
         ) {
             usage |= vk::ImageUsageFlags::SAMPLED;
         }
@@ -471,10 +703,81 @@ impl From<Access> for vk::ImageUsageFlags {
         if access.intersects(Access::MemoryRW | Access::TransferWrite) {
             usage |= vk::ImageUsageFlags::TRANSFER_DST;
         }
-        if access.intersects(Access::MemoryRW | Access::FragmentRW | Access::ComputeRW | Access::RayTracingRW) {
+        if access.intersects(
+            Access::MemoryRW
+                | Access::VertexRW
+                | Access::TessellationControlRW
+                | Access::TessellationEvaluationRW
+                | Access::GeometryRW
+                | Access::FragmentRW
+                | Access::ComputeRW
+                | Access::RayTracingRW,
+        ) {
             usage |= vk::ImageUsageFlags::STORAGE;
+        }
+        if access.intersects(Access::MemoryRW | Access::InputAttachmentRead) {
+            usage |= vk::ImageUsageFlags::INPUT_ATTACHMENT;
         }
 
         usage
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sampled_access_keeps_each_graphics_stage_distinct() {
+        let stages = vk::ShaderStageFlags::VERTEX
+            | vk::ShaderStageFlags::TESSELLATION_CONTROL
+            | vk::ShaderStageFlags::TESSELLATION_EVALUATION
+            | vk::ShaderStageFlags::GEOMETRY
+            | vk::ShaderStageFlags::FRAGMENT;
+        assert_eq!(
+            Access::sampled_by(stages),
+            Access::VertexSampled
+                | Access::TessellationControlSampled
+                | Access::TessellationEvaluationSampled
+                | Access::GeometrySampled
+                | Access::FragmentSampled
+        );
+    }
+
+    #[test]
+    fn compute_uniform_reads_convert_to_the_matching_vulkan_access_and_stage() {
+        assert_eq!(
+            vk::AccessFlags2::from(Access::ComputeUniformRead),
+            vk::AccessFlags2::UNIFORM_READ
+        );
+        assert_eq!(
+            vk::PipelineStageFlags2::from(Access::ComputeUniformRead),
+            vk::PipelineStageFlags2::COMPUTE_SHADER
+        );
+    }
+
+    #[test]
+    fn geometry_storage_writes_are_writes_at_the_geometry_stage() {
+        assert!(Access::GeometryWrite.writes());
+        assert_eq!(
+            vk::AccessFlags2::from(Access::GeometryWrite),
+            vk::AccessFlags2::SHADER_WRITE
+        );
+        assert_eq!(
+            vk::PipelineStageFlags2::from(Access::GeometryWrite),
+            vk::PipelineStageFlags2::GEOMETRY_SHADER
+        );
+    }
+
+    #[test]
+    fn input_attachment_access_selects_its_layout_and_usage() {
+        assert_eq!(
+            vk::ImageLayout::from(Access::InputAttachmentRead),
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+        );
+        assert_eq!(
+            vk::ImageUsageFlags::from(Access::InputAttachmentRead),
+            vk::ImageUsageFlags::INPUT_ATTACHMENT
+        );
     }
 }

@@ -43,17 +43,15 @@ let target = frame
     .end_rendering();
 ```
 
-Scalar sampled images and combined image samplers are ordinary pass state. Their set layouts are
-reflected from the shaders, while the pass resource list declares the image transition and the
-binding call records the descriptor write:
+Scalar sampled images and combined image samplers are ordinary pass state. Their set layouts and
+statically reachable read/write accesses are reflected from the shaders, so the binding call infers
+the image transition from the operations that actually use its set and binding. A pipeline must
+therefore be bound before any descriptor write:
 
 ```rust
 let target = frame
     .module
-    .begin_rendering([
-        (target, Access::ColorRW),
-        (texture, Access::FragmentSampled),
-    ])
+    .begin_rendering([(target, Access::ColorRW)])
     .bind_graphics_pipeline(pipeline)
     .bind_texture(0, 3, texture, sampler)
     .draw(3, 1)

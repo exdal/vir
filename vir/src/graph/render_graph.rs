@@ -185,7 +185,11 @@ fn merged_bindings(reflections: &[Reflection]) -> Vec<DescriptorBinding> {
         for binding in &reflection.bindings {
             merged
                 .entry((binding.set, binding.binding))
-                .and_modify(|shared| shared.stages |= binding.stages)
+                .and_modify(|shared| {
+                    shared.stages |= binding.stages;
+                    let combined = shared.access.difference(Access::None) | binding.access.difference(Access::None);
+                    shared.access = if combined.is_empty() { Access::None } else { combined };
+                })
                 .or_insert(*binding);
         }
     }

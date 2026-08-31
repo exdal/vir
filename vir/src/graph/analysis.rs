@@ -13,8 +13,8 @@ use crate::{
 
 /// Where the analyzer reads what a program's pipelines declare, as their shaders were reflected.
 ///
-/// `None` from either method means this source knows nothing about that pipeline, and its draws
-/// are left unchecked.
+/// `None` from [`Self::bindings`] means this source knows nothing about that pipeline. Descriptor-free
+/// modules may still compile, but descriptor writes need reflected bindings to infer their access.
 pub trait PipelineBindings {
     fn bindings(&self, pipeline: PipelineId) -> Option<&[DescriptorBinding]>;
 
@@ -22,7 +22,7 @@ pub trait PipelineBindings {
     fn bindless_set(&self, pipeline: PipelineId) -> Option<u32>;
 }
 
-/// Compiles without checking any of it, for a module built with no graph to ask.
+/// Compiles a descriptor-free module without a graph to ask about its pipelines.
 pub struct Unchecked;
 
 impl PipelineBindings for Unchecked {
@@ -45,6 +45,12 @@ impl Declared {
     }
 
     pub(super) fn in_stages(bindings: &[(u32, u32, vk::DescriptorType)], stages: vk::ShaderStageFlags) -> Self {
+        Self::with_access(bindings, stages, crate::Access::sampled_by(stages))
+    }
+
+    pub(super) fn with_access(
+        bindings: &[(u32, u32, vk::DescriptorType)], stages: vk::ShaderStageFlags, access: crate::Access,
+    ) -> Self {
         Self {
             bindings: bindings
                 .iter()
@@ -55,6 +61,7 @@ impl Declared {
                     count: 1,
                     variable_count: false,
                     stages,
+                    access,
                 })
                 .collect(),
             bindless: None,
@@ -242,6 +249,8 @@ fn names_an_image(instructions: &[Instr], id: ValueId) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use ash::vk::Handle;
 
     use super::*;
@@ -256,6 +265,37 @@ mod tests {
             vk::Extent2D::default().width(4).height(4),
             FORMAT,
         ))
+    }
+
+    #[derive(Default)]
+    struct PerPipeline {
+        bindings: HashMap<PipelineId, Vec<DescriptorBinding>>,
+    }
+
+    impl PerPipeline {
+        fn with_binding(mut self, pipeline: PipelineId, stages: vk::ShaderStageFlags) -> Self {
+            self.bindings.insert(
+                pipeline,
+                vec![DescriptorBinding {
+                    set: 0,
+                    binding: 0,
+                    descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                    count: 1,
+                    variable_count: false,
+                    stages,
+                    access: Access::sampled_by(stages),
+                }],
+            );
+            self
+        }
+    }
+
+    impl PipelineBindings for PerPipeline {
+        fn bindings(&self, pipeline: PipelineId) -> Option<&[DescriptorBinding]> {
+            self.bindings.get(&pipeline).map(Vec::as_slice)
+        }
+
+        fn bindless_set(&self, _: PipelineId) -> Option<u32> { None }
     }
 
     /// A pass that writes `writes` and then draws once.
@@ -319,7 +359,6 @@ mod tests {
         assert!(module.compile(&combined, end).is_err());
     }
 
-    /// A pass may bind several pipelines, so a write no pipeline declares is not by itself wrong.
     #[test]
     fn a_write_the_pipeline_does_not_declare_is_allowed() {
         let none = Declared::new(&[]);
@@ -328,6 +367,52 @@ mod tests {
         });
 
         assert!(module.compile(&none, end).is_ok());
+    }
+
+    #[test]
+    fn a_write_before_a_pipeline_is_resolved_from_the_consuming_draw() {
+        let combined = Declared::new(&[(0, 0, vk::DescriptorType::COMBINED_IMAGE_SAMPLER)]);
+        let mut module = Module::default();
+        let attachment = target(&mut module);
+        let texture = target(&mut module);
+        let end = module
+            .begin_rendering([(attachment, Access::ColorRW)])
+            .bind_texture(0, 0, texture, a_sampler())
+            .bind_graphics_pipeline(PipelineId(0))
+            .draw(3, 1)
+            .end_rendering();
+
+        let compiled = module.compile(&combined, end).unwrap();
+        assert_eq!(sampled_barrier(&compiled), Access::FragmentSampled);
+    }
+
+    #[test]
+    fn a_write_outside_a_pass_is_dropped_without_affecting_unrelated_compilation() {
+        let mut module = Module::default();
+        let attachment = target(&mut module);
+        let texture = target(&mut module);
+        module.bind_texture(0, 0, texture, a_sampler());
+        let end = module.clear(attachment, crate::clear::f32::BLACK);
+
+        assert!(module.compile(&Unchecked, end).is_ok());
+    }
+
+    #[test]
+    fn a_descriptor_consumed_without_a_valid_pipeline_is_refused() {
+        let mut module = Module::default();
+        let attachment = target(&mut module);
+        let texture = target(&mut module);
+        let end = module
+            .begin_rendering([(attachment, Access::ColorRW)])
+            .bind_graphics_pipeline(PipelineId::INVALID)
+            .bind_texture(0, 0, texture, a_sampler())
+            .draw(3, 1)
+            .end_rendering();
+
+        assert!(matches!(
+            module.compile(&Unchecked, end),
+            Err(vk::Result::ERROR_INITIALIZATION_FAILED)
+        ));
     }
 
     #[test]
@@ -384,7 +469,7 @@ mod tests {
     }
     /// What the barrier for the written image actually waits on, read back off the emitted
     /// barrier rather than off the write, since the barrier is the thing that has to be right.
-    fn sampled_barrier(program: &Program) -> Access {
+    fn sampled_barrier_for(program: &Program, sampled: ValueId) -> Access {
         let instructions = program.instructions();
         let constant = |id: &ValueId| {
             instructions.iter().find_map(|(instr, ir)| match ir {
@@ -393,14 +478,6 @@ mod tests {
             })
         };
 
-        let sampled = instructions
-            .iter()
-            .find_map(|(_, ir)| match ir {
-                IR::WriteDescriptor { descriptor, .. } => Some(descriptor.image()),
-                _ => None,
-            })
-            .expect("the write should survive");
-
         instructions
             .iter()
             .find_map(|(_, ir)| match ir {
@@ -408,6 +485,18 @@ mod tests {
                 _ => None,
             })
             .expect("the written image should be transitioned")
+    }
+
+    fn sampled_barrier(program: &Program) -> Access {
+        let sampled = program
+            .instructions()
+            .iter()
+            .find_map(|(_, ir)| match ir {
+                IR::WriteDescriptor { descriptor, .. } => Some(descriptor.image()),
+                _ => None,
+            })
+            .expect("the write should survive");
+        sampled_barrier_for(program, sampled)
     }
 
     /// The whole point of resolving from reflection: a texture the vertex stage reads needs its
@@ -443,20 +532,69 @@ mod tests {
         );
     }
 
-    /// With no reflection to ask, the placeholder the pass recorded is all there is.
     #[test]
-    fn an_unchecked_compile_keeps_the_placeholder_access() {
+    fn an_unchecked_compile_refuses_a_descriptor_write() {
         let (module, end) = drawing(|m, texture| {
             m.bind_texture(0, 0, texture, a_sampler());
         });
 
-        let compiled = module.compile(&Unchecked, end).unwrap();
-        let access = compiled.instructions().iter().find_map(|(_, ir)| match ir {
-            IR::WriteDescriptor { access, .. } => Some(*access),
-            _ => None,
-        });
-        let symbols = crate::graph::ir::Symbols::new(compiled.instructions());
+        assert!(matches!(
+            module.compile(&Unchecked, end),
+            Err(vk::Result::ERROR_INITIALIZATION_FAILED)
+        ));
+    }
 
-        assert_eq!(access.and_then(|id| symbols.access(id)), Some(Access::None));
+    #[test]
+    fn a_standing_write_widens_for_every_pipeline_that_consumes_it() {
+        let fragment = PipelineId(0);
+        let vertex = PipelineId(1);
+        let pipelines = PerPipeline::default()
+            .with_binding(fragment, vk::ShaderStageFlags::FRAGMENT)
+            .with_binding(vertex, vk::ShaderStageFlags::VERTEX);
+
+        let mut module = Module::default();
+        let attachment = target(&mut module);
+        let texture = target(&mut module);
+        let end = module
+            .begin_rendering([(attachment, Access::ColorRW)])
+            .bind_graphics_pipeline(fragment)
+            .bind_texture(0, 0, texture, a_sampler())
+            .draw(3, 1)
+            .bind_graphics_pipeline(vertex)
+            .draw(3, 1)
+            .end_rendering();
+
+        let compiled = module.compile(&pipelines, end).unwrap();
+        assert_eq!(
+            sampled_barrier_for(&compiled, texture),
+            Access::FragmentSampled | Access::VertexSampled
+        );
+    }
+
+    #[test]
+    fn rewriting_a_descriptor_starts_a_new_access_association() {
+        let fragment = PipelineId(0);
+        let vertex = PipelineId(1);
+        let pipelines = PerPipeline::default()
+            .with_binding(fragment, vk::ShaderStageFlags::FRAGMENT)
+            .with_binding(vertex, vk::ShaderStageFlags::VERTEX);
+
+        let mut module = Module::default();
+        let attachment = target(&mut module);
+        let first = target(&mut module);
+        let second = target(&mut module);
+        let end = module
+            .begin_rendering([(attachment, Access::ColorRW)])
+            .bind_graphics_pipeline(fragment)
+            .bind_texture(0, 0, first, a_sampler())
+            .draw(3, 1)
+            .bind_graphics_pipeline(vertex)
+            .bind_texture(0, 0, second, a_sampler())
+            .draw(3, 1)
+            .end_rendering();
+
+        let compiled = module.compile(&pipelines, end).unwrap();
+        assert_eq!(sampled_barrier_for(&compiled, first), Access::FragmentSampled);
+        assert_eq!(sampled_barrier_for(&compiled, second), Access::VertexSampled);
     }
 }

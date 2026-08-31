@@ -1,11 +1,19 @@
-use std::{collections::HashMap, ffi::CString};
+use std::{
+    collections::{HashMap, HashSet},
+    ffi::CString,
+};
 
 use ash::vk;
+
+use crate::Access;
 
 const MAGIC: u32 = 0x0723_0203;
 const HEADER_WORDS: usize = 5;
 
 mod op {
+    pub const NOP: u16 = 0;
+    pub const LINE: u16 = 8;
+    pub const EXT_INST: u16 = 12;
     pub const ENTRY_POINT: u16 = 15;
     pub const EXECUTION_MODE: u16 = 16;
     pub const TYPE_VOID: u16 = 19;
@@ -21,12 +29,69 @@ mod op {
     pub const TYPE_RUNTIME_ARRAY: u16 = 29;
     pub const TYPE_STRUCT: u16 = 30;
     pub const TYPE_POINTER: u16 = 32;
+    #[cfg(test)]
+    pub const TYPE_FUNCTION: u16 = 33;
     pub const CONSTANT: u16 = 43;
+    pub const FUNCTION: u16 = 54;
+    pub const FUNCTION_PARAMETER: u16 = 55;
+    pub const FUNCTION_END: u16 = 56;
+    pub const FUNCTION_CALL: u16 = 57;
     pub const VARIABLE: u16 = 59;
+    pub const IMAGE_TEXEL_POINTER: u16 = 60;
+    pub const LOAD: u16 = 61;
+    pub const STORE: u16 = 62;
+    pub const COPY_MEMORY: u16 = 63;
+    pub const COPY_MEMORY_SIZED: u16 = 64;
+    pub const ACCESS_CHAIN: u16 = 65;
+    pub const IN_BOUNDS_ACCESS_CHAIN: u16 = 66;
+    pub const PTR_ACCESS_CHAIN: u16 = 67;
+    pub const ARRAY_LENGTH: u16 = 68;
+    pub const IN_BOUNDS_PTR_ACCESS_CHAIN: u16 = 70;
     pub const DECORATE: u16 = 71;
     pub const MEMBER_DECORATE: u16 = 72;
+    pub const VECTOR_EXTRACT_DYNAMIC: u16 = 77;
+    pub const COMPOSITE_INSERT: u16 = 82;
+    pub const COPY_OBJECT: u16 = 83;
+    pub const TRANSPOSE: u16 = 84;
+    pub const SAMPLED_IMAGE: u16 = 86;
+    pub const IMAGE_SAMPLE_FIRST: u16 = 87;
+    pub const IMAGE_READ: u16 = 98;
+    pub const IMAGE_WRITE: u16 = 99;
+    pub const IMAGE: u16 = 100;
+    pub const IMAGE_QUERY_FORMAT: u16 = 101;
+    pub const IMAGE_QUERY_SAMPLES: u16 = 107;
+    pub const BITCAST: u16 = 124;
+    pub const SELECT: u16 = 169;
+    pub const ATOMIC_LOAD: u16 = 227;
+    pub const ATOMIC_STORE: u16 = 228;
+    pub const ATOMIC_RMW_FIRST: u16 = 229;
+    pub const ATOMIC_RMW_LAST: u16 = 242;
+    pub const PHI: u16 = 245;
+    pub const LOOP_MERGE: u16 = 246;
+    pub const SELECTION_MERGE: u16 = 247;
+    pub const LABEL: u16 = 248;
+    pub const BRANCH: u16 = 249;
+    pub const BRANCH_CONDITIONAL: u16 = 250;
+    pub const SWITCH: u16 = 251;
+    pub const KILL: u16 = 252;
+    pub const RETURN: u16 = 253;
+    pub const RETURN_VALUE: u16 = 254;
+    pub const UNREACHABLE: u16 = 255;
+    pub const IMAGE_SPARSE_SAMPLE_FIRST: u16 = 305;
+    pub const IMAGE_SPARSE_DREF_GATHER: u16 = 315;
+    pub const ATOMIC_FLAG_TEST_AND_SET: u16 = 318;
+    pub const ATOMIC_FLAG_CLEAR: u16 = 319;
+    pub const NO_LINE: u16 = 317;
+    pub const IMAGE_SPARSE_READ: u16 = 320;
     pub const EXECUTION_MODE_ID: u16 = 331;
+    pub const COPY_LOGICAL: u16 = 400;
+    pub const TRACE_RAY: u16 = 4445;
+    pub const RAY_QUERY_INITIALIZE: u16 = 4473;
+    pub const IMAGE_SAMPLE_FOOTPRINT: u16 = 5283;
     pub const TYPE_ACCELERATION_STRUCTURE: u16 = 5341;
+    pub const ATOMIC_FMIN: u16 = 5614;
+    pub const ATOMIC_FMAX: u16 = 5615;
+    pub const ATOMIC_FADD: u16 = 6035;
 }
 
 mod execution_mode {
@@ -39,6 +104,8 @@ mod decoration {
     pub const ARRAY_STRIDE: u32 = 6;
     pub const MATRIX_STRIDE: u32 = 7;
     pub const BUILT_IN: u32 = 11;
+    pub const NON_WRITABLE: u32 = 24;
+    pub const NON_READABLE: u32 = 25;
     pub const LOCATION: u32 = 30;
     pub const BINDING: u32 = 33;
     pub const DESCRIPTOR_SET: u32 = 34;
@@ -65,7 +132,12 @@ pub struct DescriptorBinding {
     pub descriptor_type: vk::DescriptorType,
     pub count: u32,
     pub variable_count: bool,
+    /// Every pipeline stage whose module declares this binding.
     pub stages: vk::ShaderStageFlags,
+    /// The descriptor memory operations in this entry point's static call tree.
+    ///
+    /// Runtime branches are all included; a binding with no reachable operation is [`Access::None`].
+    pub access: Access,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -113,14 +185,50 @@ enum TypeInfo {
     Opaque,
 }
 
+struct EntryPoint {
+    execution_model: u32,
+    function: u32,
+    name: CString,
+}
+
+struct Instruction {
+    opcode: u16,
+    operands: Vec<u32>,
+    function: u32,
+}
+
+struct PendingDescriptor {
+    variable: u32,
+    pointer_type: u32,
+    binding: DescriptorBinding,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct Origin {
+    variable: u32,
+    non_readable: bool,
+    non_writable: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DescriptorOperation {
+    MemoryRead,
+    MemoryWrite,
+    ImageRead,
+    ImageWrite,
+    AccelerationStructureRead,
+}
+
 #[derive(Default)]
 struct Parsed {
-    entry_points: Vec<(u32, CString)>,
+    entry_points: Vec<EntryPoint>,
     types: HashMap<u32, TypeInfo>,
     decorations: HashMap<(u32, u32), Vec<u32>>,
     member_decorations: HashMap<(u32, u32, u32), Vec<u32>>,
     constants: HashMap<u32, u32>,
     variables: Vec<(u32, u32, u32)>,
+    value_types: HashMap<u32, u32>,
+    instructions: Vec<Instruction>,
     local_size: Option<[u32; 3]>,
     /// A `LocalSizeId` names constants rather than literals, which are only known once the whole
     /// module has been walked.
@@ -148,6 +256,7 @@ fn parse(spirv: &[u32]) -> Option<Parsed> {
 
     let mut parsed = Parsed::default();
     let mut cursor = HEADER_WORDS;
+    let mut current_function = None;
 
     while cursor < spirv.len() {
         let word_count = (spirv[cursor] >> 16) as usize;
@@ -157,10 +266,28 @@ fn parse(spirv: &[u32]) -> Option<Parsed> {
         }
         let operands = &spirv[cursor + 1..cursor + word_count];
 
+        if opcode == op::FUNCTION {
+            if operands.len() < 2 || current_function.is_some() {
+                return None;
+            }
+            current_function = Some(operands[1]);
+        }
+        if let Some(function) = current_function {
+            parsed.instructions.push(Instruction {
+                opcode,
+                operands: operands.to_vec(),
+                function,
+            });
+        }
+
         match opcode {
             op::ENTRY_POINT if operands.len() >= 3 => {
                 let (name, _) = decode_literal_string(&operands[2..])?;
-                parsed.entry_points.push((operands[0], name));
+                parsed.entry_points.push(EntryPoint {
+                    execution_model: operands[0],
+                    function: operands[1],
+                    name,
+                });
             },
             op::EXECUTION_MODE if operands.len() >= 5 && operands[1] == execution_mode::LOCAL_SIZE => {
                 parsed.local_size = Some([operands[2], operands[3], operands[4]]);
@@ -262,6 +389,26 @@ fn parse(spirv: &[u32]) -> Option<Parsed> {
             },
             op::VARIABLE if operands.len() >= 3 => {
                 parsed.variables.push((operands[1], operands[0], operands[2]));
+                parsed.value_types.insert(operands[1], operands[0]);
+            },
+            op::FUNCTION_PARAMETER
+            | op::FUNCTION_CALL
+            | op::IMAGE_TEXEL_POINTER
+            | op::LOAD
+            | op::ACCESS_CHAIN
+            | op::IN_BOUNDS_ACCESS_CHAIN
+            | op::PTR_ACCESS_CHAIN
+            | op::IN_BOUNDS_PTR_ACCESS_CHAIN
+            | op::COPY_OBJECT
+            | op::COPY_LOGICAL
+            | op::SAMPLED_IMAGE
+            | op::IMAGE
+            | op::BITCAST
+            | op::SELECT
+            | op::PHI
+                if operands.len() >= 2 =>
+            {
+                parsed.value_types.insert(operands[1], operands[0]);
             },
             op::DECORATE if operands.len() >= 2 => {
                 parsed
@@ -276,7 +423,15 @@ fn parse(spirv: &[u32]) -> Option<Parsed> {
             _ => {},
         }
 
+        if opcode == op::FUNCTION_END {
+            current_function = None;
+        }
+
         cursor += word_count;
+    }
+
+    if current_function.is_some() {
+        return None;
     }
 
     Some(parsed)
@@ -303,6 +458,10 @@ impl Parsed {
 
     fn has_decoration(&self, target: u32, decoration: u32) -> bool {
         self.decorations.contains_key(&(target, decoration))
+    }
+
+    fn has_member_decoration(&self, target: u32, member: u32, decoration: u32) -> bool {
+        self.member_decorations.contains_key(&(target, member, decoration))
     }
 
     fn member_decoration(&self, target: u32, member: u32, decoration: u32) -> Option<u32> {
@@ -442,6 +601,547 @@ impl Parsed {
             _ => None,
         }
     }
+
+    fn type_constraints(&self, ty: u32, depth: u32) -> (bool, bool) {
+        if depth > 64 {
+            return (false, false);
+        }
+
+        let direct = (
+            self.has_decoration(ty, decoration::NON_READABLE),
+            self.has_decoration(ty, decoration::NON_WRITABLE),
+        );
+        let nested = match self.types.get(&ty) {
+            Some(TypeInfo::Pointer { pointee }) => self.type_constraints(*pointee, depth + 1),
+            Some(TypeInfo::Array { element, .. }) | Some(TypeInfo::RuntimeArray { element }) => {
+                self.type_constraints(*element, depth + 1)
+            },
+            _ => (false, false),
+        };
+        (direct.0 || nested.0, direct.1 || nested.1)
+    }
+
+    fn type_carries_provenance(&self, ty: u32, depth: u32) -> bool {
+        if depth > 64 {
+            return false;
+        }
+
+        match self.types.get(&ty) {
+            Some(
+                TypeInfo::Pointer { .. }
+                | TypeInfo::Image { .. }
+                | TypeInfo::Sampler
+                | TypeInfo::SampledImage
+                | TypeInfo::AccelerationStructure,
+            ) => true,
+            Some(TypeInfo::Array { element, .. } | TypeInfo::RuntimeArray { element }) => {
+                self.type_carries_provenance(*element, depth + 1)
+            },
+            _ => false,
+        }
+    }
+
+    fn value_carries_provenance(&self, value: u32) -> bool {
+        self.value_types
+            .get(&value)
+            .is_some_and(|ty| self.type_carries_provenance(*ty, 0))
+    }
+
+    fn value_is_opaque_handle(&self, value: u32) -> bool {
+        self.value_types.get(&value).is_some_and(|ty| {
+            matches!(
+                self.types.get(ty),
+                Some(
+                    TypeInfo::Image { .. }
+                        | TypeInfo::Sampler
+                        | TypeInfo::SampledImage
+                        | TypeInfo::AccelerationStructure
+                )
+            )
+        })
+    }
+
+    fn reachable_functions(&self, entry: u32) -> HashSet<u32> {
+        let mut reachable = HashSet::from([entry]);
+        loop {
+            let before = reachable.len();
+            for instruction in &self.instructions {
+                if instruction.opcode == op::FUNCTION_CALL
+                    && reachable.contains(&instruction.function)
+                    && instruction.operands.len() >= 3
+                {
+                    reachable.insert(instruction.operands[2]);
+                }
+            }
+            if reachable.len() == before {
+                return reachable;
+            }
+        }
+    }
+
+    fn access_chain_constraints(&self, base: u32, indices: &[u32]) -> (bool, bool) {
+        let Some(mut ty) = self.value_types.get(&base).copied() else {
+            return (false, false);
+        };
+        let mut constraints = (false, false);
+
+        for index in indices {
+            for _ in 0..64 {
+                match self.types.get(&ty) {
+                    Some(TypeInfo::Pointer { pointee }) => ty = *pointee,
+                    _ => break,
+                }
+            }
+
+            match self.types.get(&ty) {
+                Some(TypeInfo::Struct { members }) => {
+                    let Some(member) = self.constants.get(index).copied() else {
+                        continue;
+                    };
+                    let Some(member_type) = members.get(member as usize).copied() else {
+                        continue;
+                    };
+                    constraints.0 |= self.has_member_decoration(ty, member, decoration::NON_READABLE);
+                    constraints.1 |= self.has_member_decoration(ty, member, decoration::NON_WRITABLE);
+                    let nested = self.type_constraints(member_type, 0);
+                    constraints.0 |= nested.0;
+                    constraints.1 |= nested.1;
+                    ty = member_type;
+                },
+                Some(TypeInfo::Array { element, .. }) | Some(TypeInfo::RuntimeArray { element }) => {
+                    ty = *element;
+                },
+                Some(TypeInfo::Vector { component, .. }) => ty = *component,
+                Some(TypeInfo::Matrix { column, .. }) => ty = *column,
+                _ => {},
+            }
+        }
+
+        constraints
+    }
+}
+
+type Provenance = HashMap<u32, HashSet<Origin>>;
+
+fn origins_from(provenance: &Provenance, sources: impl IntoIterator<Item = u32>) -> HashSet<Origin> {
+    sources
+        .into_iter()
+        .filter_map(|source| provenance.get(&source))
+        .flat_map(|origins| origins.iter().copied())
+        .collect()
+}
+
+fn extend_origins(provenance: &mut Provenance, result: u32, additions: HashSet<Origin>) -> bool {
+    if additions.is_empty() {
+        return false;
+    }
+
+    let result_origins = provenance.entry(result).or_default();
+    let before = result_origins.len();
+    result_origins.extend(additions);
+    result_origins.len() != before
+}
+
+impl Parsed {
+    fn descriptor_accesses(
+        &self, entry_function: u32, stage: vk::ShaderStageFlags, descriptors: &[PendingDescriptor],
+    ) -> Result<HashMap<u32, Access>, vk::Result> {
+        let descriptors_by_variable: HashMap<_, _> = descriptors
+            .iter()
+            .map(|descriptor| (descriptor.variable, descriptor))
+            .collect();
+        let reachable = self.reachable_functions(entry_function);
+        let mut provenance = Provenance::new();
+
+        for descriptor in descriptors {
+            let type_constraints = self.type_constraints(descriptor.pointer_type, 0);
+            provenance.insert(
+                descriptor.variable,
+                HashSet::from([Origin {
+                    variable: descriptor.variable,
+                    non_readable: self.has_decoration(descriptor.variable, decoration::NON_READABLE)
+                        || type_constraints.0,
+                    non_writable: self.has_decoration(descriptor.variable, decoration::NON_WRITABLE)
+                        || type_constraints.1,
+                }]),
+            );
+        }
+
+        let mut parameters: HashMap<u32, Vec<u32>> = HashMap::new();
+        let mut return_values: HashMap<u32, Vec<u32>> = HashMap::new();
+        for instruction in &self.instructions {
+            match instruction.opcode {
+                op::FUNCTION_PARAMETER if instruction.operands.len() >= 2 => parameters
+                    .entry(instruction.function)
+                    .or_default()
+                    .push(instruction.operands[1]),
+                op::RETURN_VALUE if !instruction.operands.is_empty() => return_values
+                    .entry(instruction.function)
+                    .or_default()
+                    .push(instruction.operands[0]),
+                _ => {},
+            }
+        }
+
+        loop {
+            let mut changed = false;
+            for instruction in self
+                .instructions
+                .iter()
+                .filter(|instruction| reachable.contains(&instruction.function))
+            {
+                let operands = instruction.operands.as_slice();
+                match instruction.opcode {
+                    op::ACCESS_CHAIN
+                    | op::IN_BOUNDS_ACCESS_CHAIN
+                    | op::PTR_ACCESS_CHAIN
+                    | op::IN_BOUNDS_PTR_ACCESS_CHAIN
+                        if operands.len() >= 3 && self.value_carries_provenance(operands[1]) =>
+                    {
+                        let base = operands[2];
+                        let first_index = if matches!(
+                            instruction.opcode,
+                            op::PTR_ACCESS_CHAIN | op::IN_BOUNDS_PTR_ACCESS_CHAIN
+                        ) {
+                            4
+                        } else {
+                            3
+                        };
+                        let constraints =
+                            self.access_chain_constraints(base, operands.get(first_index..).unwrap_or_default());
+                        let additions = origins_from(&provenance, [base])
+                            .into_iter()
+                            .map(|origin| Origin {
+                                non_readable: origin.non_readable || constraints.0,
+                                non_writable: origin.non_writable || constraints.1,
+                                ..origin
+                            })
+                            .collect();
+                        changed |= extend_origins(&mut provenance, operands[1], additions);
+                    },
+                    op::LOAD
+                    | op::IMAGE_TEXEL_POINTER
+                    | op::COPY_OBJECT
+                    | op::COPY_LOGICAL
+                    | op::IMAGE
+                    | op::BITCAST
+                        if operands.len() >= 3 && self.value_carries_provenance(operands[1]) =>
+                    {
+                        let additions = origins_from(&provenance, [operands[2]]);
+                        changed |= extend_origins(&mut provenance, operands[1], additions);
+                    },
+                    op::SAMPLED_IMAGE if operands.len() >= 4 && self.value_carries_provenance(operands[1]) => {
+                        let additions = origins_from(&provenance, [operands[2], operands[3]]);
+                        changed |= extend_origins(&mut provenance, operands[1], additions);
+                    },
+                    op::SELECT if operands.len() >= 5 && self.value_carries_provenance(operands[1]) => {
+                        let additions = origins_from(&provenance, [operands[3], operands[4]]);
+                        changed |= extend_origins(&mut provenance, operands[1], additions);
+                    },
+                    op::PHI if operands.len() >= 4 && self.value_carries_provenance(operands[1]) => {
+                        let additions = origins_from(&provenance, operands[2..].iter().step_by(2).copied());
+                        changed |= extend_origins(&mut provenance, operands[1], additions);
+                    },
+                    op::FUNCTION_CALL if operands.len() >= 3 => {
+                        let callee = operands[2];
+                        if let Some(callee_parameters) = parameters.get(&callee) {
+                            for (argument, parameter) in operands[3..].iter().zip(callee_parameters) {
+                                if self.value_carries_provenance(*parameter) {
+                                    let additions = origins_from(&provenance, [*argument]);
+                                    changed |= extend_origins(&mut provenance, *parameter, additions);
+                                }
+                            }
+                        }
+
+                        if self.value_carries_provenance(operands[1]) {
+                            let additions =
+                                origins_from(&provenance, return_values.get(&callee).into_iter().flatten().copied());
+                            changed |= extend_origins(&mut provenance, operands[1], additions);
+                        }
+                    },
+                    _ => {},
+                }
+            }
+
+            if !changed {
+                break;
+            }
+        }
+
+        let mut access = descriptors
+            .iter()
+            .map(|descriptor| (descriptor.variable, Access::empty()))
+            .collect::<HashMap<_, _>>();
+        for instruction in self
+            .instructions
+            .iter()
+            .filter(|instruction| reachable.contains(&instruction.function))
+        {
+            let operands = instruction.operands.as_slice();
+            let mut record = |value, operation| {
+                record_descriptor_operation(
+                    value,
+                    operation,
+                    stage,
+                    &provenance,
+                    &descriptors_by_variable,
+                    &mut access,
+                )
+            };
+
+            match instruction.opcode {
+                op::LOAD => {
+                    if operands.len() >= 3 && !self.value_is_opaque_handle(operands[1]) {
+                        record(operands[2], DescriptorOperation::MemoryRead)?;
+                    }
+                },
+                op::STORE => {
+                    if let Some(pointer) = operands.first() {
+                        record(*pointer, DescriptorOperation::MemoryWrite)?;
+                    }
+                },
+                op::COPY_MEMORY | op::COPY_MEMORY_SIZED => {
+                    if operands.len() >= 2 {
+                        record(operands[0], DescriptorOperation::MemoryWrite)?;
+                        record(operands[1], DescriptorOperation::MemoryRead)?;
+                    }
+                },
+                op::ARRAY_LENGTH => {
+                    if operands.len() >= 3 {
+                        record(operands[2], DescriptorOperation::MemoryRead)?;
+                    }
+                },
+                op::ATOMIC_LOAD => {
+                    if operands.len() >= 3 {
+                        record(operands[2], DescriptorOperation::MemoryRead)?;
+                    }
+                },
+                op::ATOMIC_STORE | op::ATOMIC_FLAG_CLEAR => {
+                    if let Some(pointer) = operands.first() {
+                        record(*pointer, DescriptorOperation::MemoryWrite)?;
+                    }
+                },
+                op::ATOMIC_RMW_FIRST..=op::ATOMIC_RMW_LAST
+                | op::ATOMIC_FLAG_TEST_AND_SET
+                | op::ATOMIC_FMIN
+                | op::ATOMIC_FMAX
+                | op::ATOMIC_FADD => {
+                    if operands.len() >= 3 {
+                        record(operands[2], DescriptorOperation::MemoryRead)?;
+                        record(operands[2], DescriptorOperation::MemoryWrite)?;
+                    }
+                },
+                op::IMAGE_SAMPLE_FIRST..=op::IMAGE_READ
+                | op::IMAGE_SPARSE_SAMPLE_FIRST..=op::IMAGE_SPARSE_DREF_GATHER
+                | op::IMAGE_SPARSE_READ
+                | op::IMAGE_SAMPLE_FOOTPRINT => {
+                    if operands.len() >= 3 {
+                        record(operands[2], DescriptorOperation::ImageRead)?;
+                    }
+                },
+                op::IMAGE_WRITE => {
+                    if let Some(image) = operands.first() {
+                        record(*image, DescriptorOperation::ImageWrite)?;
+                    }
+                },
+                op::TRACE_RAY => {
+                    if let Some(acceleration_structure) = operands.first() {
+                        record(*acceleration_structure, DescriptorOperation::AccelerationStructureRead)?;
+                    }
+                },
+                op::RAY_QUERY_INITIALIZE => {
+                    if operands.len() >= 2 {
+                        record(operands[1], DescriptorOperation::AccelerationStructureRead)?;
+                    }
+                },
+                op::FUNCTION
+                | op::NOP
+                | op::LINE
+                | op::FUNCTION_PARAMETER
+                | op::FUNCTION_END
+                | op::FUNCTION_CALL
+                | op::VARIABLE
+                | op::IMAGE_TEXEL_POINTER
+                | op::ACCESS_CHAIN
+                | op::IN_BOUNDS_ACCESS_CHAIN
+                | op::PTR_ACCESS_CHAIN
+                | op::IN_BOUNDS_PTR_ACCESS_CHAIN
+                | op::COPY_OBJECT
+                | op::COPY_LOGICAL
+                | op::SAMPLED_IMAGE
+                | op::IMAGE
+                | op::BITCAST
+                | op::SELECT
+                | op::PHI
+                | op::RETURN_VALUE
+                | op::VECTOR_EXTRACT_DYNAMIC..=op::COMPOSITE_INSERT
+                | op::TRANSPOSE
+                | op::LOOP_MERGE
+                | op::SELECTION_MERGE
+                | op::LABEL
+                | op::BRANCH
+                | op::BRANCH_CONDITIONAL
+                | op::SWITCH
+                | op::KILL
+                | op::RETURN
+                | op::UNREACHABLE
+                | op::NO_LINE
+                | op::IMAGE_QUERY_FORMAT..=op::IMAGE_QUERY_SAMPLES => {},
+                op::EXT_INST => {
+                    if operands
+                        .get(4..)
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|operand| provenance.get(operand).is_some_and(|origins| !origins.is_empty()))
+                    {
+                        tracing::error!(
+                            function = instruction.function,
+                            "unsupported extended SPIR-V instruction touches a descriptor"
+                        );
+                        return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+                    }
+                },
+                opcode => {
+                    if operands
+                        .iter()
+                        .any(|operand| provenance.get(operand).is_some_and(|origins| !origins.is_empty()))
+                    {
+                        tracing::error!(
+                            opcode,
+                            function = instruction.function,
+                            "unsupported SPIR-V instruction touches a descriptor"
+                        );
+                        return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+                    }
+                },
+            }
+        }
+
+        for descriptor_access in access.values_mut() {
+            if descriptor_access.is_empty() {
+                *descriptor_access = Access::None;
+            }
+        }
+        Ok(access)
+    }
+}
+
+fn record_descriptor_operation(
+    value: u32, operation: DescriptorOperation, stage: vk::ShaderStageFlags, provenance: &Provenance,
+    descriptors: &HashMap<u32, &PendingDescriptor>, accesses: &mut HashMap<u32, Access>,
+) -> Result<(), vk::Result> {
+    let Some(origins) = provenance.get(&value) else {
+        return Ok(());
+    };
+
+    let reads = !matches!(
+        operation,
+        DescriptorOperation::MemoryWrite | DescriptorOperation::ImageWrite
+    );
+    let writes = matches!(
+        operation,
+        DescriptorOperation::MemoryWrite | DescriptorOperation::ImageWrite
+    );
+    for origin in origins {
+        let descriptor = descriptors
+            .get(&origin.variable)
+            .expect("descriptor provenance must name a reflected descriptor");
+        if (reads && origin.non_readable) || (writes && origin.non_writable) {
+            tracing::error!(
+                variable = origin.variable,
+                ?operation,
+                non_readable = origin.non_readable,
+                non_writable = origin.non_writable,
+                "SPIR-V descriptor operation contradicts its access decorations"
+            );
+            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+        }
+
+        let descriptor_type = descriptor.binding.descriptor_type;
+        let operation_access = match operation {
+            DescriptorOperation::MemoryRead => match descriptor_type {
+                vk::DescriptorType::UNIFORM_BUFFER => Access::uniform_by(stage),
+                vk::DescriptorType::STORAGE_BUFFER
+                | vk::DescriptorType::STORAGE_IMAGE
+                | vk::DescriptorType::STORAGE_TEXEL_BUFFER => Access::shader_read_by(stage),
+                _ => {
+                    tracing::error!(
+                        variable = origin.variable,
+                        ?descriptor_type,
+                        ?operation,
+                        "SPIR-V memory operation is incompatible with its descriptor type"
+                    );
+                    return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+                },
+            },
+            DescriptorOperation::MemoryWrite => match descriptor_type {
+                vk::DescriptorType::STORAGE_BUFFER
+                | vk::DescriptorType::STORAGE_IMAGE
+                | vk::DescriptorType::STORAGE_TEXEL_BUFFER => Access::shader_write_by(stage),
+                _ => {
+                    tracing::error!(
+                        variable = origin.variable,
+                        ?descriptor_type,
+                        ?operation,
+                        "SPIR-V memory operation is incompatible with its descriptor type"
+                    );
+                    return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+                },
+            },
+            DescriptorOperation::ImageRead => match descriptor_type {
+                vk::DescriptorType::SAMPLER => Access::empty(),
+                vk::DescriptorType::SAMPLED_IMAGE
+                | vk::DescriptorType::COMBINED_IMAGE_SAMPLER
+                | vk::DescriptorType::UNIFORM_TEXEL_BUFFER => Access::sampled_by(stage),
+                vk::DescriptorType::STORAGE_IMAGE | vk::DescriptorType::STORAGE_TEXEL_BUFFER => {
+                    Access::shader_read_by(stage)
+                },
+                vk::DescriptorType::INPUT_ATTACHMENT => Access::InputAttachmentRead,
+                _ => {
+                    tracing::error!(
+                        variable = origin.variable,
+                        ?descriptor_type,
+                        ?operation,
+                        "SPIR-V image operation is incompatible with its descriptor type"
+                    );
+                    return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+                },
+            },
+            DescriptorOperation::ImageWrite => match descriptor_type {
+                vk::DescriptorType::SAMPLER => Access::empty(),
+                vk::DescriptorType::STORAGE_IMAGE | vk::DescriptorType::STORAGE_TEXEL_BUFFER => {
+                    Access::shader_write_by(stage)
+                },
+                _ => {
+                    tracing::error!(
+                        variable = origin.variable,
+                        ?descriptor_type,
+                        ?operation,
+                        "SPIR-V image operation is incompatible with its descriptor type"
+                    );
+                    return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+                },
+            },
+            DescriptorOperation::AccelerationStructureRead => match descriptor_type {
+                vk::DescriptorType::ACCELERATION_STRUCTURE_KHR => Access::acceleration_structure_read_by(stage),
+                _ => {
+                    tracing::error!(
+                        variable = origin.variable,
+                        ?descriptor_type,
+                        ?operation,
+                        "SPIR-V acceleration-structure operation is incompatible with its descriptor type"
+                    );
+                    return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+                },
+            },
+        };
+
+        *accesses
+            .get_mut(&origin.variable)
+            .expect("every reflected descriptor must have an access entry") |= operation_access;
+    }
+
+    Ok(())
 }
 
 fn stage_from_execution_model(model: u32) -> Option<vk::ShaderStageFlags> {
@@ -462,7 +1162,7 @@ pub fn reflect(spirv: &[u32]) -> Result<Reflection, vk::Result> {
         return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
     };
 
-    let [(execution_model, entry_point)] = parsed.entry_points.as_slice() else {
+    let [entry_point] = parsed.entry_points.as_slice() else {
         tracing::error!(
             count = parsed.entry_points.len(),
             "shader must declare exactly one entry point"
@@ -470,12 +1170,15 @@ pub fn reflect(spirv: &[u32]) -> Result<Reflection, vk::Result> {
         return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
     };
 
-    let Some(stage) = stage_from_execution_model(*execution_model) else {
-        tracing::error!(execution_model, "unsupported SPIR-V execution model");
+    let Some(stage) = stage_from_execution_model(entry_point.execution_model) else {
+        tracing::error!(
+            execution_model = entry_point.execution_model,
+            "unsupported SPIR-V execution model"
+        );
         return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
     };
 
-    let mut bindings = Vec::new();
+    let mut pending_descriptors = Vec::new();
     let mut vertex_inputs = Vec::new();
     // the stage's push constants as a half-open byte range; `None` until one shows up
     let mut push_constants: Option<(u32, u32)> = None;
@@ -534,15 +1237,29 @@ pub fn reflect(spirv: &[u32]) -> Result<Reflection, vk::Result> {
             continue;
         };
 
-        bindings.push(DescriptorBinding {
-            set,
-            binding,
-            descriptor_type,
-            count,
-            variable_count,
-            stages: stage,
+        pending_descriptors.push(PendingDescriptor {
+            variable: *variable,
+            pointer_type: *pointer_type,
+            binding: DescriptorBinding {
+                set,
+                binding,
+                descriptor_type,
+                count,
+                variable_count,
+                stages: stage,
+                access: Access::None,
+            },
         });
     }
+
+    let descriptor_accesses = parsed.descriptor_accesses(entry_point.function, stage, &pending_descriptors)?;
+    let mut bindings = pending_descriptors
+        .into_iter()
+        .map(|mut descriptor| {
+            descriptor.binding.access = descriptor_accesses[&descriptor.variable];
+            descriptor.binding
+        })
+        .collect::<Vec<_>>();
 
     bindings.sort_unstable_by_key(|b| (b.set, b.binding));
     vertex_inputs.sort_unstable_by_key(|input| input.location);
@@ -564,7 +1281,7 @@ pub fn reflect(spirv: &[u32]) -> Result<Reflection, vk::Result> {
 
     Ok(Reflection {
         stage,
-        entry_point: entry_point.clone(),
+        entry_point: entry_point.name.clone(),
         bindings,
         push_constant_offset,
         push_constant_size,
@@ -793,6 +1510,303 @@ mod tests {
         }
 
         words
+    }
+
+    #[derive(Clone, Copy)]
+    enum BufferOperation {
+        None,
+        Read,
+        Write,
+        ReadWrite,
+        Unknown,
+    }
+
+    fn buffer_descriptor_module(
+        storage_class: u32, operation: BufferOperation, member_decoration: Option<u32>,
+    ) -> Vec<u32> {
+        let mut words = vec![MAGIC, 0x0001_0300, 0, 100, 0];
+
+        let mut entry = vec![5, 9];
+        entry.extend(literal("main"));
+        words.extend(inst(op::ENTRY_POINT, &entry));
+        words.extend(inst(op::EXECUTION_MODE, &[9, execution_mode::LOCAL_SIZE, 1, 1, 1]));
+        words.extend(inst(op::DECORATE, &[6, decoration::DESCRIPTOR_SET, 0]));
+        words.extend(inst(op::DECORATE, &[6, decoration::BINDING, 0]));
+        if let Some(decoration) = member_decoration {
+            words.extend(inst(op::MEMBER_DECORATE, &[4, 0, decoration]));
+        }
+
+        words.extend(inst(op::TYPE_VOID, &[1]));
+        words.extend(inst(op::TYPE_FUNCTION, &[2, 1]));
+        words.extend(inst(op::TYPE_INT, &[3, 32, 0]));
+        words.extend(inst(op::TYPE_STRUCT, &[4, 3]));
+        words.extend(inst(op::TYPE_POINTER, &[5, storage_class, 4]));
+        words.extend(inst(op::VARIABLE, &[5, 6, storage_class]));
+        words.extend(inst(op::TYPE_POINTER, &[7, storage_class, 3]));
+        words.extend(inst(op::CONSTANT, &[3, 8, 0]));
+
+        words.extend(inst(op::FUNCTION, &[1, 9, 0, 2]));
+        words.extend(inst(op::LABEL, &[20]));
+        words.extend(inst(op::ACCESS_CHAIN, &[7, 10, 6, 8]));
+        if matches!(operation, BufferOperation::Read | BufferOperation::ReadWrite) {
+            words.extend(inst(op::LOAD, &[3, 11, 10]));
+        }
+        if matches!(operation, BufferOperation::Write | BufferOperation::ReadWrite) {
+            words.extend(inst(op::STORE, &[10, 8]));
+        }
+        if matches!(operation, BufferOperation::Unknown) {
+            words.extend(inst(999, &[10]));
+        }
+        words.extend(inst(op::RETURN, &[]));
+        words.extend(inst(op::FUNCTION_END, &[]));
+        words
+    }
+
+    fn buffer_descriptor_through_function(call_helper: bool) -> Vec<u32> {
+        let mut words = vec![MAGIC, 0x0001_0300, 0, 100, 0];
+
+        let mut entry = vec![5, 9];
+        entry.extend(literal("main"));
+        words.extend(inst(op::ENTRY_POINT, &entry));
+        words.extend(inst(op::EXECUTION_MODE, &[9, execution_mode::LOCAL_SIZE, 1, 1, 1]));
+        words.extend(inst(op::DECORATE, &[6, decoration::DESCRIPTOR_SET, 0]));
+        words.extend(inst(op::DECORATE, &[6, decoration::BINDING, 0]));
+
+        words.extend(inst(op::TYPE_VOID, &[1]));
+        words.extend(inst(op::TYPE_FUNCTION, &[2, 1]));
+        words.extend(inst(op::TYPE_INT, &[3, 32, 0]));
+        words.extend(inst(op::TYPE_STRUCT, &[4, 3]));
+        words.extend(inst(op::TYPE_POINTER, &[5, storage_class::STORAGE_BUFFER, 4]));
+        words.extend(inst(op::VARIABLE, &[5, 6, storage_class::STORAGE_BUFFER]));
+        words.extend(inst(op::TYPE_POINTER, &[7, storage_class::STORAGE_BUFFER, 3]));
+        words.extend(inst(op::CONSTANT, &[3, 8, 0]));
+        words.extend(inst(op::TYPE_FUNCTION, &[13, 1, 7]));
+
+        words.extend(inst(op::FUNCTION, &[1, 9, 0, 2]));
+        words.extend(inst(op::LABEL, &[20]));
+        if call_helper {
+            words.extend(inst(op::ACCESS_CHAIN, &[7, 10, 6, 8]));
+            words.extend(inst(op::FUNCTION_CALL, &[1, 11, 12, 10]));
+        }
+        words.extend(inst(op::RETURN, &[]));
+        words.extend(inst(op::FUNCTION_END, &[]));
+
+        words.extend(inst(op::FUNCTION, &[1, 12, 0, 13]));
+        words.extend(inst(op::FUNCTION_PARAMETER, &[7, 14]));
+        words.extend(inst(op::LABEL, &[21]));
+        words.extend(inst(op::STORE, &[14, 8]));
+        words.extend(inst(op::RETURN, &[]));
+        words.extend(inst(op::FUNCTION_END, &[]));
+        words
+    }
+
+    #[derive(Clone, Copy)]
+    enum ImageOperation {
+        None,
+        Read,
+        Write,
+    }
+
+    fn image_descriptor_module(
+        execution_model: u32, image_dim: u32, sampled: u32, operation: ImageOperation,
+    ) -> Vec<u32> {
+        let mut words = vec![MAGIC, 0x0001_0300, 0, 100, 0];
+
+        let mut entry = vec![execution_model, 9];
+        entry.extend(literal("main"));
+        words.extend(inst(op::ENTRY_POINT, &entry));
+        if execution_model == 5 {
+            words.extend(inst(op::EXECUTION_MODE, &[9, execution_mode::LOCAL_SIZE, 1, 1, 1]));
+        }
+        words.extend(inst(op::DECORATE, &[6, decoration::DESCRIPTOR_SET, 0]));
+        words.extend(inst(op::DECORATE, &[6, decoration::BINDING, 0]));
+
+        words.extend(inst(op::TYPE_VOID, &[1]));
+        words.extend(inst(op::TYPE_FUNCTION, &[2, 1]));
+        words.extend(inst(op::TYPE_FLOAT, &[3, 32]));
+        words.extend(inst(op::TYPE_IMAGE, &[4, 3, image_dim, 0, 0, 0, sampled, 0]));
+        words.extend(inst(op::TYPE_POINTER, &[5, storage_class::UNIFORM_CONSTANT, 4]));
+        words.extend(inst(op::VARIABLE, &[5, 6, storage_class::UNIFORM_CONSTANT]));
+        words.extend(inst(op::CONSTANT, &[3, 8, 0]));
+
+        words.extend(inst(op::FUNCTION, &[1, 9, 0, 2]));
+        words.extend(inst(op::LABEL, &[20]));
+        words.extend(inst(op::LOAD, &[4, 10, 6]));
+        match operation {
+            ImageOperation::None => {},
+            ImageOperation::Read => words.extend(inst(op::IMAGE_READ, &[3, 11, 10, 8])),
+            ImageOperation::Write => words.extend(inst(op::IMAGE_WRITE, &[10, 8, 8])),
+        }
+        words.extend(inst(op::RETURN, &[]));
+        words.extend(inst(op::FUNCTION_END, &[]));
+        words
+    }
+
+    fn acceleration_structure_module() -> Vec<u32> {
+        let mut words = vec![MAGIC, 0x0001_0300, 0, 100, 0];
+
+        let mut entry = vec![5, 9];
+        entry.extend(literal("main"));
+        words.extend(inst(op::ENTRY_POINT, &entry));
+        words.extend(inst(op::EXECUTION_MODE, &[9, execution_mode::LOCAL_SIZE, 1, 1, 1]));
+        words.extend(inst(op::DECORATE, &[6, decoration::DESCRIPTOR_SET, 0]));
+        words.extend(inst(op::DECORATE, &[6, decoration::BINDING, 0]));
+
+        words.extend(inst(op::TYPE_VOID, &[1]));
+        words.extend(inst(op::TYPE_FUNCTION, &[2, 1]));
+        words.extend(inst(op::TYPE_ACCELERATION_STRUCTURE, &[4]));
+        words.extend(inst(op::TYPE_POINTER, &[5, storage_class::UNIFORM_CONSTANT, 4]));
+        words.extend(inst(op::VARIABLE, &[5, 6, storage_class::UNIFORM_CONSTANT]));
+
+        words.extend(inst(op::FUNCTION, &[1, 9, 0, 2]));
+        words.extend(inst(op::LABEL, &[20]));
+        words.extend(inst(op::LOAD, &[4, 10, 6]));
+        words.extend(inst(op::RAY_QUERY_INITIALIZE, &[30, 10, 31, 32, 33, 34, 35, 36]));
+        words.extend(inst(op::RETURN, &[]));
+        words.extend(inst(op::FUNCTION_END, &[]));
+        words
+    }
+
+    fn only_binding_access(module: &[u32]) -> Access {
+        let reflection = reflect(module).expect("module should reflect");
+        assert_eq!(reflection.bindings.len(), 1);
+        assert_eq!(reflection.bindings[0].stages, vk::ShaderStageFlags::COMPUTE);
+        reflection.bindings[0].access
+    }
+
+    #[test]
+    fn a_compute_uniform_buffer_read_has_uniform_access_at_compute() {
+        assert_eq!(
+            only_binding_access(&buffer_descriptor_module(
+                storage_class::UNIFORM,
+                BufferOperation::Read,
+                None,
+            )),
+            Access::ComputeUniformRead
+        );
+    }
+
+    #[test]
+    fn compute_storage_buffer_access_distinguishes_reads_and_writes() {
+        assert_eq!(
+            only_binding_access(&buffer_descriptor_module(
+                storage_class::STORAGE_BUFFER,
+                BufferOperation::Read,
+                None,
+            )),
+            Access::ComputeRead
+        );
+        assert_eq!(
+            only_binding_access(&buffer_descriptor_module(
+                storage_class::STORAGE_BUFFER,
+                BufferOperation::Write,
+                None,
+            )),
+            Access::ComputeWrite
+        );
+        assert_eq!(
+            only_binding_access(&buffer_descriptor_module(
+                storage_class::STORAGE_BUFFER,
+                BufferOperation::ReadWrite,
+                None,
+            )),
+            Access::ComputeRW
+        );
+    }
+
+    #[test]
+    fn compute_storage_images_distinguish_reads_and_writes() {
+        assert_eq!(
+            only_binding_access(&image_descriptor_module(5, 1, 2, ImageOperation::Read)),
+            Access::ComputeRead
+        );
+        assert_eq!(
+            only_binding_access(&image_descriptor_module(5, 1, 2, ImageOperation::Write)),
+            Access::ComputeWrite
+        );
+    }
+
+    #[test]
+    fn loading_an_image_handle_alone_does_not_access_the_image() {
+        assert_eq!(
+            only_binding_access(&image_descriptor_module(5, 1, 1, ImageOperation::None)),
+            Access::None
+        );
+    }
+
+    #[test]
+    fn a_compute_acceleration_structure_query_has_stage_specific_access() {
+        assert_eq!(
+            only_binding_access(&acceleration_structure_module()),
+            Access::ComputeAccelerationStructureRead
+        );
+    }
+
+    #[test]
+    fn a_fragment_subpass_read_has_input_attachment_access() {
+        let reflection = reflect(&image_descriptor_module(4, dim::SUBPASS_DATA, 2, ImageOperation::Read))
+            .expect("module should reflect");
+        assert_eq!(
+            reflection.bindings[0].descriptor_type,
+            vk::DescriptorType::INPUT_ATTACHMENT
+        );
+        assert_eq!(reflection.bindings[0].access, Access::InputAttachmentRead);
+    }
+
+    #[test]
+    fn declaring_or_aliasing_a_descriptor_does_not_access_it() {
+        assert_eq!(
+            only_binding_access(&buffer_descriptor_module(
+                storage_class::STORAGE_BUFFER,
+                BufferOperation::None,
+                None,
+            )),
+            Access::None
+        );
+    }
+
+    #[test]
+    fn descriptor_access_follows_the_static_function_call_tree() {
+        assert_eq!(
+            only_binding_access(&buffer_descriptor_through_function(true)),
+            Access::ComputeWrite
+        );
+        assert_eq!(
+            only_binding_access(&buffer_descriptor_through_function(false)),
+            Access::None
+        );
+    }
+
+    #[test]
+    fn descriptor_operations_must_respect_member_access_decorations() {
+        assert!(
+            reflect(&buffer_descriptor_module(
+                storage_class::STORAGE_BUFFER,
+                BufferOperation::Write,
+                Some(decoration::NON_WRITABLE),
+            ))
+            .is_err()
+        );
+        assert!(
+            reflect(&buffer_descriptor_module(
+                storage_class::STORAGE_BUFFER,
+                BufferOperation::Read,
+                Some(decoration::NON_READABLE),
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_an_unknown_instruction_that_touches_a_descriptor() {
+        assert!(
+            reflect(&buffer_descriptor_module(
+                storage_class::STORAGE_BUFFER,
+                BufferOperation::Unknown,
+                None,
+            ))
+            .is_err()
+        );
     }
 
     #[test]

@@ -649,7 +649,10 @@ mod tests {
     use ash::vk::Handle;
 
     use super::*;
-    use crate::resource::shader::{DescriptorBinding, VertexInput};
+    use crate::{
+        Access,
+        resource::shader::{DescriptorBinding, VertexInput},
+    };
 
     fn reflection(stage: vk::ShaderStageFlags, vertex_inputs: Vec<VertexInput>) -> Reflection {
         Reflection {
@@ -812,6 +815,7 @@ mod tests {
                 count: 1,
                 variable_count: false,
                 stages: vk::ShaderStageFlags::FRAGMENT,
+                access: Access::FragmentSampled,
             }],
         );
         assert!(validate_descriptor_bindings(&[reflection], None).is_ok());
@@ -828,6 +832,7 @@ mod tests {
                 count: 0,
                 variable_count: true,
                 stages: vk::ShaderStageFlags::FRAGMENT,
+                access: Access::FragmentSampled,
             }],
         );
         assert!(validate_descriptor_bindings(std::slice::from_ref(&reflection), None).is_err());
