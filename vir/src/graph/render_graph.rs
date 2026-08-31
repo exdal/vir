@@ -214,15 +214,138 @@ impl DeclaredPipeline {
 struct DescriptorSetKey {
     pipeline: PipelineId,
     set: u32,
-    descriptors: Vec<ResolvedImageDescriptor>,
+    descriptors: Vec<ResolvedDescriptor>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct ResolvedImageDescriptor {
+struct ResolvedDescriptor {
     set: u32,
     binding: u32,
-    image_view: vk::ImageView,
-    sampler: Option<vk::Sampler>,
+    descriptor_type: Option<vk::DescriptorType>,
+    value: ResolvedDescriptorValue,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ResolvedDescriptorValue {
+    Sampler {
+        sampler: vk::Sampler,
+    },
+    Image {
+        image_view: vk::ImageView,
+    },
+    CombinedImageSampler {
+        image_view: vk::ImageView,
+        sampler: vk::Sampler,
+    },
+    TexelBuffer {
+        backing_buffer: vk::Buffer,
+        view: vk::BufferView,
+    },
+    Buffer {
+        buffer: vk::Buffer,
+        buffer_size: u64,
+        offset: u64,
+        range: u64,
+    },
+    AccelerationStructure {
+        backing_buffer: vk::Buffer,
+        acceleration_structure: vk::AccelerationStructureKHR,
+    },
+}
+
+impl ResolvedDescriptorValue {
+    fn supports_type(self, descriptor_type: vk::DescriptorType) -> bool {
+        match self {
+            Self::Sampler { .. } => descriptor_type == vk::DescriptorType::SAMPLER,
+            Self::Image { .. } => matches!(
+                descriptor_type,
+                vk::DescriptorType::SAMPLED_IMAGE
+                    | vk::DescriptorType::STORAGE_IMAGE
+                    | vk::DescriptorType::INPUT_ATTACHMENT
+            ),
+            Self::CombinedImageSampler { .. } => descriptor_type == vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            Self::TexelBuffer { .. } => matches!(
+                descriptor_type,
+                vk::DescriptorType::UNIFORM_TEXEL_BUFFER | vk::DescriptorType::STORAGE_TEXEL_BUFFER
+            ),
+            Self::Buffer { .. } => {
+                matches!(
+                    descriptor_type,
+                    vk::DescriptorType::UNIFORM_BUFFER | vk::DescriptorType::STORAGE_BUFFER
+                )
+            },
+            Self::AccelerationStructure { .. } => descriptor_type == vk::DescriptorType::ACCELERATION_STRUCTURE_KHR,
+        }
+    }
+
+    fn validate(self, set: u32, binding: u32) -> Result<(), vk::Result> {
+        let invalid = match self {
+            Self::Sampler { sampler } => sampler.is_null(),
+            Self::Image { image_view } => image_view.is_null(),
+            Self::CombinedImageSampler { image_view, sampler } => image_view.is_null() || sampler.is_null(),
+            Self::TexelBuffer { backing_buffer, view } => backing_buffer.is_null() || view.is_null(),
+            Self::Buffer {
+                buffer,
+                buffer_size,
+                offset,
+                range,
+            } => {
+                buffer.is_null()
+                    || range == 0
+                    || offset >= buffer_size
+                    || (range != vk::WHOLE_SIZE && offset.checked_add(range).is_none_or(|end| end > buffer_size))
+            },
+            Self::AccelerationStructure {
+                backing_buffer,
+                acceleration_structure,
+            } => backing_buffer.is_null() || acceleration_structure.is_null(),
+        };
+
+        if invalid {
+            tracing::error!(
+                set,
+                binding,
+                payload = ?self,
+                "descriptor resolves to an invalid or out-of-bounds Vulkan resource"
+            );
+            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+        }
+
+        Ok(())
+    }
+}
+
+impl ResolvedDescriptor {
+    fn resolve_type(mut self, pipeline: PipelineId, descriptor_type: vk::DescriptorType) -> Result<Self, vk::Result> {
+        if !self.value.supports_type(descriptor_type) {
+            tracing::error!(
+                %pipeline,
+                set = self.set,
+                binding = self.binding,
+                declared = ?descriptor_type,
+                payload = ?self.value,
+                "the descriptor payload does not match the reflected descriptor type"
+            );
+            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+        }
+        if let Some(resolved) = self.descriptor_type
+            && resolved != descriptor_type
+        {
+            tracing::error!(
+                %pipeline,
+                set = self.set,
+                binding = self.binding,
+                declared = ?descriptor_type,
+                resolved = ?resolved,
+                "the descriptor write was compiled for a different reflected descriptor type"
+            );
+            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+        }
+
+        self.value.validate(self.set, self.binding)?;
+        self.descriptor_type = Some(descriptor_type);
+        Ok(self)
+    }
 }
 
 struct RetiredDescriptorArena {
@@ -233,7 +356,7 @@ struct RetiredDescriptorArena {
 pub struct Recorder<'a> {
     graph: &'a mut RenderGraph,
     pipeline: PipelineId,
-    descriptors: BTreeMap<(u32, u32), ResolvedImageDescriptor>,
+    descriptors: BTreeMap<(u32, u32), ResolvedDescriptor>,
     result: Result<(), vk::Result>,
 }
 
@@ -317,27 +440,94 @@ impl Recorder<'_> {
 
     pub fn image(&self, id: ValueId) -> ImageAttachment { self.graph.get::<ImageAttachment>(&id) }
 
+    /// Binds an image payload. Shader reflection selects sampled image, storage image, or input attachment.
     pub fn bind_image(&mut self, set: u32, binding: u32, image: &ImageAttachment) -> &mut Self {
-        self.descriptors.insert(
-            (set, binding),
-            ResolvedImageDescriptor {
-                set,
-                binding,
+        self.write_descriptor(
+            set,
+            binding,
+            ResolvedDescriptorValue::Image {
                 image_view: image.image_view(),
-                sampler: None,
             },
-        );
-        self
+        )
     }
 
     pub fn bind_texture(&mut self, set: u32, binding: u32, image: &ImageAttachment, sampler: vk::Sampler) -> &mut Self {
+        self.write_descriptor(
+            set,
+            binding,
+            ResolvedDescriptorValue::CombinedImageSampler {
+                image_view: image.image_view(),
+                sampler,
+            },
+        )
+    }
+
+    pub fn bind_sampler(&mut self, set: u32, binding: u32, sampler: vk::Sampler) -> &mut Self {
+        self.write_descriptor(set, binding, ResolvedDescriptorValue::Sampler { sampler })
+    }
+
+    /// Binds a whole buffer. Shader reflection selects uniform or storage buffer.
+    pub fn bind_buffer(&mut self, set: u32, binding: u32, buffer: &Buffer) -> &mut Self {
+        self.bind_buffer_range(set, binding, buffer, 0, vk::WHOLE_SIZE)
+    }
+
+    /// Binds a byte range of a buffer. Shader reflection selects uniform or storage buffer.
+    pub fn bind_buffer_range(&mut self, set: u32, binding: u32, buffer: &Buffer, offset: u64, range: u64) -> &mut Self {
+        self.write_descriptor(
+            set,
+            binding,
+            ResolvedDescriptorValue::Buffer {
+                buffer: buffer.handle(),
+                buffer_size: buffer.size(),
+                offset,
+                range,
+            },
+        )
+    }
+
+    /// Binds a buffer view. Shader reflection selects uniform or storage texel buffer.
+    pub fn bind_texel_buffer(&mut self, set: u32, binding: u32, buffer: &Buffer, view: vk::BufferView) -> &mut Self {
+        self.write_descriptor(
+            set,
+            binding,
+            ResolvedDescriptorValue::TexelBuffer {
+                backing_buffer: buffer.handle(),
+                view,
+            },
+        )
+    }
+
+    pub fn bind_acceleration_structure(
+        &mut self, set: u32, binding: u32, backing_buffer: &Buffer,
+        acceleration_structure: vk::AccelerationStructureKHR,
+    ) -> &mut Self {
+        self.write_descriptor(
+            set,
+            binding,
+            ResolvedDescriptorValue::AccelerationStructure {
+                backing_buffer: backing_buffer.handle(),
+                acceleration_structure,
+            },
+        )
+    }
+
+    fn write_descriptor(&mut self, set: u32, binding: u32, value: ResolvedDescriptorValue) -> &mut Self {
+        if self.result.is_err() {
+            return self;
+        }
+
+        if let Err(err) = value.validate(set, binding) {
+            self.result = Err(err);
+            return self;
+        }
+
         self.descriptors.insert(
             (set, binding),
-            ResolvedImageDescriptor {
+            ResolvedDescriptor {
                 set,
                 binding,
-                image_view: image.image_view(),
-                sampler: Some(sampler),
+                descriptor_type: None,
+                value,
             },
         );
         self
@@ -360,7 +550,7 @@ pub struct RenderGraph {
     retired_descriptor_arenas: Vec<RetiredDescriptorArena>,
     values: Vec<Value>,
     bound_pipeline: Option<vk::Pipeline>,
-    active_descriptors: Vec<ResolvedImageDescriptor>,
+    active_descriptors: Vec<ResolvedDescriptor>,
     bound_descriptors: Option<PipelineId>,
     render_area: vk::Rect2D,
     recorded_viewports: Vec<ResolvedViewport>,
@@ -1043,6 +1233,39 @@ impl RenderGraph {
         self.bound_descriptors = None;
     }
 
+    fn resolve_descriptor_value(&self, descriptor: ir::Descriptor) -> ResolvedDescriptorValue {
+        match descriptor {
+            ir::Descriptor::Sampler { sampler } => ResolvedDescriptorValue::Sampler { sampler },
+            ir::Descriptor::Image { image } => ResolvedDescriptorValue::Image {
+                image_view: self.get::<ImageAttachment>(&image).image_view(),
+            },
+            ir::Descriptor::CombinedImageSampler { image, sampler } => ResolvedDescriptorValue::CombinedImageSampler {
+                image_view: self.get::<ImageAttachment>(&image).image_view(),
+                sampler,
+            },
+            ir::Descriptor::TexelBuffer { buffer, view } => ResolvedDescriptorValue::TexelBuffer {
+                backing_buffer: self.get::<Buffer>(&buffer).handle(),
+                view,
+            },
+            ir::Descriptor::Buffer { buffer, offset, range } => {
+                let buffer = self.get::<Buffer>(&buffer);
+                ResolvedDescriptorValue::Buffer {
+                    buffer: buffer.handle(),
+                    buffer_size: buffer.size(),
+                    offset,
+                    range,
+                }
+            },
+            ir::Descriptor::AccelerationStructure {
+                backing_buffer,
+                acceleration_structure,
+            } => ResolvedDescriptorValue::AccelerationStructure {
+                backing_buffer: self.get::<Buffer>(&backing_buffer).handle(),
+                acceleration_structure,
+            },
+        }
+    }
+
     /// Binds the writes still standing, unless the same pipeline already has them bound.
     fn bind_active_descriptors(
         &mut self, pipeline: PipelineId, bind_point: vk::PipelineBindPoint,
@@ -1062,7 +1285,7 @@ impl RenderGraph {
     }
 
     fn bind_resolved_descriptor_sets(
-        &mut self, pipeline: PipelineId, bind_point: vk::PipelineBindPoint, descriptors: &[ResolvedImageDescriptor],
+        &mut self, pipeline: PipelineId, bind_point: vk::PipelineBindPoint, descriptors: &[ResolvedDescriptor],
     ) -> Result<(), vk::Result> {
         let Some(declared) = self.pipelines.get(pipeline.0 as usize) else {
             return Err(vk::Result::ERROR_UNKNOWN);
@@ -1077,7 +1300,7 @@ impl RenderGraph {
 
         // A pass can draw with several pipelines. Its descriptor table is their union, while
         // each pipeline only consumes the locations present in its own reflected layout.
-        let mut ordinary = BTreeMap::<u32, Vec<(ResolvedImageDescriptor, vk::DescriptorType)>>::new();
+        let mut ordinary = BTreeMap::<u32, Vec<ResolvedDescriptor>>::new();
         for expected in &declared.bindings {
             let (set, binding, descriptor_type) = (expected.set, expected.binding, expected.descriptor_type);
             if external.is_some_and(|external| external.index == set) {
@@ -1089,29 +1312,11 @@ impl RenderGraph {
                 .ok()
                 .map(|at| descriptors[at]);
             let Some(descriptor) = found else {
-                tracing::error!(%pipeline, set, binding, "pipeline descriptor has no image bound for this pass");
+                tracing::error!(%pipeline, set, binding, "pipeline descriptor has no value bound for this pass");
                 return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
             };
-            if descriptor.image_view.is_null() {
-                tracing::error!(%pipeline, set, binding, "image descriptor uses a null image view");
-                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
-            }
-            if descriptor.sampler.is_some_and(|sampler| sampler.is_null()) {
-                tracing::error!(%pipeline, set, binding, "combined image sampler uses a null sampler");
-                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
-            }
-            let combined = descriptor_type == vk::DescriptorType::COMBINED_IMAGE_SAMPLER;
-            if combined != descriptor.sampler.is_some() {
-                tracing::error!(
-                    %pipeline,
-                    set,
-                    binding,
-                    descriptor_type = ?descriptor_type,
-                    "the image binding method does not match the reflected descriptor type"
-                );
-                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
-            }
-            ordinary.entry(set).or_default().push((descriptor, descriptor_type));
+            let descriptor = descriptor.resolve_type(pipeline, descriptor_type)?;
+            ordinary.entry(set).or_default().push(descriptor);
         }
 
         let device_ptr = self.device;
@@ -1121,7 +1326,7 @@ impl RenderGraph {
             let key = DescriptorSetKey {
                 pipeline,
                 set,
-                descriptors: bindings.iter().map(|(descriptor, _)| *descriptor).collect(),
+                descriptors: bindings.clone(),
             };
             let descriptor_set = match self.descriptor_cache.get(&key).copied() {
                 Some(descriptor_set) => descriptor_set,
@@ -1136,27 +1341,121 @@ impl RenderGraph {
                         .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
                     let descriptor_set = arena.allocate(device, set_layout)?;
 
-                    let infos = bindings
-                        .iter()
-                        .map(|(descriptor, _)| {
-                            vk::DescriptorImageInfo::default()
-                                .sampler(descriptor.sampler.unwrap_or(vk::Sampler::null()))
-                                .image_view(descriptor.image_view)
-                                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                        })
-                        .collect::<Vec<_>>();
+                    #[derive(Clone, Copy)]
+                    enum WriteBacking {
+                        Image(usize),
+                        Buffer(usize),
+                        TexelBuffer(usize),
+                        AccelerationStructure(vk::AccelerationStructureKHR),
+                    }
+
+                    let mut image_infos = Vec::with_capacity(bindings.len());
+                    let mut buffer_infos = Vec::with_capacity(bindings.len());
+                    let mut texel_buffer_views = Vec::with_capacity(bindings.len());
+                    let mut backings = Vec::with_capacity(bindings.len());
+                    for descriptor in &bindings {
+                        let backing = match descriptor.value {
+                            ResolvedDescriptorValue::Sampler { sampler } => {
+                                let at = image_infos.len();
+                                image_infos.push(vk::DescriptorImageInfo::default().sampler(sampler));
+                                WriteBacking::Image(at)
+                            },
+                            ResolvedDescriptorValue::Image { image_view } => {
+                                let at = image_infos.len();
+                                let image_layout = match descriptor.descriptor_type {
+                                    Some(vk::DescriptorType::STORAGE_IMAGE) => vk::ImageLayout::GENERAL,
+                                    Some(vk::DescriptorType::SAMPLED_IMAGE | vk::DescriptorType::INPUT_ATTACHMENT) => {
+                                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+                                    },
+                                    _ => unreachable!("resolved image payload has a compatible descriptor type"),
+                                };
+                                image_infos.push(
+                                    vk::DescriptorImageInfo::default()
+                                        .image_view(image_view)
+                                        .image_layout(image_layout),
+                                );
+                                WriteBacking::Image(at)
+                            },
+                            ResolvedDescriptorValue::CombinedImageSampler { image_view, sampler } => {
+                                let at = image_infos.len();
+                                image_infos.push(
+                                    vk::DescriptorImageInfo::default()
+                                        .sampler(sampler)
+                                        .image_view(image_view)
+                                        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+                                );
+                                WriteBacking::Image(at)
+                            },
+                            ResolvedDescriptorValue::TexelBuffer { view, .. } => {
+                                let at = texel_buffer_views.len();
+                                texel_buffer_views.push(view);
+                                WriteBacking::TexelBuffer(at)
+                            },
+                            ResolvedDescriptorValue::Buffer {
+                                buffer, offset, range, ..
+                            } => {
+                                let at = buffer_infos.len();
+                                buffer_infos.push(
+                                    vk::DescriptorBufferInfo::default()
+                                        .buffer(buffer)
+                                        .offset(offset)
+                                        .range(range),
+                                );
+                                WriteBacking::Buffer(at)
+                            },
+                            ResolvedDescriptorValue::AccelerationStructure {
+                                acceleration_structure, ..
+                            } => WriteBacking::AccelerationStructure(acceleration_structure),
+                        };
+                        backings.push(backing);
+                    }
+
                     let writes = bindings
                         .iter()
-                        .zip(&infos)
-                        .map(|((descriptor, descriptor_type), info)| {
-                            vk::WriteDescriptorSet::default()
+                        .zip(&backings)
+                        .filter_map(|(descriptor, backing)| {
+                            let write = vk::WriteDescriptorSet::default()
                                 .dst_set(descriptor_set)
                                 .dst_binding(descriptor.binding)
-                                .descriptor_type(*descriptor_type)
-                                .image_info(std::slice::from_ref(info))
+                                .descriptor_type(
+                                    descriptor
+                                        .descriptor_type
+                                        .expect("descriptors entering the cache have reflected types"),
+                                );
+                            match backing {
+                                WriteBacking::Image(at) => {
+                                    Some(write.image_info(std::slice::from_ref(&image_infos[*at])))
+                                },
+                                WriteBacking::Buffer(at) => {
+                                    Some(write.buffer_info(std::slice::from_ref(&buffer_infos[*at])))
+                                },
+                                WriteBacking::TexelBuffer(at) => {
+                                    Some(write.texel_buffer_view(std::slice::from_ref(&texel_buffer_views[*at])))
+                                },
+                                WriteBacking::AccelerationStructure(_) => None,
+                            }
                         })
                         .collect::<Vec<_>>();
-                    unsafe { device.update_descriptor_sets(&writes, &[]) };
+                    if !writes.is_empty() {
+                        unsafe { device.update_descriptor_sets(&writes, &[]) };
+                    }
+
+                    for (descriptor, backing) in bindings.iter().zip(&backings) {
+                        let WriteBacking::AccelerationStructure(acceleration_structure) = backing else {
+                            continue;
+                        };
+                        let acceleration_structures = [*acceleration_structure];
+                        let mut acceleration_info = vk::WriteDescriptorSetAccelerationStructureKHR::default()
+                            .acceleration_structures(&acceleration_structures);
+                        let write = vk::WriteDescriptorSet::default()
+                            .dst_set(descriptor_set)
+                            .dst_binding(descriptor.binding)
+                            .descriptor_count(1)
+                            .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
+                            .push_next(&mut acceleration_info);
+                        unsafe { device.update_descriptor_sets(std::slice::from_ref(&write), &[]) };
+                    }
+
                     self.descriptor_cache.insert(key, descriptor_set);
                     descriptor_set
                 },
@@ -1575,17 +1874,18 @@ impl RenderGraph {
                 set,
                 binding,
                 descriptor,
+                descriptor_type,
                 ..
             } => {
                 self.set_value(value_id, Value::Reference(*pass));
 
-                let image = self.get::<ImageAttachment>(&descriptor.image());
-                let written = ResolvedImageDescriptor {
+                let written = ResolvedDescriptor {
                     set: *set,
                     binding: *binding,
-                    image_view: image.image_view(),
-                    sampler: descriptor.sampler(),
+                    descriptor_type: *descriptor_type,
+                    value: self.resolve_descriptor_value(*descriptor),
                 };
+                written.value.validate(*set, *binding)?;
 
                 match self
                     .active_descriptors
@@ -1844,5 +2144,141 @@ impl Drop for RenderGraph {
                 layout.destroy(device);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolved_descriptor_payloads_support_every_reflected_scalar_type() {
+        let buffer = vk::Buffer::from_raw(1);
+        let image_view = vk::ImageView::from_raw(2);
+        let sampler = vk::Sampler::from_raw(3);
+        let view = vk::BufferView::from_raw(4);
+        let acceleration_structure = vk::AccelerationStructureKHR::from_raw(5);
+        let descriptors: [(ResolvedDescriptorValue, &[vk::DescriptorType]); 6] = [
+            (
+                ResolvedDescriptorValue::Sampler { sampler },
+                &[vk::DescriptorType::SAMPLER],
+            ),
+            (
+                ResolvedDescriptorValue::Image { image_view },
+                &[
+                    vk::DescriptorType::SAMPLED_IMAGE,
+                    vk::DescriptorType::STORAGE_IMAGE,
+                    vk::DescriptorType::INPUT_ATTACHMENT,
+                ],
+            ),
+            (
+                ResolvedDescriptorValue::CombinedImageSampler { image_view, sampler },
+                &[vk::DescriptorType::COMBINED_IMAGE_SAMPLER],
+            ),
+            (
+                ResolvedDescriptorValue::TexelBuffer {
+                    backing_buffer: buffer,
+                    view,
+                },
+                &[
+                    vk::DescriptorType::UNIFORM_TEXEL_BUFFER,
+                    vk::DescriptorType::STORAGE_TEXEL_BUFFER,
+                ],
+            ),
+            (
+                ResolvedDescriptorValue::Buffer {
+                    buffer,
+                    buffer_size: 256,
+                    offset: 16,
+                    range: 64,
+                },
+                &[vk::DescriptorType::UNIFORM_BUFFER, vk::DescriptorType::STORAGE_BUFFER],
+            ),
+            (
+                ResolvedDescriptorValue::AccelerationStructure {
+                    backing_buffer: buffer,
+                    acceleration_structure,
+                },
+                &[vk::DescriptorType::ACCELERATION_STRUCTURE_KHR],
+            ),
+        ];
+        let reflected_types = [
+            vk::DescriptorType::SAMPLER,
+            vk::DescriptorType::SAMPLED_IMAGE,
+            vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            vk::DescriptorType::STORAGE_IMAGE,
+            vk::DescriptorType::UNIFORM_TEXEL_BUFFER,
+            vk::DescriptorType::STORAGE_TEXEL_BUFFER,
+            vk::DescriptorType::UNIFORM_BUFFER,
+            vk::DescriptorType::STORAGE_BUFFER,
+            vk::DescriptorType::INPUT_ATTACHMENT,
+            vk::DescriptorType::ACCELERATION_STRUCTURE_KHR,
+        ];
+
+        for (descriptor, compatible_types) in descriptors {
+            for descriptor_type in reflected_types {
+                assert_eq!(
+                    descriptor.supports_type(descriptor_type),
+                    compatible_types.contains(&descriptor_type),
+                    "{descriptor:?} against {descriptor_type:?}"
+                );
+            }
+            assert!(descriptor.validate(0, 0).is_ok());
+        }
+    }
+
+    #[test]
+    fn resolved_buffer_descriptors_reject_empty_and_out_of_bounds_ranges() {
+        let buffer = vk::Buffer::from_raw(1);
+        let descriptor = |offset, range| ResolvedDescriptorValue::Buffer {
+            buffer,
+            buffer_size: 128,
+            offset,
+            range,
+        };
+
+        assert!(descriptor(0, 0).validate(0, 0).is_err());
+        assert!(descriptor(128, vk::WHOLE_SIZE).validate(0, 0).is_err());
+        assert!(descriptor(96, 64).validate(0, 0).is_err());
+        assert!(descriptor(32, vk::WHOLE_SIZE).validate(0, 0).is_ok());
+    }
+
+    #[test]
+    fn runtime_descriptor_payloads_are_typed_by_reflection() {
+        let descriptor = ResolvedDescriptor {
+            set: 0,
+            binding: 1,
+            descriptor_type: None,
+            value: ResolvedDescriptorValue::Image {
+                image_view: vk::ImageView::from_raw(1),
+            },
+        };
+
+        let storage = descriptor
+            .resolve_type(PipelineId(0), vk::DescriptorType::STORAGE_IMAGE)
+            .unwrap();
+        assert_eq!(storage.descriptor_type, Some(vk::DescriptorType::STORAGE_IMAGE));
+        assert!(
+            storage
+                .resolve_type(PipelineId(1), vk::DescriptorType::SAMPLED_IMAGE)
+                .is_err()
+        );
+
+        let wrong_payload = ResolvedDescriptor {
+            set: 0,
+            binding: 1,
+            descriptor_type: None,
+            value: ResolvedDescriptorValue::Buffer {
+                buffer: vk::Buffer::from_raw(2),
+                buffer_size: 64,
+                offset: 0,
+                range: vk::WHOLE_SIZE,
+            },
+        };
+        assert!(
+            wrong_payload
+                .resolve_type(PipelineId(0), vk::DescriptorType::SAMPLED_IMAGE)
+                .is_err()
+        );
     }
 }

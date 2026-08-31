@@ -246,7 +246,19 @@ mod tests {
     use ash::{vk, vk::Handle};
 
     use super::super::analysis::Declared;
-    use crate::{Access, BlendPreset, Image, ImageAttachment, ImageInfo, Module, PipelineId, Rect2D, Unchecked};
+    use crate::{
+        Access,
+        BlendPreset,
+        BufferInfo,
+        Image,
+        ImageAttachment,
+        ImageInfo,
+        MemoryLocation,
+        Module,
+        PipelineId,
+        Rect2D,
+        Unchecked,
+    };
 
     const FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
 
@@ -507,5 +519,71 @@ mod tests {
             dump.lines().any(|line| line.ends_with("= const FragmentSampled")),
             "{dump}"
         );
+    }
+
+    #[test]
+    fn every_scalar_descriptor_payload_and_inferred_type_is_dumped() {
+        let extent = vk::Extent2D::default().width(4).height(4);
+        let mut module = Module::default();
+        let attachment = module.transient_image(&ImageInfo::color_target(extent, FORMAT));
+        let image = module.transient_image(&ImageInfo::color_target(extent, FORMAT));
+        let buffer = module.transient_buffer(&BufferInfo::new(
+            256,
+            vk::BufferUsageFlags::empty(),
+            MemoryLocation::GpuOnly,
+        ));
+        let sampler = vk::Sampler::from_raw(1);
+        let view = vk::BufferView::from_raw(2);
+        let acceleration_structure = vk::AccelerationStructureKHR::from_raw(3);
+
+        let end = module
+            .begin_rendering([(attachment, Access::ColorRW)])
+            .bind_graphics_pipeline(PipelineId(0))
+            .bind_sampler(0, 0, sampler)
+            .bind_image(0, 1, image)
+            .bind_texture(0, 2, image, sampler)
+            .bind_image(0, 3, image)
+            .bind_texel_buffer(0, 4, buffer, view)
+            .bind_texel_buffer(0, 5, buffer, view)
+            .bind_buffer(0, 6, buffer)
+            .bind_buffer_range(0, 7, buffer, 16, 64)
+            .bind_image(0, 8, image)
+            .bind_acceleration_structure(0, 9, buffer, acceleration_structure)
+            .draw(3, 1)
+            .end_rendering();
+        let descriptor_types = [
+            vk::DescriptorType::SAMPLER,
+            vk::DescriptorType::SAMPLED_IMAGE,
+            vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            vk::DescriptorType::STORAGE_IMAGE,
+            vk::DescriptorType::UNIFORM_TEXEL_BUFFER,
+            vk::DescriptorType::STORAGE_TEXEL_BUFFER,
+            vk::DescriptorType::UNIFORM_BUFFER,
+            vk::DescriptorType::STORAGE_BUFFER,
+            vk::DescriptorType::INPUT_ATTACHMENT,
+            vk::DescriptorType::ACCELERATION_STRUCTURE_KHR,
+        ];
+        let bindings = descriptor_types
+            .into_iter()
+            .enumerate()
+            .map(|(binding, descriptor_type)| (0, binding as u32, descriptor_type))
+            .collect::<Vec<_>>();
+        let declared = Declared::with_access(&bindings, vk::ShaderStageFlags::FRAGMENT, Access::None);
+        let dump = module.compile(&declared, end).unwrap().dump();
+
+        for payload in [
+            " sampler ",
+            " image ",
+            " combined_image_sampler ",
+            " texel_buffer ",
+            " buffer ",
+            " acceleration_structure ",
+        ] {
+            assert!(dump.contains(payload), "missing {payload:?}\n{dump}");
+        }
+        for descriptor_type in descriptor_types {
+            let inferred = format!("type={descriptor_type:?}");
+            assert!(dump.contains(&inferred), "missing {inferred:?}\n{dump}");
+        }
     }
 }

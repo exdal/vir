@@ -8,6 +8,7 @@ cargo run --example triangle
 cargo run --example vertex_buffer
 cargo run --example offscreen
 cargo run --example texture
+cargo run --example descriptors
 cargo run --example compute
 cargo run --example deferred
 cargo run --example egui
@@ -19,6 +20,7 @@ cargo run --example egui
 | `vertex_buffer` | A quad uploaded once into a persistent buffer and drawn indexed, next to a triangle rebuilt every frame out of the frame allocator. |
 | `offscreen` | A frame as a chain: an offscreen target the graph owns for the run, a second one sized by a variable so the downscale costs no recompile, and three blits back onto the swapchain. |
 | `texture` | A PNG staged and copied onto the GPU once at startup, then bound directly to the scalar descriptor reflected from the shader. |
+| `descriptors` | A CPU-runnable reflection table and host-binding walkthrough for every scalar descriptor kind, including input attachments and acceleration structures without requiring those optional GPU facilities. |
 | `compute` | Geometry that never exists on the CPU: two dispatches reaching their buffers through device addresses, chained so that the second reads what the first wrote and the draw's vertex input waits on both. |
 | `deferred` | A simple deferred renderer that uses Damaged Helmet model. It's a great example to show how multiple attachments per pass is used. |
 | `egui` | The overlay with nothing under it. |

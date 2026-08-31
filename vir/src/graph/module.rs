@@ -67,11 +67,12 @@ struct Arm {
     buffers: HashMap<ValueId, BufferState>,
 }
 
-fn resolve_descriptor_access(
+fn resolve_descriptors(
     mut nodes: Vec<ir::Instr>, pipelines: &impl PipelineBindings, next_id: &mut u32,
 ) -> Result<Vec<ir::Instr>, vk::Result> {
-    let mut written: BTreeMap<(u32, u32), usize> = BTreeMap::new();
-    let mut resolved: BTreeMap<usize, Access> = BTreeMap::new();
+    let mut written: BTreeMap<(u32, u32), (usize, ir::Descriptor)> = BTreeMap::new();
+    let mut resolved_accesses: BTreeMap<usize, Access> = BTreeMap::new();
+    let mut resolved_types: BTreeMap<usize, vk::DescriptorType> = BTreeMap::new();
     let mut open = false;
     let mut failed = false;
 
@@ -84,15 +85,20 @@ fn resolve_descriptor_access(
             IR::EndRendering { .. } | IR::EndCompute { .. } => {
                 open = false;
             },
-            IR::WriteDescriptor { set, binding, .. } => {
+            IR::WriteDescriptor {
+                set,
+                binding,
+                descriptor,
+                ..
+            } => {
                 if !open {
                     tracing::error!(%value_id, set, binding, "a descriptor is written outside of any pass");
                     failed = true;
                     continue;
                 }
 
-                written.insert((*set, *binding), index);
-                resolved.insert(index, Access::None);
+                written.insert((*set, *binding), (index, *descriptor));
+                resolved_accesses.insert(index, Access::None);
             },
             IR::Draw { pipeline, .. }
             | IR::DrawIndexed { pipeline, .. }
@@ -118,10 +124,41 @@ fn resolve_descriptor_access(
                 };
 
                 for binding in bindings {
-                    let Some(index) = written.get(&(binding.set, binding.binding)) else {
+                    let Some((index, descriptor)) = written.get(&(binding.set, binding.binding)) else {
                         continue;
                     };
-                    let access = resolved
+
+                    if !descriptor.supports_type(binding.descriptor_type) {
+                        tracing::error!(
+                            %value_id,
+                            %pipeline,
+                            set = binding.set,
+                            binding = binding.binding,
+                            declared = ?binding.descriptor_type,
+                            payload = ?descriptor,
+                            "the bound descriptor payload is incompatible with the reflected descriptor type"
+                        );
+                        failed = true;
+                        continue;
+                    }
+
+                    if let Some(previous) = resolved_types.insert(*index, binding.descriptor_type)
+                        && previous != binding.descriptor_type
+                    {
+                        tracing::error!(
+                            %value_id,
+                            %pipeline,
+                            set = binding.set,
+                            binding = binding.binding,
+                            first = ?previous,
+                            current = ?binding.descriptor_type,
+                            "one descriptor write is consumed as two different reflected descriptor types; rebind it between pipelines"
+                        );
+                        failed = true;
+                        continue;
+                    }
+
+                    let access = resolved_accesses
                         .get_mut(index)
                         .expect("every active descriptor write must have an access accumulator");
                     let combined = access.difference(Access::None) | binding.access.difference(Access::None);
@@ -145,7 +182,7 @@ fn resolve_descriptor_access(
         .collect::<HashMap<_, _>>();
     let mut constants = Vec::new();
 
-    for (index, access) in resolved {
+    for (index, access) in resolved_accesses {
         let access_id = match access_ids.get(&access).copied() {
             Some(id) => id,
             None => {
@@ -155,8 +192,14 @@ fn resolve_descriptor_access(
                 id
             },
         };
-        if let IR::WriteDescriptor { access: slot, .. } = &mut nodes[index].1 {
+        if let IR::WriteDescriptor {
+            access: slot,
+            descriptor_type,
+            ..
+        } = &mut nodes[index].1
+        {
             *slot = access_id;
+            *descriptor_type = resolved_types.remove(&index);
         }
     }
 
@@ -837,8 +880,8 @@ impl Module {
         let nodes = self.topo_sort(&roots);
         let nodes = self.layout_blocks(nodes, &mut next_id);
         let nodes = self.infer(nodes);
-        // the barriers are what the resolved accesses are for, so this comes before them
-        let nodes = resolve_descriptor_access(nodes, pipelines, &mut next_id)?;
+        // Reflected accesses drive barriers and reflected types drive usage, so resolve both first.
+        let nodes = resolve_descriptors(nodes, pipelines, &mut next_id)?;
         let nodes = self.sync(nodes, &mut next_id);
         let nodes = self.simplify_cfg(nodes);
         let nodes = self.fold_barriers(nodes, &mut next_id);
@@ -993,7 +1036,9 @@ impl Module {
                     } => {
                         stack.push(*access);
                         stack.push(*pass);
-                        stack.push(descriptor.image());
+                        if let Some(resource) = descriptor.resource() {
+                            stack.push(resource);
+                        }
                     },
                     IR::Draw {
                         pass,
@@ -1285,12 +1330,24 @@ impl Module {
                 },
                 IR::WriteDescriptor { descriptor, access, .. } => {
                     let access = resolve_access(access);
+                    if access == Access::None {
+                        continue;
+                    }
                     if let Some(region) = open_region {
-                        let root = self.resource_root(descriptor.image());
-                        let sampled = region_images.entry(region).or_default();
-                        match sampled.iter_mut().find(|(seen, _)| *seen == root) {
-                            Some((_, merged)) => *merged |= access,
-                            None => sampled.push((root, access)),
+                        if let Some(image) = descriptor.image() {
+                            let root = self.resource_root(image);
+                            let images = region_images.entry(region).or_default();
+                            match images.iter_mut().find(|(seen, _)| *seen == root) {
+                                Some((_, merged)) => *merged |= access,
+                                None => images.push((root, access)),
+                            }
+                        } else if let Some(buffer) = descriptor.buffer() {
+                            let root = self.resource_root(buffer);
+                            let buffers = region_buffers.entry(region).or_default();
+                            match buffers.iter_mut().find(|(seen, _)| *seen == root) {
+                                Some((_, merged)) => *merged |= access,
+                                None => buffers.push((root, access)),
+                            }
                         }
                     }
                     continue;
@@ -1614,6 +1671,10 @@ impl Module {
                             transition!(resource, access_id, access);
                         }
                     }
+
+                    for (buffer, access) in region_buffers.get(&value_id).cloned().into_iter().flatten() {
+                        buffer_barrier!(buffer, access);
+                    }
                 },
 
                 IR::Dispatch {
@@ -1715,14 +1776,24 @@ impl Module {
 
         let mut usages: HashMap<ValueId, vk::ImageUsageFlags> = HashMap::new();
         for (_, ir) in nodes.iter() {
-            let IR::ImageBarrier { dst_access, value, .. } = ir else {
-                continue;
-            };
-            let Some(access) = access_of(dst_access) else {
-                continue;
-            };
-
-            *usages.entry(self.resource_root(*value)).or_default() |= vk::ImageUsageFlags::from(access);
+            match ir {
+                IR::ImageBarrier { dst_access, value, .. } => {
+                    let Some(access) = access_of(dst_access) else {
+                        continue;
+                    };
+                    *usages.entry(self.resource_root(*value)).or_default() |= vk::ImageUsageFlags::from(access);
+                },
+                IR::WriteDescriptor {
+                    descriptor,
+                    descriptor_type: Some(descriptor_type),
+                    ..
+                } => {
+                    if let (Some(image), Some(usage)) = (descriptor.image(), descriptor.image_usage(*descriptor_type)) {
+                        *usages.entry(self.resource_root(image)).or_default() |= usage;
+                    }
+                },
+                _ => {},
+            }
         }
 
         // a buffer's barriers are global, so unlike an image's there is nothing in them naming
@@ -1739,6 +1810,17 @@ impl Module {
                     .iter()
                     .for_each(|b| used(b, vk::BufferUsageFlags::VERTEX_BUFFER)),
                 IR::BindIndexBuffer { buffer, .. } => used(buffer, vk::BufferUsageFlags::INDEX_BUFFER),
+                IR::WriteDescriptor {
+                    descriptor,
+                    descriptor_type: Some(descriptor_type),
+                    ..
+                } => {
+                    if let (Some(buffer), Some(usage)) =
+                        (descriptor.buffer(), descriptor.buffer_usage(*descriptor_type))
+                    {
+                        used(&buffer, usage);
+                    }
+                },
                 IR::BeginRendering { attachments, .. } | IR::BeginCompute { attachments, .. } => {
                     for (resource, access) in attachments {
                         for resource in self.resource_elements(*resource) {
@@ -2195,12 +2277,25 @@ impl Module {
     /// dispatch is reached is what that command's descriptor sets are built from, so rebinding
     /// the same set and binding only affects the commands after it.
     fn write_descriptor(&mut self, set: u32, binding: u32, descriptor: ir::Descriptor) -> &mut Self {
-        if !self.is_image(descriptor.image()) {
+        if let Some(image) = descriptor.image()
+            && !self.is_image(image)
+        {
             tracing::error!(
-                image = %descriptor.image(),
+                %image,
                 set,
                 binding,
                 "only an image value can be written to an image descriptor"
+            );
+            return self;
+        }
+        if let Some(buffer) = descriptor.buffer()
+            && !self.is_buffer(buffer)
+        {
+            tracing::error!(
+                %buffer,
+                set,
+                binding,
+                "only a buffer value can be written to a buffer-backed descriptor"
             );
             return self;
         }
@@ -2211,16 +2306,51 @@ impl Module {
             set,
             binding,
             descriptor,
+            descriptor_type: None,
             access,
         })
     }
 
+    /// Binds an image payload. Shader reflection selects sampled image, storage image, or input attachment.
     pub fn bind_image(&mut self, set: u32, binding: u32, image: ValueId) -> &mut Self {
-        self.write_descriptor(set, binding, ir::Descriptor::SampledImage { image })
+        self.write_descriptor(set, binding, ir::Descriptor::Image { image })
     }
 
     pub fn bind_texture(&mut self, set: u32, binding: u32, image: ValueId, sampler: vk::Sampler) -> &mut Self {
         self.write_descriptor(set, binding, ir::Descriptor::CombinedImageSampler { image, sampler })
+    }
+
+    pub fn bind_sampler(&mut self, set: u32, binding: u32, sampler: vk::Sampler) -> &mut Self {
+        self.write_descriptor(set, binding, ir::Descriptor::Sampler { sampler })
+    }
+
+    /// Binds a whole buffer. Shader reflection selects uniform or storage buffer.
+    pub fn bind_buffer(&mut self, set: u32, binding: u32, buffer: ValueId) -> &mut Self {
+        self.bind_buffer_range(set, binding, buffer, 0, vk::WHOLE_SIZE)
+    }
+
+    /// Binds a byte range of a buffer. Shader reflection selects uniform or storage buffer.
+    pub fn bind_buffer_range(&mut self, set: u32, binding: u32, buffer: ValueId, offset: u64, range: u64) -> &mut Self {
+        self.write_descriptor(set, binding, ir::Descriptor::Buffer { buffer, offset, range })
+    }
+
+    /// Binds a buffer view. Shader reflection selects uniform or storage texel buffer.
+    pub fn bind_texel_buffer(&mut self, set: u32, binding: u32, buffer: ValueId, view: vk::BufferView) -> &mut Self {
+        self.write_descriptor(set, binding, ir::Descriptor::TexelBuffer { buffer, view })
+    }
+
+    pub fn bind_acceleration_structure(
+        &mut self, set: u32, binding: u32, backing_buffer: ValueId,
+        acceleration_structure: vk::AccelerationStructureKHR,
+    ) -> &mut Self {
+        self.write_descriptor(
+            set,
+            binding,
+            ir::Descriptor::AccelerationStructure {
+                backing_buffer,
+                acceleration_structure,
+            },
+        )
     }
 
     pub fn bind_vertex_buffer(&mut self, binding: u32, buffer: ValueId) -> &mut Self {
@@ -2602,6 +2732,17 @@ mod tests {
                 _ => None,
             })
             .expect("the image should still be declared after compiling")
+    }
+
+    fn buffer_usage(program: &Program, id: ValueId) -> vk::BufferUsageFlags {
+        program
+            .instructions()
+            .iter()
+            .find_map(|(instr_id, ir)| match ir {
+                IR::ConstructBuffer { usage, .. } if *instr_id == id => Some(*usage),
+                _ => None,
+            })
+            .expect("the buffer should still be declared after compiling")
     }
 
     fn draws(program: &Program) -> Vec<(PipelineId, PipelineState)> {
@@ -4616,7 +4757,7 @@ mod tests {
         assert_eq!(
             descriptor_writes(&compiled),
             [
-                (2, 4, ir::Descriptor::SampledImage { image: first }),
+                (2, 4, ir::Descriptor::Image { image: first }),
                 (
                     2,
                     4,
@@ -4653,7 +4794,7 @@ mod tests {
         let compiled = module.compile(&bindings, end).unwrap();
         assert_eq!(
             descriptor_writes(&compiled),
-            [(1, 3, ir::Descriptor::SampledImage { image: texture })]
+            [(1, 3, ir::Descriptor::Image { image: texture })]
         );
 
         let sampled = image_barriers(&module, &compiled)
@@ -4689,6 +4830,135 @@ mod tests {
             .expect("the region should survive");
 
         assert!(barrier < begin);
+    }
+
+    #[test]
+    fn storage_and_input_descriptors_choose_their_image_layout_and_usage() {
+        fn check(
+            descriptor_type: vk::DescriptorType, access: Access, expected_layout: vk::ImageLayout,
+            expected_usage: vk::ImageUsageFlags, bind: impl FnOnce(&mut Module, ValueId),
+        ) {
+            let (mut module, attachment) = module_with_attachment();
+            let image = module.transient_image(&untyped_info());
+            module
+                .begin_rendering([(attachment, Access::ColorRW)])
+                .bind_graphics_pipeline(PipelineId(0));
+            bind(&mut module, image);
+            let end = module.draw(3, 1).end_rendering();
+            let bindings = Declared::with_access(&[(0, 0, descriptor_type)], vk::ShaderStageFlags::FRAGMENT, access);
+            let compiled = module.compile(&bindings, end).unwrap();
+            let barrier = image_barriers(&module, &compiled)
+                .into_iter()
+                .find(|barrier| barrier.resource == image)
+                .expect("the descriptor image should be transitioned");
+            assert_eq!(barrier.dst, access);
+            assert_eq!(barrier.new_layout, expected_layout);
+            assert_eq!(image_usage(&compiled, image), expected_usage);
+        }
+
+        check(
+            vk::DescriptorType::STORAGE_IMAGE,
+            Access::FragmentWrite,
+            vk::ImageLayout::GENERAL,
+            vk::ImageUsageFlags::STORAGE,
+            |module, image| {
+                module.bind_image(0, 0, image);
+            },
+        );
+        check(
+            vk::DescriptorType::INPUT_ATTACHMENT,
+            Access::InputAttachmentRead,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::ImageUsageFlags::INPUT_ATTACHMENT,
+            |module, image| {
+                module.bind_image(0, 0, image);
+            },
+        );
+    }
+
+    #[test]
+    fn buffer_descriptors_infer_their_usage_and_synchronize_their_backing_buffer() {
+        fn check(
+            descriptor_type: vk::DescriptorType, access: Access, expected_usage: vk::BufferUsageFlags,
+            bind: impl FnOnce(&mut Module, ValueId),
+        ) {
+            let (mut module, attachment) = module_with_attachment();
+            let buffer = module.declare_buffer_var("descriptor_buffer", Access::HostWrite);
+            module
+                .begin_rendering([(attachment, Access::ColorRW)])
+                .bind_graphics_pipeline(PipelineId(0));
+            bind(&mut module, buffer);
+            let end = module.draw(3, 1).end_rendering();
+            let bindings = Declared::with_access(&[(0, 0, descriptor_type)], vk::ShaderStageFlags::FRAGMENT, access);
+            let compiled = module.compile(&bindings, end).unwrap();
+            assert_eq!(memory_barriers(&module, &compiled), [(Access::HostWrite, access)]);
+            assert_eq!(buffer_usage(&compiled, buffer), expected_usage);
+        }
+
+        check(
+            vk::DescriptorType::UNIFORM_BUFFER,
+            Access::FragmentUniformRead,
+            vk::BufferUsageFlags::UNIFORM_BUFFER,
+            |module, buffer| {
+                module.bind_buffer(0, 0, buffer);
+            },
+        );
+        check(
+            vk::DescriptorType::STORAGE_BUFFER,
+            Access::FragmentRead,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            |module, buffer| {
+                module.bind_buffer_range(0, 0, buffer, 16, 64);
+            },
+        );
+        check(
+            vk::DescriptorType::UNIFORM_TEXEL_BUFFER,
+            Access::FragmentSampled,
+            vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER,
+            |module, buffer| {
+                module.bind_texel_buffer(0, 0, buffer, vk::BufferView::from_raw(2));
+            },
+        );
+        check(
+            vk::DescriptorType::STORAGE_TEXEL_BUFFER,
+            Access::FragmentRead,
+            vk::BufferUsageFlags::STORAGE_TEXEL_BUFFER,
+            |module, buffer| {
+                module.bind_texel_buffer(0, 0, buffer, vk::BufferView::from_raw(2));
+            },
+        );
+        check(
+            vk::DescriptorType::ACCELERATION_STRUCTURE_KHR,
+            Access::FragmentAccelerationStructureRead,
+            vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR,
+            |module, buffer| {
+                module.bind_acceleration_structure(0, 0, buffer, vk::AccelerationStructureKHR::from_raw(3));
+            },
+        );
+    }
+
+    #[test]
+    fn a_compute_buffer_descriptor_is_synchronized_before_dispatch() {
+        let mut module = Module::default();
+        let buffer = module.declare_buffer_var("compute_storage", Access::HostWrite);
+        let end = module
+            .begin_compute([])
+            .bind_compute_pipeline(PipelineId(0))
+            .bind_buffer(0, 0, buffer)
+            .dispatch(1, 1, 1)
+            .end_compute();
+        let bindings = Declared::with_access(
+            &[(0, 0, vk::DescriptorType::STORAGE_BUFFER)],
+            vk::ShaderStageFlags::COMPUTE,
+            Access::ComputeRead,
+        );
+        let compiled = module.compile(&bindings, end).unwrap();
+
+        assert_eq!(
+            memory_barriers(&module, &compiled),
+            [(Access::HostWrite, Access::ComputeRead)]
+        );
+        assert_eq!(buffer_usage(&compiled, buffer), vk::BufferUsageFlags::STORAGE_BUFFER);
     }
 
     #[test]

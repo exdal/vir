@@ -110,28 +110,111 @@ pub enum VariableKind {
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub enum Descriptor {
-    SampledImage { image: ValueId },
-    CombinedImageSampler { image: ValueId, sampler: vk::Sampler },
+    Sampler {
+        sampler: vk::Sampler,
+    },
+    Image {
+        image: ValueId,
+    },
+    CombinedImageSampler {
+        image: ValueId,
+        sampler: vk::Sampler,
+    },
+    TexelBuffer {
+        buffer: ValueId,
+        view: vk::BufferView,
+    },
+    Buffer {
+        buffer: ValueId,
+        offset: u64,
+        range: u64,
+    },
+    AccelerationStructure {
+        backing_buffer: ValueId,
+        acceleration_structure: vk::AccelerationStructureKHR,
+    },
 }
 
 impl Descriptor {
-    pub fn image(&self) -> ValueId {
+    pub fn image(&self) -> Option<ValueId> {
         match self {
-            Descriptor::SampledImage { image } | Descriptor::CombinedImageSampler { image, .. } => *image,
+            Descriptor::Image { image } | Descriptor::CombinedImageSampler { image, .. } => Some(*image),
+            _ => None,
         }
     }
+
+    pub fn buffer(&self) -> Option<ValueId> {
+        match self {
+            Descriptor::TexelBuffer { buffer, .. } | Descriptor::Buffer { buffer, .. } => Some(*buffer),
+            Descriptor::AccelerationStructure { backing_buffer, .. } => Some(*backing_buffer),
+            _ => None,
+        }
+    }
+
+    pub fn resource(&self) -> Option<ValueId> { self.image().or_else(|| self.buffer()) }
 
     pub fn sampler(&self) -> Option<vk::Sampler> {
         match self {
-            Descriptor::SampledImage { .. } => None,
-            Descriptor::CombinedImageSampler { sampler, .. } => Some(*sampler),
+            Descriptor::Sampler { sampler } | Descriptor::CombinedImageSampler { sampler, .. } => Some(*sampler),
+            _ => None,
         }
     }
 
-    pub fn descriptor_type(&self) -> vk::DescriptorType {
+    pub fn supports_type(&self, descriptor_type: vk::DescriptorType) -> bool {
         match self {
-            Descriptor::SampledImage { .. } => vk::DescriptorType::SAMPLED_IMAGE,
-            Descriptor::CombinedImageSampler { .. } => vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            Descriptor::Sampler { .. } => descriptor_type == vk::DescriptorType::SAMPLER,
+            Descriptor::Image { .. } => matches!(
+                descriptor_type,
+                vk::DescriptorType::SAMPLED_IMAGE
+                    | vk::DescriptorType::STORAGE_IMAGE
+                    | vk::DescriptorType::INPUT_ATTACHMENT
+            ),
+            Descriptor::CombinedImageSampler { .. } => descriptor_type == vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            Descriptor::TexelBuffer { .. } => matches!(
+                descriptor_type,
+                vk::DescriptorType::UNIFORM_TEXEL_BUFFER | vk::DescriptorType::STORAGE_TEXEL_BUFFER
+            ),
+            Descriptor::Buffer { .. } => {
+                matches!(
+                    descriptor_type,
+                    vk::DescriptorType::UNIFORM_BUFFER | vk::DescriptorType::STORAGE_BUFFER
+                )
+            },
+            Descriptor::AccelerationStructure { .. } => {
+                descriptor_type == vk::DescriptorType::ACCELERATION_STRUCTURE_KHR
+            },
+        }
+    }
+
+    pub(crate) fn image_usage(&self, descriptor_type: vk::DescriptorType) -> Option<vk::ImageUsageFlags> {
+        if !self.supports_type(descriptor_type) {
+            return None;
+        }
+
+        match descriptor_type {
+            vk::DescriptorType::SAMPLED_IMAGE | vk::DescriptorType::COMBINED_IMAGE_SAMPLER => {
+                Some(vk::ImageUsageFlags::SAMPLED)
+            },
+            vk::DescriptorType::STORAGE_IMAGE => Some(vk::ImageUsageFlags::STORAGE),
+            vk::DescriptorType::INPUT_ATTACHMENT => Some(vk::ImageUsageFlags::INPUT_ATTACHMENT),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn buffer_usage(&self, descriptor_type: vk::DescriptorType) -> Option<vk::BufferUsageFlags> {
+        if !self.supports_type(descriptor_type) {
+            return None;
+        }
+
+        match descriptor_type {
+            vk::DescriptorType::UNIFORM_TEXEL_BUFFER => Some(vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER),
+            vk::DescriptorType::STORAGE_TEXEL_BUFFER => Some(vk::BufferUsageFlags::STORAGE_TEXEL_BUFFER),
+            vk::DescriptorType::UNIFORM_BUFFER => Some(vk::BufferUsageFlags::UNIFORM_BUFFER),
+            vk::DescriptorType::STORAGE_BUFFER => Some(vk::BufferUsageFlags::STORAGE_BUFFER),
+            vk::DescriptorType::ACCELERATION_STRUCTURE_KHR => {
+                Some(vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR)
+            },
+            _ => None,
         }
     }
 }
@@ -304,6 +387,7 @@ pub enum IR {
         set: u32,
         binding: u32,
         descriptor: Descriptor,
+        descriptor_type: Option<vk::DescriptorType>,
         access: ValueId,
     },
     Draw {
@@ -703,7 +787,9 @@ impl IR {
                 ..
             } => {
                 visit(*pass);
-                visit(descriptor.image());
+                if let Some(resource) = descriptor.resource() {
+                    visit(resource);
+                }
                 visit(*access);
             },
 
@@ -810,10 +896,14 @@ impl IR {
                 }
             },
 
-            IR::WriteDescriptor { descriptor, access, .. } => visit(ResourceSideEffect {
-                resource: descriptor.image(),
-                access: SideEffectAccess::Operand(*access),
-            }),
+            IR::WriteDescriptor { descriptor, access, .. } => {
+                if let Some(resource) = descriptor.resource() {
+                    visit(ResourceSideEffect {
+                        resource,
+                        access: SideEffectAccess::Operand(*access),
+                    });
+                }
+            },
             IR::BindVertexBuffers { buffers, .. } => fixed(*buffers, Access::AttributeRead),
             IR::BindIndexBuffer { buffer, .. } => fixed(*buffer, Access::IndexRead),
             IR::Dispatch {
@@ -1414,15 +1504,34 @@ impl IR {
                 set,
                 binding,
                 descriptor,
+                descriptor_type,
                 access,
                 ..
             } => {
                 write!(f, "write_descriptor set={set} binding={binding} ")?;
                 match descriptor {
-                    Descriptor::SampledImage { image } => write!(f, "sampled_image {}", p.operand(*image))?,
+                    Descriptor::Sampler { sampler } => write!(f, "sampler {sampler:?}")?,
+                    Descriptor::Image { image } => write!(f, "image {}", p.operand(*image))?,
                     Descriptor::CombinedImageSampler { image, sampler } => {
                         write!(f, "combined_image_sampler {} sampler={sampler:?}", p.operand(*image))?
                     },
+                    Descriptor::TexelBuffer { buffer, view } => {
+                        write!(f, "texel_buffer {} view={view:?}", p.operand(*buffer))?
+                    },
+                    Descriptor::Buffer { buffer, offset, range } => {
+                        write!(f, "buffer {} offset={offset} range={range}", p.operand(*buffer))?
+                    },
+                    Descriptor::AccelerationStructure {
+                        backing_buffer,
+                        acceleration_structure,
+                    } => write!(
+                        f,
+                        "acceleration_structure {acceleration_structure:?} backing={}",
+                        p.operand(*backing_buffer)
+                    )?,
+                }
+                if let Some(descriptor_type) = descriptor_type {
+                    write!(f, " type={descriptor_type:?}")?;
                 }
                 write!(f, " access={}", p.operand(*access))
             },
@@ -1633,6 +1742,8 @@ impl fmt::Display for IR {
 
 #[cfg(test)]
 mod tests {
+    use ash::vk::Handle;
+
     use super::*;
 
     fn value(id: u32) -> ValueId { ValueId(id) }
@@ -1646,6 +1757,98 @@ mod tests {
             14 => Access::ColorRW,
             15 => Access::DepthStencilRW,
             _ => panic!("{id} does not name a test access"),
+        }
+    }
+
+    #[test]
+    fn descriptor_payloads_report_compatible_vulkan_types_and_backing_resources() {
+        let image = value(1);
+        let buffer = value(2);
+        let sampler = vk::Sampler::from_raw(3);
+        let view = vk::BufferView::from_raw(4);
+        let acceleration_structure = vk::AccelerationStructureKHR::from_raw(5);
+        type DescriptorCase = (
+            Descriptor,
+            &'static [vk::DescriptorType],
+            Option<ValueId>,
+            Option<ValueId>,
+        );
+        let descriptors: [DescriptorCase; 6] = [
+            (
+                Descriptor::Sampler { sampler },
+                &[vk::DescriptorType::SAMPLER],
+                None,
+                None,
+            ),
+            (
+                Descriptor::Image { image },
+                &[
+                    vk::DescriptorType::SAMPLED_IMAGE,
+                    vk::DescriptorType::STORAGE_IMAGE,
+                    vk::DescriptorType::INPUT_ATTACHMENT,
+                ],
+                Some(image),
+                None,
+            ),
+            (
+                Descriptor::CombinedImageSampler { image, sampler },
+                &[vk::DescriptorType::COMBINED_IMAGE_SAMPLER],
+                Some(image),
+                None,
+            ),
+            (
+                Descriptor::TexelBuffer { buffer, view },
+                &[
+                    vk::DescriptorType::UNIFORM_TEXEL_BUFFER,
+                    vk::DescriptorType::STORAGE_TEXEL_BUFFER,
+                ],
+                None,
+                Some(buffer),
+            ),
+            (
+                Descriptor::Buffer {
+                    buffer,
+                    offset: 0,
+                    range: vk::WHOLE_SIZE,
+                },
+                &[vk::DescriptorType::UNIFORM_BUFFER, vk::DescriptorType::STORAGE_BUFFER],
+                None,
+                Some(buffer),
+            ),
+            (
+                Descriptor::AccelerationStructure {
+                    backing_buffer: buffer,
+                    acceleration_structure,
+                },
+                &[vk::DescriptorType::ACCELERATION_STRUCTURE_KHR],
+                None,
+                Some(buffer),
+            ),
+        ];
+        let reflected_types = [
+            vk::DescriptorType::SAMPLER,
+            vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            vk::DescriptorType::SAMPLED_IMAGE,
+            vk::DescriptorType::STORAGE_IMAGE,
+            vk::DescriptorType::UNIFORM_TEXEL_BUFFER,
+            vk::DescriptorType::STORAGE_TEXEL_BUFFER,
+            vk::DescriptorType::UNIFORM_BUFFER,
+            vk::DescriptorType::STORAGE_BUFFER,
+            vk::DescriptorType::INPUT_ATTACHMENT,
+            vk::DescriptorType::ACCELERATION_STRUCTURE_KHR,
+        ];
+
+        for (descriptor, compatible_types, expected_image, expected_buffer) in descriptors {
+            for descriptor_type in reflected_types {
+                assert_eq!(
+                    descriptor.supports_type(descriptor_type),
+                    compatible_types.contains(&descriptor_type),
+                    "{descriptor:?} against {descriptor_type:?}"
+                );
+            }
+            assert_eq!(descriptor.image(), expected_image);
+            assert_eq!(descriptor.buffer(), expected_buffer);
+            assert_eq!(descriptor.resource(), expected_image.or(expected_buffer));
         }
     }
 
@@ -1687,7 +1890,8 @@ mod tests {
                 pass: value(0),
                 set: 0,
                 binding: 0,
-                descriptor: Descriptor::SampledImage { image: value(1) },
+                descriptor: Descriptor::Image { image: value(1) },
+                descriptor_type: Some(vk::DescriptorType::SAMPLED_IMAGE),
                 access: value(13),
             },
             IR::BindIndexBuffer {
@@ -1788,7 +1992,8 @@ mod tests {
                 pass: value(0),
                 set: 0,
                 binding: 0,
-                descriptor: Descriptor::SampledImage { image: value(1) },
+                descriptor: Descriptor::Image { image: value(1) },
+                descriptor_type: Some(vk::DescriptorType::SAMPLED_IMAGE),
                 access,
             },
         ];

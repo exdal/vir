@@ -25,7 +25,7 @@ which passes depend on which, and inserts the pipeline barriers and layout trans
   [`gpu-allocator`](https://github.com/Traverse-Research/gpu-allocator), with buffer device address
   enabled.
 
-## A pass, recorded
+## A recorded pass
 
 ```rust
 let target = frame.module.clear(frame.swapchain_image, BACKGROUND);
@@ -43,10 +43,12 @@ let target = frame
     .end_rendering();
 ```
 
-Scalar sampled images and combined image samplers are ordinary pass state. Their set layouts and
-statically reachable read/write accesses are reflected from the shaders, so the binding call infers
-the image transition from the operations that actually use its set and binding. A pipeline must
-therefore be bound before any descriptor write:
+Every scalar descriptor type reflected from SPIR-V is ordinary pass state: samplers, sampled and
+storage images, input attachments, uniform and storage buffers, texel buffers, and acceleration
+structures. Binding methods describe the payload, while the pipeline active at each consuming draw
+or dispatch supplies its exact Vulkan descriptor type and statically reachable access. For example,
+`bind_image` covers sampled images, storage images, and input attachments; `bind_buffer` covers both
+uniform and storage buffers:
 
 ```rust
 let target = frame
@@ -54,9 +56,21 @@ let target = frame
     .begin_rendering([(target, Access::ColorRW)])
     .bind_graphics_pipeline(pipeline)
     .bind_texture(0, 3, texture, sampler)
+    .bind_buffer(0, 4, material)
     .draw(3, 1)
     .end_rendering();
 ```
+
+`bind_buffer_range` binds an explicit byte range, and `bind_texel_buffer` similarly covers both
+uniform and storage texel buffers. Sampler-only, combined image/sampler, texel-buffer, and
+acceleration-structure bindings remain separate because their Vulkan payloads differ. A descriptor
+write may precede the pipeline bind, but a reflected pipeline must be active when a draw or dispatch
+consumes it. If the same standing write is consumed by multiple pipelines, they must agree on its
+descriptor type; rebind between pipelines when they do not.
+
+Texel-buffer views and acceleration structures remain caller-owned; their binding calls also take
+the backing buffer value so the graph can synchronize it. The caller must keep raw sampler,
+buffer-view, and acceleration-structure handles alive through execution.
 
 Bindless is opt-in per pipeline. Pass the caller-owned layout and set at the index it should
 occupy; `vir` splices that layout into the reflected pipeline layout and binds the set without
@@ -98,18 +112,6 @@ frame
     .end_compute();
 ```
 
-## Layout
-
-```
-vir/               the library
-  src/
-    graph/         module, IR, render graph, passes, attachments
-    resource/      buffers, images, pipelines, shaders, descriptors, swapchain
-    context/       device context, command queues and buffers, access
-    allocator/     frame and persistent allocators
-vir-examples/      runnable examples and their Slang shaders
-```
-
 ## Examples
 
 The examples live in `vir-examples`. Their shaders are written in [Slang](https://shader-slang.org)
@@ -119,6 +121,7 @@ and compiled to SPIR-V at build time by `vir-examples/build.rs`.
 cargo run -p vir-examples --example triangle
 cargo run -p vir-examples --example vertex_buffer
 cargo run -p vir-examples --example texture
+cargo run -p vir-examples --example descriptors
 cargo run -p vir-examples --example compute
 cargo run -p vir-examples --example offscreen
 cargo run -p vir-examples --example deferred

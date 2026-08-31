@@ -185,7 +185,16 @@ pub(crate) fn validate_descriptor_bindings(
 
             let supported_type = matches!(
                 binding.descriptor_type,
-                vk::DescriptorType::SAMPLED_IMAGE | vk::DescriptorType::COMBINED_IMAGE_SAMPLER
+                vk::DescriptorType::SAMPLER
+                    | vk::DescriptorType::COMBINED_IMAGE_SAMPLER
+                    | vk::DescriptorType::SAMPLED_IMAGE
+                    | vk::DescriptorType::STORAGE_IMAGE
+                    | vk::DescriptorType::UNIFORM_TEXEL_BUFFER
+                    | vk::DescriptorType::STORAGE_TEXEL_BUFFER
+                    | vk::DescriptorType::UNIFORM_BUFFER
+                    | vk::DescriptorType::STORAGE_BUFFER
+                    | vk::DescriptorType::INPUT_ATTACHMENT
+                    | vk::DescriptorType::ACCELERATION_STRUCTURE_KHR
             );
             if !supported_type || binding.count != 1 || binding.variable_count {
                 tracing::error!(
@@ -194,7 +203,7 @@ pub(crate) fn validate_descriptor_bindings(
                     descriptor_type = ?binding.descriptor_type,
                     count = binding.count,
                     variable_count = binding.variable_count,
-                    "ordinary descriptors only support scalar sampled images and combined image samplers"
+                    "ordinary descriptors only support reflected scalar descriptor types"
                 );
                 return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
             }
@@ -805,18 +814,34 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_descriptors_accept_scalar_sampled_images() {
+    fn ordinary_descriptors_accept_every_reflected_scalar_type() {
+        let descriptor_types = [
+            vk::DescriptorType::SAMPLER,
+            vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            vk::DescriptorType::SAMPLED_IMAGE,
+            vk::DescriptorType::STORAGE_IMAGE,
+            vk::DescriptorType::UNIFORM_TEXEL_BUFFER,
+            vk::DescriptorType::STORAGE_TEXEL_BUFFER,
+            vk::DescriptorType::UNIFORM_BUFFER,
+            vk::DescriptorType::STORAGE_BUFFER,
+            vk::DescriptorType::INPUT_ATTACHMENT,
+            vk::DescriptorType::ACCELERATION_STRUCTURE_KHR,
+        ];
         let reflection = with_bindings(
             vk::ShaderStageFlags::FRAGMENT,
-            vec![DescriptorBinding {
-                set: 1,
-                binding: 3,
-                descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                count: 1,
-                variable_count: false,
-                stages: vk::ShaderStageFlags::FRAGMENT,
-                access: Access::FragmentSampled,
-            }],
+            descriptor_types
+                .into_iter()
+                .enumerate()
+                .map(|(binding, descriptor_type)| DescriptorBinding {
+                    set: 1,
+                    binding: binding as u32,
+                    descriptor_type,
+                    count: 1,
+                    variable_count: false,
+                    stages: vk::ShaderStageFlags::FRAGMENT,
+                    access: Access::None,
+                })
+                .collect(),
         );
         assert!(validate_descriptor_bindings(&[reflection], None).is_ok());
     }

@@ -14,7 +14,7 @@ use crate::{
 /// Where the analyzer reads what a program's pipelines declare, as their shaders were reflected.
 ///
 /// `None` from [`Self::bindings`] means this source knows nothing about that pipeline. Descriptor-free
-/// modules may still compile, but descriptor writes need reflected bindings to infer their access.
+/// modules may still compile, but descriptor writes need reflected bindings to infer their type and access.
 pub trait PipelineBindings {
     fn bindings(&self, pipeline: PipelineId) -> Option<&[DescriptorBinding]>;
 
@@ -84,7 +84,7 @@ impl PipelineBindings for Declared {
 #[derive(Default)]
 struct Table {
     open: bool,
-    written: BTreeMap<(u32, u32), (ValueId, Descriptor)>,
+    written: BTreeMap<(u32, u32), (ValueId, Descriptor, Option<vk::DescriptorType>)>,
 }
 
 impl Table {
@@ -112,10 +112,13 @@ pub(crate) fn analyze_descriptors(program: &Program, pipelines: &impl PipelineBi
                 set,
                 binding,
                 descriptor,
+                descriptor_type,
                 ..
             } => {
                 failed |= !write_is_sound(program, value_id, &table, *set, *binding, descriptor);
-                table.written.insert((*set, *binding), (*value_id, *descriptor));
+                table
+                    .written
+                    .insert((*set, *binding), (*value_id, *descriptor, *descriptor_type));
             },
 
             // a callback binds whatever it draws with itself, so there is nothing here to check
@@ -144,20 +147,49 @@ fn write_is_sound(
         return false;
     }
 
-    if !names_an_image(program.instructions(), descriptor.image()) {
+    if let Some(image) = descriptor.image()
+        && !names_an_image(program.instructions(), image)
+    {
+        tracing::error!(%value_id, set, binding, %image, "an image descriptor names a value that is not an image");
+        return false;
+    }
+
+    if let Some(buffer) = descriptor.buffer()
+        && !names_a_buffer(program.instructions(), buffer)
+    {
         tracing::error!(
             %value_id,
             set,
             binding,
-            image = %descriptor.image(),
-            "a descriptor is written from a value that is not an image"
+            %buffer,
+            "a buffer-backed descriptor names a value that is not a buffer"
         );
         return false;
     }
 
     if descriptor.sampler().is_some_and(|sampler| sampler.is_null()) {
-        tracing::error!(%value_id, set, binding, "a combined image sampler is written with a null sampler");
+        tracing::error!(%value_id, set, binding, "a sampler descriptor is written with a null sampler");
         return false;
+    }
+
+    match descriptor {
+        Descriptor::TexelBuffer { view, .. } if view.is_null() => {
+            tracing::error!(%value_id, set, binding, "a texel buffer descriptor is written with a null view");
+            return false;
+        },
+        Descriptor::Buffer { offset, range, .. }
+            if *range == 0 || (*range != vk::WHOLE_SIZE && offset.checked_add(*range).is_none()) =>
+        {
+            tracing::error!(%value_id, set, binding, offset, range, "a buffer descriptor has an invalid range");
+            return false;
+        },
+        Descriptor::AccelerationStructure {
+            acceleration_structure, ..
+        } if acceleration_structure.is_null() => {
+            tracing::error!(%value_id, set, binding, "an acceleration structure descriptor is written with a null handle");
+            return false;
+        },
+        _ => {},
     }
 
     true
@@ -183,7 +215,7 @@ fn descriptors_are_compatible_with_pipeline(
             continue;
         }
 
-        let Some((written_at, descriptor)) = table.written.get(&(binding.set, binding.binding)) else {
+        let Some((written_at, descriptor, resolved_type)) = table.written.get(&(binding.set, binding.binding)) else {
             tracing::error!(
                 %value_id,
                 %pipeline,
@@ -196,7 +228,7 @@ fn descriptors_are_compatible_with_pipeline(
             continue;
         };
 
-        if descriptor.descriptor_type() != binding.descriptor_type {
+        if !descriptor.supports_type(binding.descriptor_type) {
             tracing::error!(
                 %value_id,
                 %pipeline,
@@ -204,8 +236,20 @@ fn descriptors_are_compatible_with_pipeline(
                 set = binding.set,
                 binding = binding.binding,
                 declared = ?binding.descriptor_type,
-                written = ?descriptor.descriptor_type(),
-                "the descriptor written here is not the type the pipeline declares"
+                payload = ?descriptor,
+                "the descriptor payload written here is incompatible with the type the pipeline declares"
+            );
+            sound = false;
+        } else if *resolved_type != Some(binding.descriptor_type) {
+            tracing::error!(
+                %value_id,
+                %pipeline,
+                written_at = %written_at,
+                set = binding.set,
+                binding = binding.binding,
+                declared = ?binding.descriptor_type,
+                resolved = ?resolved_type,
+                "the descriptor write was not resolved to the type this pipeline declares"
             );
             sound = false;
         }
@@ -230,6 +274,16 @@ fn descriptors_are_compatible_with_pipeline(
 }
 
 fn names_an_image(instructions: &[Instr], id: ValueId) -> bool {
+    names_a_resource(instructions, id, |ir| {
+        matches!(ir, IR::ConstructImage { .. } | IR::SwapchainImage { .. })
+    })
+}
+
+fn names_a_buffer(instructions: &[Instr], id: ValueId) -> bool {
+    names_a_resource(instructions, id, |ir| matches!(ir, IR::ConstructBuffer { .. }))
+}
+
+fn names_a_resource(instructions: &[Instr], id: ValueId, is_base: fn(&IR) -> bool) -> bool {
     let mut id = id;
 
     for _ in 0..MAX_RESOLVE_DEPTH {
@@ -238,7 +292,7 @@ fn names_an_image(instructions: &[Instr], id: ValueId) -> bool {
         };
 
         id = match underlying_object(ir) {
-            UnderlyingObject::Base => return matches!(ir, IR::ConstructImage { .. } | IR::SwapchainImage { .. }),
+            UnderlyingObject::Base => return is_base(ir),
             UnderlyingObject::Forwards(next) | UnderlyingObject::Element(next) => next,
             UnderlyingObject::None => return false,
         };
@@ -254,7 +308,7 @@ mod tests {
     use ash::vk::Handle;
 
     use super::*;
-    use crate::{Access, ImageInfo, Module, ValueId};
+    use crate::{Access, BufferInfo, ImageInfo, MemoryLocation, Module, ValueId};
 
     const FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 
@@ -273,17 +327,29 @@ mod tests {
     }
 
     impl PerPipeline {
-        fn with_binding(mut self, pipeline: PipelineId, stages: vk::ShaderStageFlags) -> Self {
+        fn with_binding(self, pipeline: PipelineId, stages: vk::ShaderStageFlags) -> Self {
+            self.with_typed_binding(
+                pipeline,
+                vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                stages,
+                Access::sampled_by(stages),
+            )
+        }
+
+        fn with_typed_binding(
+            mut self, pipeline: PipelineId, descriptor_type: vk::DescriptorType, stages: vk::ShaderStageFlags,
+            access: Access,
+        ) -> Self {
             self.bindings.insert(
                 pipeline,
                 vec![DescriptorBinding {
                     set: 0,
                     binding: 0,
-                    descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                    descriptor_type,
                     count: 1,
                     variable_count: false,
                     stages,
-                    access: Access::sampled_by(stages),
+                    access,
                 }],
             );
             self
@@ -321,6 +387,131 @@ mod tests {
         });
 
         assert!(module.compile(&combined, end).is_ok());
+    }
+
+    #[test]
+    fn every_reflected_scalar_descriptor_type_can_be_written() {
+        fn compile(
+            descriptor_type: vk::DescriptorType, access: Access, bind: impl FnOnce(&mut Module, ValueId, ValueId),
+        ) {
+            let mut module = Module::default();
+            let attachment = target(&mut module);
+            let image = target(&mut module);
+            let buffer = module.transient_buffer(&BufferInfo::new(
+                256,
+                vk::BufferUsageFlags::empty(),
+                MemoryLocation::GpuOnly,
+            ));
+            module
+                .begin_rendering([(attachment, Access::ColorRW)])
+                .bind_graphics_pipeline(PipelineId(0));
+            bind(&mut module, image, buffer);
+            let end = module.draw(3, 1).end_rendering();
+            let declared = Declared::with_access(&[(0, 0, descriptor_type)], vk::ShaderStageFlags::FRAGMENT, access);
+            assert!(module.compile(&declared, end).is_ok(), "{descriptor_type:?}");
+        }
+
+        compile(vk::DescriptorType::SAMPLER, Access::None, |module, _, _| {
+            module.bind_sampler(0, 0, a_sampler());
+        });
+        compile(
+            vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            Access::FragmentSampled,
+            |module, image, _| {
+                module.bind_texture(0, 0, image, a_sampler());
+            },
+        );
+        compile(
+            vk::DescriptorType::SAMPLED_IMAGE,
+            Access::FragmentSampled,
+            |module, image, _| {
+                module.bind_image(0, 0, image);
+            },
+        );
+        compile(
+            vk::DescriptorType::STORAGE_IMAGE,
+            Access::FragmentRead,
+            |module, image, _| {
+                module.bind_image(0, 0, image);
+            },
+        );
+        compile(
+            vk::DescriptorType::UNIFORM_TEXEL_BUFFER,
+            Access::FragmentSampled,
+            |module, _, buffer| {
+                module.bind_texel_buffer(0, 0, buffer, vk::BufferView::from_raw(2));
+            },
+        );
+        compile(
+            vk::DescriptorType::STORAGE_TEXEL_BUFFER,
+            Access::FragmentRead,
+            |module, _, buffer| {
+                module.bind_texel_buffer(0, 0, buffer, vk::BufferView::from_raw(2));
+            },
+        );
+        compile(
+            vk::DescriptorType::UNIFORM_BUFFER,
+            Access::FragmentUniformRead,
+            |module, _, buffer| {
+                module.bind_buffer(0, 0, buffer);
+            },
+        );
+        compile(
+            vk::DescriptorType::STORAGE_BUFFER,
+            Access::FragmentRead,
+            |module, _, buffer| {
+                module.bind_buffer_range(0, 0, buffer, 16, 64);
+            },
+        );
+        compile(
+            vk::DescriptorType::INPUT_ATTACHMENT,
+            Access::InputAttachmentRead,
+            |module, image, _| {
+                module.bind_image(0, 0, image);
+            },
+        );
+        compile(
+            vk::DescriptorType::ACCELERATION_STRUCTURE_KHR,
+            Access::FragmentAccelerationStructureRead,
+            |module, _, buffer| {
+                module.bind_acceleration_structure(0, 0, buffer, vk::AccelerationStructureKHR::from_raw(3));
+            },
+        );
+    }
+
+    #[test]
+    fn descriptor_writes_reject_null_handles_and_empty_buffer_ranges() {
+        fn rejects(descriptor_type: vk::DescriptorType, bind: impl FnOnce(&mut Module, ValueId, ValueId)) {
+            let mut module = Module::default();
+            let attachment = target(&mut module);
+            let image = target(&mut module);
+            let buffer = module.transient_buffer(&BufferInfo::new(
+                256,
+                vk::BufferUsageFlags::empty(),
+                MemoryLocation::GpuOnly,
+            ));
+            module
+                .begin_rendering([(attachment, Access::ColorRW)])
+                .bind_graphics_pipeline(PipelineId(0));
+            bind(&mut module, image, buffer);
+            let end = module.draw(3, 1).end_rendering();
+            let declared =
+                Declared::with_access(&[(0, 0, descriptor_type)], vk::ShaderStageFlags::FRAGMENT, Access::None);
+            assert!(module.compile(&declared, end).is_err(), "{descriptor_type:?}");
+        }
+
+        rejects(vk::DescriptorType::SAMPLER, |module, _, _| {
+            module.bind_sampler(0, 0, vk::Sampler::null());
+        });
+        rejects(vk::DescriptorType::UNIFORM_TEXEL_BUFFER, |module, _, buffer| {
+            module.bind_texel_buffer(0, 0, buffer, vk::BufferView::null());
+        });
+        rejects(vk::DescriptorType::STORAGE_BUFFER, |module, _, buffer| {
+            module.bind_buffer_range(0, 0, buffer, 0, 0);
+        });
+        rejects(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR, |module, _, buffer| {
+            module.bind_acceleration_structure(0, 0, buffer, vk::AccelerationStructureKHR::null());
+        });
     }
 
     #[test]
@@ -366,7 +557,12 @@ mod tests {
             m.bind_texture(3, 1, texture, a_sampler());
         });
 
-        assert!(module.compile(&none, end).is_ok());
+        let compiled = module.compile(&none, end).unwrap();
+        let descriptor_type = compiled.instructions().iter().find_map(|(_, ir)| match ir {
+            IR::WriteDescriptor { descriptor_type, .. } => Some(*descriptor_type),
+            _ => None,
+        });
+        assert_eq!(descriptor_type, Some(None));
     }
 
     #[test]
@@ -492,7 +688,7 @@ mod tests {
             .instructions()
             .iter()
             .find_map(|(_, ir)| match ir {
-                IR::WriteDescriptor { descriptor, .. } => Some(descriptor.image()),
+                IR::WriteDescriptor { descriptor, .. } => descriptor.image(),
                 _ => None,
             })
             .expect("the write should survive");
@@ -596,5 +792,85 @@ mod tests {
         let compiled = module.compile(&pipelines, end).unwrap();
         assert_eq!(sampled_barrier_for(&compiled, first), Access::FragmentSampled);
         assert_eq!(sampled_barrier_for(&compiled, second), Access::VertexSampled);
+    }
+
+    #[test]
+    fn one_standing_write_cannot_be_inferred_as_two_descriptor_types() {
+        let sampled = PipelineId(0);
+        let storage = PipelineId(1);
+        let pipelines = PerPipeline::default()
+            .with_typed_binding(
+                sampled,
+                vk::DescriptorType::SAMPLED_IMAGE,
+                vk::ShaderStageFlags::FRAGMENT,
+                Access::FragmentSampled,
+            )
+            .with_typed_binding(
+                storage,
+                vk::DescriptorType::STORAGE_IMAGE,
+                vk::ShaderStageFlags::FRAGMENT,
+                Access::FragmentRead,
+            );
+
+        let mut module = Module::default();
+        let attachment = target(&mut module);
+        let image = target(&mut module);
+        let end = module
+            .begin_rendering([(attachment, Access::ColorRW)])
+            .bind_graphics_pipeline(sampled)
+            .bind_image(0, 0, image)
+            .draw(3, 1)
+            .bind_graphics_pipeline(storage)
+            .draw(3, 1)
+            .end_rendering();
+
+        assert!(module.compile(&pipelines, end).is_err());
+    }
+
+    #[test]
+    fn rebinding_allows_reflection_to_infer_a_new_descriptor_type() {
+        let sampled = PipelineId(0);
+        let storage = PipelineId(1);
+        let pipelines = PerPipeline::default()
+            .with_typed_binding(
+                sampled,
+                vk::DescriptorType::SAMPLED_IMAGE,
+                vk::ShaderStageFlags::FRAGMENT,
+                Access::FragmentSampled,
+            )
+            .with_typed_binding(
+                storage,
+                vk::DescriptorType::STORAGE_IMAGE,
+                vk::ShaderStageFlags::FRAGMENT,
+                Access::FragmentRead,
+            );
+
+        let mut module = Module::default();
+        let attachment = target(&mut module);
+        let sampled_image = target(&mut module);
+        let storage_image = target(&mut module);
+        let end = module
+            .begin_rendering([(attachment, Access::ColorRW)])
+            .bind_graphics_pipeline(sampled)
+            .bind_image(0, 0, sampled_image)
+            .draw(3, 1)
+            .bind_graphics_pipeline(storage)
+            .bind_image(0, 0, storage_image)
+            .draw(3, 1)
+            .end_rendering();
+
+        let compiled = module.compile(&pipelines, end).unwrap();
+        let resolved = compiled
+            .instructions()
+            .iter()
+            .filter_map(|(_, ir)| match ir {
+                IR::WriteDescriptor { descriptor_type, .. } => *descriptor_type,
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            resolved,
+            [vk::DescriptorType::SAMPLED_IMAGE, vk::DescriptorType::STORAGE_IMAGE]
+        );
     }
 }

@@ -6,7 +6,14 @@ use slang::Downcast;
 /// Every Slang module, with the entry points to pull out of it and the file each one is
 /// written to. A module is linked on its own, so entry point names only have to be unique
 /// within their module.
-const MODULES: [(&str, &[(&str, &str)]); 7] = [
+const MODULES: [(&str, &[(&str, &str)]); 8] = [
+    (
+        "descriptors.slang",
+        &[
+            ("cs_main", "descriptors.comp.spv"),
+            ("fs_input", "descriptors.input.frag.spv"),
+        ],
+    ),
     (
         "deferred_geometry.slang",
         &[

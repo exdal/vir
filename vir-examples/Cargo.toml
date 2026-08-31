@@ -53,3 +53,6 @@ test = true
 name = "deferred"
 test = true
 
+[[example]]
+name = "descriptors"
+test = true
