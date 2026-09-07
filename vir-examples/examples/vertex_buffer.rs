@@ -173,7 +173,7 @@ impl Example for VertexBuffer {
         module.set_name(quad_indices, "quad indices");
 
         // one pass, two draws: only the bound buffer and the tail of the block change
-        let drawn = module
+        let [drawn] = module
             .begin_rendering([(target, Access::ColorRW)])
             .with_name("buffer geometry")
             .bind_graphics_pipeline(self.pipeline)

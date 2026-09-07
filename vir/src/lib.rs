@@ -14,6 +14,7 @@ pub use allocator::{AllocatorKind, FrameAllocator, PersistentAllocator, SuperFra
 use ash::vk;
 pub use context::{Access, CommandBuffer, Context, DomainFlag};
 pub use graph::{
+    ConditionResult,
     Count,
     Descriptor,
     DispatchSize,

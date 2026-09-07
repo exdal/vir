@@ -30,7 +30,7 @@ which passes depend on which, and inserts the pipeline barriers and layout trans
 ```rust
 let target = frame.module.clear(frame.swapchain_image, BACKGROUND);
 
-let target = frame
+let [target] = frame
     .module
     .begin_rendering([(target, Access::ColorRW)])
     .with_name("triangle")
@@ -51,7 +51,7 @@ or dispatch supplies its exact Vulkan descriptor type and statically reachable a
 uniform and storage buffers:
 
 ```rust
-let target = frame
+let [target] = frame
     .module
     .begin_rendering([(target, Access::ColorRW)])
     .bind_graphics_pipeline(pipeline)
@@ -60,6 +60,11 @@ let target = frame
     .draw(3, 1)
     .end_rendering();
 ```
+
+Closing a rendering or compute pass returns one fresh `ValueId` for every resource declared at the
+beginning of the pass, in the same order. Array destructuring supplies the expected result count.
+Read-only resources also receive an after-pass value, so using that value explicitly orders later
+work after the pass. Passes must declare at least one resource.
 
 `bind_buffer_range` binds an explicit byte range, and `bind_texel_buffer` similarly covers both
 uniform and storage texel buffers. Sampler-only, combined image/sampler, texel-buffer, and
@@ -90,7 +95,7 @@ intentionally opaque to the IR. One resource-array value can stand for the whole
 is applied to every element while the array remains a single attachment entry:
 
 ```rust
-module
+let [target, bindless_images] = module
     .begin_rendering([
         (target, Access::ColorRW),
         (bindless_images, Access::FragmentRead),
@@ -103,7 +108,7 @@ A compute pass declares its accesses, and the graph barriers the dispatches agai
 against any draw that later reads what they wrote:
 
 ```rust
-frame
+let [instances] = frame
     .module
     .begin_compute([(instances, Access::ComputeWrite)])
     .bind_compute_pipeline(place)

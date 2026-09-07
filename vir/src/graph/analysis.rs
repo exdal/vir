@@ -374,7 +374,7 @@ mod tests {
             .begin_rendering([(attachment, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(0));
         writes(&mut module, texture);
-        let end = module.draw(3, 1).end_rendering();
+        let end = module.draw(3, 1).end_rendering::<1>()[0];
 
         (module, end)
     }
@@ -406,7 +406,7 @@ mod tests {
                 .begin_rendering([(attachment, Access::ColorRW)])
                 .bind_graphics_pipeline(PipelineId(0));
             bind(&mut module, image, buffer);
-            let end = module.draw(3, 1).end_rendering();
+            let end = module.draw(3, 1).end_rendering::<1>()[0];
             let declared = Declared::with_access(&[(0, 0, descriptor_type)], vk::ShaderStageFlags::FRAGMENT, access);
             assert!(module.compile(&declared, end).is_ok(), "{descriptor_type:?}");
         }
@@ -494,7 +494,7 @@ mod tests {
                 .begin_rendering([(attachment, Access::ColorRW)])
                 .bind_graphics_pipeline(PipelineId(0));
             bind(&mut module, image, buffer);
-            let end = module.draw(3, 1).end_rendering();
+            let end = module.draw(3, 1).end_rendering::<1>()[0];
             let declared =
                 Declared::with_access(&[(0, 0, descriptor_type)], vk::ShaderStageFlags::FRAGMENT, Access::None);
             assert!(module.compile(&declared, end).is_err(), "{descriptor_type:?}");
@@ -545,7 +545,7 @@ mod tests {
             .bind_graphics_pipeline(PipelineId(0))
             .draw(3, 1)
             .bind_texture(0, 0, texture, a_sampler())
-            .end_rendering();
+            .end_rendering::<1>()[0];
 
         assert!(module.compile(&combined, end).is_err());
     }
@@ -576,7 +576,7 @@ mod tests {
             .bind_texture(0, 0, texture, a_sampler())
             .bind_graphics_pipeline(PipelineId(0))
             .draw(3, 1)
-            .end_rendering();
+            .end_rendering::<1>()[0];
 
         let compiled = module.compile(&combined, end).unwrap();
         assert_eq!(sampled_barrier(&compiled), Access::FragmentSampled);
@@ -603,7 +603,7 @@ mod tests {
             .bind_graphics_pipeline(PipelineId::INVALID)
             .bind_texture(0, 0, texture, a_sampler())
             .draw(3, 1)
-            .end_rendering();
+            .end_rendering::<1>()[0];
 
         assert!(matches!(
             module.compile(&Unchecked, end),
@@ -654,12 +654,12 @@ mod tests {
             .bind_graphics_pipeline(PipelineId(0))
             .bind_texture(0, 0, texture, a_sampler())
             .draw(3, 1)
-            .end_rendering();
+            .end_rendering::<1>()[0];
         let end = module
             .begin_rendering([(first, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .draw(3, 1)
-            .end_rendering();
+            .end_rendering::<1>()[0];
 
         assert!(module.compile(&combined, end).is_err());
     }
@@ -758,7 +758,7 @@ mod tests {
             .draw(3, 1)
             .bind_graphics_pipeline(vertex)
             .draw(3, 1)
-            .end_rendering();
+            .end_rendering::<1>()[0];
 
         let compiled = module.compile(&pipelines, end).unwrap();
         assert_eq!(
@@ -787,7 +787,7 @@ mod tests {
             .bind_graphics_pipeline(vertex)
             .bind_texture(0, 0, second, a_sampler())
             .draw(3, 1)
-            .end_rendering();
+            .end_rendering::<1>()[0];
 
         let compiled = module.compile(&pipelines, end).unwrap();
         assert_eq!(sampled_barrier_for(&compiled, first), Access::FragmentSampled);
@@ -822,7 +822,7 @@ mod tests {
             .draw(3, 1)
             .bind_graphics_pipeline(storage)
             .draw(3, 1)
-            .end_rendering();
+            .end_rendering::<1>()[0];
 
         assert!(module.compile(&pipelines, end).is_err());
     }
@@ -857,7 +857,7 @@ mod tests {
             .bind_graphics_pipeline(storage)
             .bind_image(0, 0, storage_image)
             .draw(3, 1)
-            .end_rendering();
+            .end_rendering::<1>()[0];
 
         let compiled = module.compile(&pipelines, end).unwrap();
         let resolved = compiled

@@ -124,7 +124,7 @@ impl Example for Offscreen {
             |m| m.clear(attachment, clear::f32::BLACK),
         );
 
-        let attachment = module
+        let [attachment] = module
             .begin_rendering([(attachment, Access::ColorRW)])
             .with_name("offscreen triangle")
             .bind_graphics_pipeline(self.pipeline)

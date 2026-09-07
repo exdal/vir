@@ -82,7 +82,7 @@ impl Example for Triangle {
         let attachment = module.clear(recording.swapchain_image, BACKGROUND);
         let pipeline = self.pipeline;
 
-        let sliding_tri = module
+        let [sliding_tri] = module
             .begin_rendering([(attachment, Access::ColorRW)])
             .with_name("sliding triangle")
             .bind_graphics_pipeline(pipeline)
@@ -102,7 +102,8 @@ impl Example for Triangle {
         let drawn = module.set_condition(
             has_corner_triangle,
             |m| {
-                m.begin_rendering([(sliding_tri, Access::ColorRW)])
+                let [drawn] = m
+                    .begin_rendering([(sliding_tri, Access::ColorRW)])
                     .with_name("corner triangle")
                     .bind_graphics_pipeline(pipeline)
                     .set_dynamic_state(DynamicStateFlags::Viewport | DynamicStateFlags::Scissor)
@@ -116,7 +117,8 @@ impl Example for Triangle {
                     .push_constants_from(push)
                     .push_constants_from_at(TINT_OFFSET, tint)
                     .draw(3, 1)
-                    .end_rendering()
+                    .end_rendering();
+                drawn
             },
             |_| sliding_tri,
         );

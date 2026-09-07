@@ -346,7 +346,7 @@ mod tests {
             .begin_rendering([(target, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .draw(3, 1)
-            .end_rendering()
+            .end_rendering::<1>()[0]
     }
 
     fn labels(program: &Program) -> Vec<LabelId> {
@@ -517,7 +517,7 @@ mod tests {
             .bind_vertex_buffer(0, vertices)
             .bind_index_buffer(indices, vk::IndexType::UINT32)
             .draw(3, 1)
-            .end_rendering();
+            .end_rendering::<1>()[0];
         let end = module.release(drawn, Access::BlitRead, DomainFlag::Graphics);
 
         let compiled = module.compile(&Unchecked, end).unwrap();
@@ -543,13 +543,13 @@ mod tests {
             .bind_graphics_pipeline(PipelineId(0))
             .bind_vertex_buffer(0, vertices)
             .draw(3, 1)
-            .end_rendering();
+            .end_rendering::<1>()[0];
         let second = module
             .begin_rendering([(first, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .bind_index_buffer(indices, vk::IndexType::UINT32)
             .draw(3, 1)
-            .end_rendering();
+            .end_rendering::<1>()[0];
         let end = module.release(second, Access::BlitRead, DomainFlag::Graphics);
 
         let compiled = module.compile(&Unchecked, end).unwrap();

@@ -290,7 +290,7 @@ mod tests {
         let target = module.import_attachment(&attachment);
         module.set_name(target, "target");
 
-        let rendered = module
+        let [rendered] = module
             .begin_rendering([(target, Access::ColorRW)])
             .with_name("triangle")
             .bind_graphics_pipeline(PipelineId(0))
@@ -328,6 +328,14 @@ mod tests {
     }
 
     #[test]
+    fn a_pass_result_prints_after_the_region_it_carries_out() {
+        let dump = dump_of_one_pass();
+        let end = dump.find("end_rendering").expect("the pass should close");
+        let result = dump.find("pass_result").expect("the pass should return its target");
+        assert!(end < result, "{dump}");
+    }
+
+    #[test]
     fn a_resource_operand_carries_the_name_it_was_given() {
         let dump = dump_of_one_pass();
         assert!(dump.contains("= const \"target\""), "{dump}");
@@ -353,7 +361,7 @@ mod tests {
             .bind_compute_pipeline(PipelineId(0))
             .push_constants(&1u32)
             .dispatch(8, 4, 1)
-            .end_compute();
+            .end_compute::<1>()[0];
 
         let dump = module.compile(&Unchecked, end).unwrap().dump();
         assert!(dump.contains("Pass \"blur\" -> \"storage\" 64x32"), "{dump}");
@@ -418,7 +426,7 @@ mod tests {
             .begin_rendering([(target, Access::ColorRW)])
             .bind_graphics_pipeline(PipelineId(0))
             .record_from(body)
-            .end_rendering();
+            .end_rendering::<1>()[0];
 
         let dump = module.compile(&Unchecked, end).unwrap().dump();
         let expected = match cfg!(debug_assertions) {
@@ -507,7 +515,7 @@ mod tests {
             .bind_graphics_pipeline(PipelineId(0))
             .bind_texture(1, 2, texture, vk::Sampler::from_raw(7))
             .draw(3, 1)
-            .end_rendering();
+            .end_rendering::<1>()[0];
 
         let bindings = Declared::new(&[(1, 2, vk::DescriptorType::COMBINED_IMAGE_SAMPLER)]);
         let dump = module.compile(&bindings, end).unwrap().dump();
@@ -550,7 +558,7 @@ mod tests {
             .bind_image(0, 8, image)
             .bind_acceleration_structure(0, 9, buffer, acceleration_structure)
             .draw(3, 1)
-            .end_rendering();
+            .end_rendering::<1>()[0];
         let descriptor_types = [
             vk::DescriptorType::SAMPLER,
             vk::DescriptorType::SAMPLED_IMAGE,

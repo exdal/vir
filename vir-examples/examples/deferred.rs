@@ -641,14 +641,14 @@ impl Example for Deferred {
         // which way the geometry pass culls is a branch, since a cull mode is baked into a
         // pipeline and both of them are worth having compiled
         let geometry = |m: &mut vir::Module, cull_mode| {
-            let mut filled = albedo;
+            let mut gbuffer = [albedo, normal, position, depth];
             for (vertices, indices, index_count, texture, push) in &meshes {
-                filled = m
+                gbuffer = m
                     .begin_rendering([
-                        (filled, Access::ColorRW),
-                        (normal, Access::ColorRW),
-                        (position, Access::ColorRW),
-                        (depth, Access::DepthStencilRW),
+                        (gbuffer[0], Access::ColorRW),
+                        (gbuffer[1], Access::ColorRW),
+                        (gbuffer[2], Access::ColorRW),
+                        (gbuffer[3], Access::DepthStencilRW),
                     ])
                     .with_name("g-buffer mesh")
                     .bind_graphics_pipeline(self.geometry_pipeline)
@@ -668,17 +668,15 @@ impl Example for Deferred {
                     .draw_indexed(*index_count, 1)
                     .end_rendering();
             }
-            filled
+            gbuffer
         };
-        let filled = module.set_condition(
+        let [filled, normal, position, _depth] = module.set_condition(
             cull_backfaces,
             |m| geometry(m, vk::CullModeFlags::BACK),
             |m| geometry(m, vk::CullModeFlags::NONE),
         );
 
-        // `filled` carries the albedo target out of the region; the other two are the same
-        // region's writes, so naming them by the value that went in is what orders the sample
-        let shaded = module
+        let [shaded] = module
             .begin_rendering([(recording.swapchain_image, Access::ColorRW)])
             .with_name("deferred lighting")
             .bind_graphics_pipeline(self.lighting_pipeline)

@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 
 use ash::vk::{self, Handle};
 use vir::{
+    Access,
     BufferInfo,
     Descriptor,
     DescriptorBinding,
@@ -73,8 +74,8 @@ fn descriptor_payload_program() -> Result<Program, vk::Result> {
     let storage_view = vk::BufferView::from_raw(3);
     let acceleration_structure = vk::AccelerationStructureKHR::from_raw(4);
 
-    let end = module
-        .begin_compute([])
+    let [end] = module
+        .begin_compute([(sampled_image, Access::None)])
         .with_name("descriptor payloads")
         // VK_DESCRIPTOR_TYPE_SAMPLER
         .bind_sampler(0, 0, sampler)

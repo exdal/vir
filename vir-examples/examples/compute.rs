@@ -153,7 +153,7 @@ impl Example for Compute {
         let instances = module.declare_buffer_var("instances", vir::Access::HostWrite);
         let vertices = module.declare_buffer_var("computed vertices", vir::Access::HostWrite);
 
-        let placed = module
+        let [placed] = module
             .begin_compute([(instances, Access::ComputeWrite)])
             .with_name("place")
             .bind_compute_pipeline(self.place)
@@ -165,7 +165,7 @@ impl Example for Compute {
 
         // write vertices first so `expanded` is what the draw binds; read `placed`, not
         // `instances`, to order this dispatch after the place
-        let expanded = module
+        let [expanded, _placed] = module
             .begin_compute([(vertices, Access::ComputeWrite), (placed, Access::ComputeRead)])
             .with_name("expand")
             .bind_compute_pipeline(self.expand)
@@ -177,7 +177,7 @@ impl Example for Compute {
 
         let attachment = module.clear(recording.swapchain_image, BACKGROUND);
 
-        let drawn = module
+        let [drawn] = module
             .begin_rendering([(attachment, Access::ColorRW)])
             .with_name("computed geometry")
             .bind_graphics_pipeline(self.draw)
@@ -288,13 +288,13 @@ mod tests {
         let instances = module.transient_buffer(&transient("instances").with_size(INSTANCE_SIZE));
         let vertices = module.transient_buffer(&transient("computed vertices").with_size(3 * VERTEX_SIZE));
 
-        let placed = module
+        let [placed] = module
             .begin_compute([(instances, Access::ComputeWrite)])
             .push_constant_address(INSTANCES_AT, instances)
             .push_constant_address(VERTICES_AT, vertices)
             .dispatch(1, 1, 1)
             .end_compute();
-        let expanded = module
+        let [expanded, _placed] = module
             .begin_compute([(vertices, Access::ComputeWrite), (placed, Access::ComputeRead)])
             .dispatch(1, 1, 1)
             .end_compute();
@@ -304,7 +304,7 @@ mod tests {
                 .with_usage(vk::ImageUsageFlags::TRANSFER_DST),
         );
         let target = module.clear(target, BACKGROUND);
-        let end = module
+        let [end] = module
             .begin_rendering([(target, Access::ColorRW)])
             .bind_vertex_buffer(0, expanded)
             .draw(3, 1)

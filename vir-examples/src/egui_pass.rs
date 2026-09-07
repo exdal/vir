@@ -346,7 +346,8 @@ impl EguiPass {
         let drawn = module.set_condition(
             slots.has_draws,
             |m| {
-                m.begin_rendering([(target, Access::ColorRW)])
+                let [drawn] = m
+                    .begin_rendering([(target, Access::ColorRW)])
                     .with_name("egui")
                     .bind_graphics_pipeline(pipeline)
                     .set_dynamic_state(DynamicStateFlags::Viewport | DynamicStateFlags::Scissor)
@@ -361,7 +362,8 @@ impl EguiPass {
                     .bind_vertex_buffer(0, slots.vertices)
                     .bind_index_buffer(slots.indices, vk::IndexType::UINT32)
                     .record_from(slots.body)
-                    .end_rendering()
+                    .end_rendering();
+                drawn
             },
             |_| target,
         );

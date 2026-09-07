@@ -2023,6 +2023,9 @@ impl RenderGraph {
                 self.set_value(value_id, Value::Reference(*pass));
                 self.open_descriptors();
             },
+            IR::PassResult { resource, .. } => {
+                self.set_value(value_id, Value::Reference(*resource));
+            },
             IR::Dispatch {
                 pass,
                 size,

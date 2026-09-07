@@ -434,6 +434,10 @@ pub enum IR {
     EndCompute {
         pass: ValueId,
     },
+    PassResult {
+        completion: ValueId,
+        resource: ValueId,
+    },
     Label {
         label: LabelId,
     },
@@ -489,22 +493,7 @@ pub fn underlying_object(ir: &IR) -> UnderlyingObject {
         IR::CopyBufferToImage { image, .. } => UnderlyingObject::Forwards(*image),
         IR::Acquire { resource, .. } | IR::Release { resource, .. } => UnderlyingObject::Forwards(*resource),
 
-        IR::BeginRendering { attachments, .. } | IR::BeginCompute { attachments, .. } => match attachments.first() {
-            Some((first, _)) => UnderlyingObject::Forwards(*first),
-            None => UnderlyingObject::None,
-        },
-
-        IR::BindPipeline { pass, .. }
-        | IR::SetState { pass, .. }
-        | IR::BindVertexBuffers { pass, .. }
-        | IR::BindIndexBuffer { pass, .. }
-        | IR::WriteDescriptor { pass, .. }
-        | IR::Draw { pass, .. }
-        | IR::DrawIndexed { pass, .. }
-        | IR::CallOpaque { pass, .. }
-        | IR::EndRendering { pass }
-        | IR::Dispatch { pass, .. }
-        | IR::EndCompute { pass } => UnderlyingObject::Forwards(*pass),
+        IR::PassResult { resource, .. } => UnderlyingObject::Forwards(*resource),
 
         IR::Phi { incoming, .. } => match incoming.first() {
             Some((first, _)) => UnderlyingObject::Forwards(*first),
@@ -515,6 +504,19 @@ pub fn underlying_object(ir: &IR) -> UnderlyingObject {
         | IR::Constant(_)
         | IR::Variable { .. }
         | IR::AcquireNextImage { .. }
+        | IR::BeginRendering { .. }
+        | IR::BindPipeline { .. }
+        | IR::SetState { .. }
+        | IR::BindVertexBuffers { .. }
+        | IR::BindIndexBuffer { .. }
+        | IR::WriteDescriptor { .. }
+        | IR::Draw { .. }
+        | IR::DrawIndexed { .. }
+        | IR::CallOpaque { .. }
+        | IR::EndRendering { .. }
+        | IR::BeginCompute { .. }
+        | IR::Dispatch { .. }
+        | IR::EndCompute { .. }
         | IR::Label { .. }
         | IR::SelectionMerge { .. }
         | IR::Branch { .. }
@@ -599,9 +601,12 @@ pub struct ResourceSideEffect {
 impl IR {
     pub fn side_effects(&self) -> SideEffect {
         match self {
-            IR::Type(_) | IR::Constant(_) | IR::Variable { .. } | IR::Array { .. } | IR::Index { .. } => {
-                SideEffect::empty()
-            },
+            IR::Type(_)
+            | IR::Constant(_)
+            | IR::Variable { .. }
+            | IR::Array { .. }
+            | IR::Index { .. }
+            | IR::PassResult { .. } => SideEffect::empty(),
 
             IR::ConstructBuffer { .. } | IR::ConstructImage { .. } | IR::SwapchainImage { .. } => SideEffect::Defines,
             IR::AcquireNextImage { .. } => SideEffect::Defines | SideEffect::External,
@@ -761,6 +766,10 @@ impl IR {
             },
 
             IR::BindPipeline { pass, .. } | IR::EndRendering { pass } | IR::EndCompute { pass } => visit(*pass),
+            IR::PassResult { completion, resource } => {
+                visit(*completion);
+                visit(*resource);
+            },
             IR::SetState { pass, change } => {
                 visit(*pass);
                 match change {
@@ -1685,6 +1694,12 @@ impl IR {
                 write!(f, " {}", fmt_pipeline(pipeline))
             },
             IR::EndCompute { .. } => write!(f, "end_compute"),
+            IR::PassResult { completion, resource } => write!(
+                f,
+                "pass_result {} after {}",
+                p.operand(*resource),
+                p.operand(*completion)
+            ),
             IR::Label { label, .. } => write!(f, "{label}:"),
             IR::SelectionMerge { merge, .. } => write!(f, "selection_merge {merge}"),
             IR::Branch { target, .. } => write!(f, "branch {target}"),
@@ -1954,6 +1969,26 @@ mod tests {
             }
             .is_pure()
         );
+
+        let result = IR::PassResult {
+            completion: value(1),
+            resource: value(2),
+        };
+        assert!(result.is_pure());
+        assert!(result.is_removable_when_unused());
+        assert!(matches!(
+            underlying_object(&result),
+            UnderlyingObject::Forwards(id) if id == value(2)
+        ));
+        let mut operands = Vec::new();
+        result.visit_operands(|id| operands.push(id));
+        assert_eq!(operands, [value(1), value(2)]);
+
+        let begin = IR::BeginCompute {
+            attachments: vec![(value(2), value(3))],
+            name: ValueId::INVALID,
+        };
+        assert!(matches!(underlying_object(&begin), UnderlyingObject::None));
 
         let buffer = IR::ConstructBuffer {
             buffer: Buffer::default(),

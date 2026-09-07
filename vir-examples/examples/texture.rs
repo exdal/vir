@@ -179,7 +179,7 @@ impl Example for Texture {
         let texture = module.import_attachment(&self.attachment());
         module.set_name(texture, "sample texture");
 
-        Ok(module
+        let [target] = module
             .begin_rendering([(target, Access::ColorRW)])
             .with_name("textured quad")
             .bind_graphics_pipeline(self.pipeline)
@@ -194,7 +194,8 @@ impl Example for Texture {
             .bind_texture(0, 0, texture, self.sampler)
             .push_constants_from(push)
             .draw(4, 1)
-            .end_rendering())
+            .end_rendering();
+        Ok(target)
     }
 
     fn update(&mut self, frame: &mut Frame) -> Result<(), vk::Result> {
