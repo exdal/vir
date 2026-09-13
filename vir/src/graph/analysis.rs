@@ -125,7 +125,10 @@ pub(crate) fn analyze_descriptors(program: &Program, pipelines: &impl PipelineBi
             // it against
             IR::CallOpaque { .. } => {},
 
-            IR::Draw { pipeline, .. } | IR::DrawIndexed { pipeline, .. } | IR::Dispatch { pipeline, .. } => {
+            IR::Draw { pipeline, .. }
+            | IR::DrawIndexed { pipeline, .. }
+            | IR::DrawIndirect { pipeline, .. }
+            | IR::Dispatch { pipeline, .. } => {
                 failed |= !descriptors_are_compatible_with_pipeline(value_id, &table, *pipeline, pipelines);
             },
 

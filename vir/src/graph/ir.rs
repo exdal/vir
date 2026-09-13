@@ -24,6 +24,7 @@ use crate::{
     RasterizationState,
     Rect2D,
     ResolvedViewport,
+    Specialization,
     StateChange,
     ValueId,
     Viewport,
@@ -279,6 +280,25 @@ impl DispatchSize {
     pub fn scale(scale: [u32; 3]) -> [f32; 3] { scale.map(f32::from_bits) }
 }
 
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+pub enum DrawCount {
+    Fixed(ValueId),
+    Indirect {
+        buffer: ValueId,
+        offset: u64,
+        max: ValueId,
+    },
+}
+
+impl DrawCount {
+    pub fn buffer(self) -> Option<ValueId> {
+        match self {
+            Self::Fixed(_) => None,
+            Self::Indirect { buffer, .. } => Some(buffer),
+        }
+    }
+}
+
 #[derive(Clone, Hash, PartialEq, Eq)]
 pub enum IR {
     Type(Type),
@@ -411,6 +431,17 @@ pub enum IR {
         state: PipelineState,
         dynamic: DynamicValues,
     },
+    DrawIndirect {
+        pass: ValueId,
+        indexed: bool,
+        buffer: ValueId,
+        offset: u64,
+        stride: u32,
+        count: DrawCount,
+        pipeline: PipelineId,
+        state: PipelineState,
+        dynamic: DynamicValues,
+    },
     CallOpaque {
         pass: ValueId,
         body: ValueId,
@@ -430,6 +461,7 @@ pub enum IR {
         size: DispatchSize,
         pipeline: PipelineId,
         push_constants: PushConstants,
+        specialization: Specialization,
     },
     EndCompute {
         pass: ValueId,
@@ -512,6 +544,7 @@ pub fn underlying_object(ir: &IR) -> UnderlyingObject {
         | IR::WriteDescriptor { .. }
         | IR::Draw { .. }
         | IR::DrawIndexed { .. }
+        | IR::DrawIndirect { .. }
         | IR::CallOpaque { .. }
         | IR::EndRendering { .. }
         | IR::BeginCompute { .. }
@@ -628,6 +661,9 @@ impl IR {
             IR::WriteDescriptor { .. } => SideEffect::Read | SideEffect::Sync | SideEffect::State,
 
             IR::Draw { .. } | IR::DrawIndexed { .. } => SideEffect::Command | SideEffect::ReadsState,
+            IR::DrawIndirect { .. } => {
+                SideEffect::Command | SideEffect::ReadsState | SideEffect::Read | SideEffect::Sync
+            },
             IR::CallOpaque { .. } => SideEffect::Command | SideEffect::ReadsState | SideEffect::Host,
             IR::Dispatch { size, .. } => {
                 let base = SideEffect::Command | SideEffect::ReadsState;
@@ -832,6 +868,19 @@ impl IR {
                 visit(*vertex_offset);
                 visit(*first_instance);
             },
+            IR::DrawIndirect {
+                pass, buffer, count, ..
+            } => {
+                visit(*pass);
+                visit(*buffer);
+                match count {
+                    DrawCount::Fixed(draw_count) => visit(*draw_count),
+                    DrawCount::Indirect { buffer, max, .. } => {
+                        visit(*buffer);
+                        visit(*max);
+                    },
+                }
+            },
             IR::CallOpaque { pass, body, .. } => {
                 visit(*pass);
                 visit(*body);
@@ -919,6 +968,12 @@ impl IR {
                 size: DispatchSize::Indirect { buffer, .. },
                 ..
             } => fixed(*buffer, Access::IndirectRead),
+            IR::DrawIndirect { buffer, count, .. } => {
+                fixed(*buffer, Access::IndirectRead);
+                if let Some(counts) = count.buffer() {
+                    fixed(counts, Access::IndirectRead);
+                }
+            },
 
             _ => {},
         }
@@ -1222,6 +1277,13 @@ fn fmt_list<T>(items: &[T], fmt: impl Fn(&T) -> String) -> String {
     items.iter().map(fmt).collect::<Vec<_>>().join(", ")
 }
 
+fn fmt_specialization(specialization: &Specialization) -> Option<String> {
+    (!specialization.is_empty()).then(|| {
+        let constants = specialization.iter().collect::<Vec<_>>();
+        format!("spec=[{}]", fmt_list(&constants, |(id, value)| format!("{id}={value}")))
+    })
+}
+
 impl fmt::Display for Constant {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1257,10 +1319,23 @@ impl IR {
         let (state, dynamic) = match self {
             IR::Draw { state, dynamic, .. }
             | IR::DrawIndexed { state, dynamic, .. }
+            | IR::DrawIndirect { state, dynamic, .. }
             | IR::CallOpaque { state, dynamic, .. } => (state, dynamic),
-            IR::Dispatch { push_constants, .. } => {
-                return (!push_constants.is_empty())
-                    .then(|| format!("push_constants=[{}..{}]", push_constants.offset, push_constants.end()));
+            IR::Dispatch {
+                push_constants,
+                specialization,
+                ..
+            } => {
+                let mut parts = Vec::new();
+                if !push_constants.is_empty() {
+                    parts.push(format!(
+                        "push_constants=[{}..{}]",
+                        push_constants.offset,
+                        push_constants.end()
+                    ));
+                }
+                parts.extend(fmt_specialization(specialization));
+                return (!parts.is_empty()).then(|| parts.join(" "));
             },
             _ => return None,
         };
@@ -1293,6 +1368,7 @@ impl IR {
         if !push.is_empty() {
             parts.push(format!("push_constants=[{}..{}]", push.offset, push.end()));
         }
+        parts.extend(fmt_specialization(&state.specialization));
 
         Some(parts.join(" "))
     }
@@ -1583,6 +1659,7 @@ impl IR {
                         offset + size_of::<vk::DeviceAddress>() as u32,
                         p.operand(*buffer)
                     ),
+                    StateChange::SpecializationConstant { id, value } => write!(f, "spec[{id}]={value}"),
                 }
             },
             IR::Draw {
@@ -1630,6 +1707,37 @@ impl IR {
                     write!(f, " first_inst={}", p.operand(*first_instance))?;
                 }
                 write!(f, " {}", fmt_pipeline(pipeline))
+            },
+            IR::DrawIndirect {
+                indexed,
+                buffer,
+                offset,
+                stride,
+                count,
+                pipeline,
+                ..
+            } => {
+                let name = match (indexed, count) {
+                    (false, DrawCount::Fixed(_)) => "draw.indirect",
+                    (true, DrawCount::Fixed(_)) => "draw_indexed.indirect",
+                    (false, DrawCount::Indirect { .. }) => "draw.indirect_count",
+                    (true, DrawCount::Indirect { .. }) => "draw_indexed.indirect_count",
+                };
+                write!(f, "{name} {}", p.operand(*buffer))?;
+                if *offset != 0 {
+                    write!(f, " offset={offset}")?;
+                }
+                match count {
+                    DrawCount::Fixed(draw_count) => write!(f, " draws={}", p.operand(*draw_count))?,
+                    DrawCount::Indirect { buffer, offset, max } => {
+                        write!(f, " counts={}", p.operand(*buffer))?;
+                        if *offset != 0 {
+                            write!(f, " count_offset={offset}")?;
+                        }
+                        write!(f, " max_draws={}", p.operand(*max))?;
+                    },
+                }
+                write!(f, " stride={stride} {}", fmt_pipeline(pipeline))
             },
             IR::CallOpaque { body, pipeline, .. } => {
                 write!(f, "call.opaque body={} {}", p.operand(*body), fmt_pipeline(pipeline))
@@ -1923,6 +2031,22 @@ mod tests {
                 },
                 pipeline: PipelineId::INVALID,
                 push_constants: PushConstants::default(),
+                specialization: Specialization::default(),
+            },
+            IR::DrawIndirect {
+                pass: value(0),
+                indexed: false,
+                buffer: value(1),
+                offset: 0,
+                stride: crate::DRAW_INDIRECT_STRIDE,
+                count: DrawCount::Indirect {
+                    buffer: value(2),
+                    offset: 0,
+                    max: value(3),
+                },
+                pipeline: PipelineId::INVALID,
+                state: PipelineState::default(),
+                dynamic: DynamicValues::default(),
             },
         ]
     }

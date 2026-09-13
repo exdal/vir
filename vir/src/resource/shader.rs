@@ -32,6 +32,10 @@ mod op {
     #[cfg(test)]
     pub const TYPE_FUNCTION: u16 = 33;
     pub const CONSTANT: u16 = 43;
+    pub const SPEC_CONSTANT_TRUE: u16 = 48;
+    pub const SPEC_CONSTANT_FALSE: u16 = 49;
+    pub const SPEC_CONSTANT: u16 = 50;
+    pub const SPEC_CONSTANT_COMPOSITE: u16 = 51;
     pub const FUNCTION: u16 = 54;
     pub const FUNCTION_PARAMETER: u16 = 55;
     pub const FUNCTION_END: u16 = 56;
@@ -100,6 +104,7 @@ mod execution_mode {
 }
 
 mod decoration {
+    pub const SPEC_ID: u32 = 1;
     pub const BUFFER_BLOCK: u32 = 3;
     pub const ARRAY_STRIDE: u32 = 6;
     pub const MATRIX_STRIDE: u32 = 7;
@@ -110,6 +115,10 @@ mod decoration {
     pub const BINDING: u32 = 33;
     pub const DESCRIPTOR_SET: u32 = 34;
     pub const OFFSET: u32 = 35;
+}
+
+mod builtin {
+    pub const WORKGROUP_SIZE: u32 = 25;
 }
 
 mod storage_class {
@@ -147,11 +156,22 @@ pub struct VertexInput {
     pub size: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SpecConstant {
+    pub id: u32,
+    pub size: u32,
+    pub stage: vk::ShaderStageFlags,
+}
+
 #[derive(Debug, Clone)]
 pub struct Reflection {
     pub stage: vk::ShaderStageFlags,
     pub entry_point: CString,
     pub bindings: Vec<DescriptorBinding>,
+    /// Sorted by [`SpecConstant::id`].
+    pub spec_constants: Vec<SpecConstant>,
+    /// The `SpecId` feeding each workgroup axis, where one does.
+    pub local_size_spec_ids: [Option<u32>; 3],
     /// Where the stage's push constant block starts. Zero when the stage has none.
     pub push_constant_offset: u32,
     /// How many bytes the block spans from `push_constant_offset`. Zero when the stage has none.
@@ -225,7 +245,13 @@ struct Parsed {
     types: HashMap<u32, TypeInfo>,
     decorations: HashMap<(u32, u32), Vec<u32>>,
     member_decorations: HashMap<(u32, u32, u32), Vec<u32>>,
+    /// Every constant whose value is one word, spec constants included: a spec constant's
+    /// entry is the default it was compiled with.
     constants: HashMap<u32, u32>,
+    /// The scalar spec constants, as `(result id, byte size)`, in declaration order.
+    spec_scalars: Vec<(u32, u32)>,
+    /// The members of every `OpSpecConstantComposite`.
+    spec_composites: HashMap<u32, Vec<u32>>,
     variables: Vec<(u32, u32, u32)>,
     value_types: HashMap<u32, u32>,
     instructions: Vec<Instruction>,
@@ -387,6 +413,20 @@ fn parse(spirv: &[u32]) -> Option<Parsed> {
             op::CONSTANT if operands.len() >= 3 => {
                 parsed.constants.insert(operands[1], operands[2]);
             },
+            op::SPEC_CONSTANT_TRUE | op::SPEC_CONSTANT_FALSE if operands.len() >= 2 => {
+                parsed
+                    .constants
+                    .insert(operands[1], u32::from(opcode == op::SPEC_CONSTANT_TRUE));
+                parsed.spec_scalars.push((operands[1], size_of::<vk::Bool32>() as u32));
+            },
+            op::SPEC_CONSTANT if operands.len() >= 3 => {
+                let size = parsed.type_size(operands[0], 0);
+                parsed.constants.insert(operands[1], operands[2]);
+                parsed.spec_scalars.push((operands[1], size));
+            },
+            op::SPEC_CONSTANT_COMPOSITE if operands.len() >= 2 => {
+                parsed.spec_composites.insert(operands[1], operands[2..].to_vec());
+            },
             op::VARIABLE if operands.len() >= 3 => {
                 parsed.variables.push((operands[1], operands[0], operands[2]));
                 parsed.value_types.insert(operands[1], operands[0]);
@@ -438,18 +478,35 @@ fn parse(spirv: &[u32]) -> Option<Parsed> {
 }
 
 impl Parsed {
-    /// The workgroup the module declares, whether it spelled it as literals or as constants.
-    fn declared_local_size(&self) -> Option<[u32; 3]> {
-        if let Some(local_size) = self.local_size {
-            return Some(local_size);
-        }
+    /// The constants the workgroup size is spelled with, where it is not spelled as literals.
+    ///
+    /// A `WorkgroupSize` composite wins over a `LocalSizeId` execution mode, as SPIR-V says it
+    /// must.
+    fn local_size_ids(&self) -> Option<[u32; 3]> {
+        let composite = self.spec_composites.iter().find_map(|(id, members)| {
+            (self.decoration(*id, decoration::BUILT_IN) == Some(builtin::WORKGROUP_SIZE))
+                .then(|| <[u32; 3]>::try_from(members.as_slice()).ok())
+                .flatten()
+        });
+        composite.or(self.local_size_id)
+    }
 
-        let ids = self.local_size_id?;
-        Some([
-            *self.constants.get(&ids[0])?,
-            *self.constants.get(&ids[1])?,
-            *self.constants.get(&ids[2])?,
-        ])
+    /// The workgroup the module declares, whether it spelled it as literals or as constants.
+    /// A spec constant contributes the default it was compiled with.
+    fn declared_local_size(&self) -> Option<[u32; 3]> {
+        let from_ids = self.local_size_ids().and_then(|ids| {
+            Some([
+                *self.constants.get(&ids[0])?,
+                *self.constants.get(&ids[1])?,
+                *self.constants.get(&ids[2])?,
+            ])
+        });
+        from_ids.or(self.local_size)
+    }
+
+    fn local_size_spec_ids(&self) -> [Option<u32>; 3] {
+        self.local_size_ids()
+            .map_or([None; 3], |ids| ids.map(|id| self.decoration(id, decoration::SPEC_ID)))
     }
 
     fn decoration(&self, target: u32, decoration: u32) -> Option<u32> {
@@ -1279,10 +1336,27 @@ pub fn reflect(spirv: &[u32]) -> Result<Reflection, vk::Result> {
         },
     };
 
+    let mut spec_constants = parsed
+        .spec_scalars
+        .iter()
+        .filter_map(|(value, size)| {
+            let id = parsed.decoration(*value, decoration::SPEC_ID)?;
+            if *size == 0 {
+                tracing::warn!(id, "specialization constant has no size to give a value; it is dropped");
+                return None;
+            }
+            Some(SpecConstant { id, size: *size, stage })
+        })
+        .collect::<Vec<_>>();
+    spec_constants.sort_unstable_by_key(|constant| constant.id);
+    spec_constants.dedup_by_key(|constant| constant.id);
+
     Ok(Reflection {
         stage,
         entry_point: entry_point.name.clone(),
         bindings,
+        spec_constants,
+        local_size_spec_ids: parsed.local_size_spec_ids(),
         push_constant_offset,
         push_constant_size,
         vertex_inputs,
@@ -1510,6 +1584,111 @@ mod tests {
         }
 
         words
+    }
+
+    /// A compute module whose x workgroup axis and whose sampler array are both sized by
+    /// specialization constants, spelling the workgroup either way SPIR-V allows.
+    fn spec_constant_module(builtin_composite: bool) -> Vec<u32> {
+        let mut words = vec![MAGIC, 0x0001_0300, 0, 100, 0];
+
+        let mut entry = vec![5, 99];
+        entry.extend(literal("cs_main"));
+        words.extend(inst(op::ENTRY_POINT, &entry));
+
+        if !builtin_composite {
+            words.extend(inst(
+                op::EXECUTION_MODE_ID,
+                &[99, execution_mode::LOCAL_SIZE_ID, 30, 31, 32],
+            ));
+        }
+
+        words.extend(inst(op::DECORATE, &[30, decoration::SPEC_ID, 3]));
+        words.extend(inst(op::DECORATE, &[40, decoration::SPEC_ID, 7]));
+        words.extend(inst(op::DECORATE, &[41, decoration::SPEC_ID, 8]));
+        words.extend(inst(op::DECORATE, &[42, decoration::SPEC_ID, 1]));
+        words.extend(inst(op::DECORATE, &[21, decoration::DESCRIPTOR_SET, 0]));
+        words.extend(inst(op::DECORATE, &[21, decoration::BINDING, 0]));
+        if builtin_composite {
+            words.extend(inst(op::DECORATE, &[60, decoration::BUILT_IN, builtin::WORKGROUP_SIZE]));
+        }
+
+        words.extend(inst(op::TYPE_INT, &[11, 32, 0]));
+        words.extend(inst(op::TYPE_BOOL, &[12]));
+        words.extend(inst(op::TYPE_FLOAT, &[13, 32]));
+        words.extend(inst(op::TYPE_VECTOR, &[14, 11, 3]));
+
+        words.extend(inst(op::SPEC_CONSTANT, &[11, 30, 8]));
+        words.extend(inst(op::CONSTANT, &[11, 31, 4]));
+        words.extend(inst(op::CONSTANT, &[11, 32, 1]));
+        words.extend(inst(op::SPEC_CONSTANT_TRUE, &[12, 40]));
+        words.extend(inst(op::SPEC_CONSTANT, &[13, 41, 2.5f32.to_bits()]));
+        words.extend(inst(op::SPEC_CONSTANT, &[11, 42, 6]));
+        if builtin_composite {
+            words.extend(inst(op::SPEC_CONSTANT_COMPOSITE, &[14, 60, 30, 31, 32]));
+        }
+
+        words.extend(inst(op::TYPE_SAMPLER, &[15]));
+        words.extend(inst(op::TYPE_ARRAY, &[16, 15, 42]));
+        words.extend(inst(op::TYPE_POINTER, &[17, storage_class::UNIFORM_CONSTANT, 16]));
+        words.extend(inst(op::VARIABLE, &[17, 21, storage_class::UNIFORM_CONSTANT]));
+
+        words
+    }
+
+    #[test]
+    fn reads_every_specialization_constant_a_module_declares() {
+        let compute = vk::ShaderStageFlags::COMPUTE;
+        let reflection = reflect(&spec_constant_module(false)).expect("module should reflect");
+        assert_eq!(
+            reflection.spec_constants,
+            vec![
+                SpecConstant {
+                    id: 1,
+                    size: 4,
+                    stage: compute,
+                },
+                SpecConstant {
+                    id: 3,
+                    size: 4,
+                    stage: compute,
+                },
+                SpecConstant {
+                    id: 7,
+                    size: 4,
+                    stage: compute,
+                },
+                SpecConstant {
+                    id: 8,
+                    size: 4,
+                    stage: compute,
+                },
+            ]
+        );
+    }
+
+    /// The default is what the workgroup is until something specializes it, and the id is how
+    /// a dispatch works out what it became.
+    #[test]
+    fn a_workgroup_sized_by_a_constant_reads_its_default_and_names_the_id() {
+        for builtin_composite in [false, true] {
+            let reflection = reflect(&spec_constant_module(builtin_composite)).expect("module should reflect");
+            assert_eq!(reflection.local_size, [8, 4, 1]);
+            assert_eq!(reflection.local_size_spec_ids, [Some(3), None, None]);
+        }
+    }
+
+    #[test]
+    fn a_descriptor_array_sized_by_a_constant_reads_its_default_length() {
+        let reflection = reflect(&spec_constant_module(false)).expect("module should reflect");
+        assert_eq!(reflection.bindings.len(), 1);
+        assert_eq!(reflection.bindings[0].count, 6);
+    }
+
+    #[test]
+    fn a_stage_that_specializes_nothing_declares_no_constants() {
+        let reflection = reflect(&vertex_module()).expect("module should reflect");
+        assert!(reflection.spec_constants.is_empty());
+        assert_eq!(reflection.local_size_spec_ids, [None; 3]);
     }
 
     #[derive(Clone, Copy)]

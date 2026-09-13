@@ -29,6 +29,7 @@ use crate::{
     RasterizationState,
     Rect2D,
     RenderingState,
+    Specializable,
     StateChange,
     SwapChain,
     Value,
@@ -102,6 +103,7 @@ fn resolve_descriptors(
             },
             IR::Draw { pipeline, .. }
             | IR::DrawIndexed { pipeline, .. }
+            | IR::DrawIndirect { pipeline, .. }
             | IR::CallOpaque { pipeline, .. }
             | IR::Dispatch { pipeline, .. } => {
                 if written.is_empty() {
@@ -1109,6 +1111,19 @@ impl Module {
                         stack.push(*index_count);
                         stack.push(*pass);
                     },
+                    IR::DrawIndirect {
+                        pass, buffer, count, ..
+                    } => {
+                        match count {
+                            ir::DrawCount::Fixed(draw_count) => stack.push(*draw_count),
+                            ir::DrawCount::Indirect { buffer, max, .. } => {
+                                stack.push(*max);
+                                stack.push(*buffer);
+                            },
+                        }
+                        stack.push(*buffer);
+                        stack.push(*pass);
+                    },
                     IR::CallOpaque { pass, body, .. } => {
                         stack.push(*body);
                         stack.push(*pass);
@@ -1727,6 +1742,13 @@ impl Module {
                     buffer_barrier!(self.resource_root(*buffer), Access::IndirectRead);
                 },
 
+                IR::DrawIndirect { buffer, count, .. } => {
+                    buffer_barrier!(self.resource_root(*buffer), Access::IndirectRead);
+                    if let Some(counts) = count.buffer() {
+                        buffer_barrier!(self.resource_root(counts), Access::IndirectRead);
+                    }
+                },
+
                 IR::Release { resource, access, .. } => {
                     transition!(*resource, *access, resolve_access(access));
                 },
@@ -1879,6 +1901,12 @@ impl Module {
                     size: ir::DispatchSize::Indirect { buffer, .. },
                     ..
                 } => used(buffer, vk::BufferUsageFlags::INDIRECT_BUFFER),
+                IR::DrawIndirect { buffer, count, .. } => {
+                    used(buffer, vk::BufferUsageFlags::INDIRECT_BUFFER);
+                    if let Some(counts) = count.buffer() {
+                        used(&counts, vk::BufferUsageFlags::INDIRECT_BUFFER);
+                    }
+                },
                 // a pushed address is the only thing that says a shader reaches the buffer
                 // through a pointer rather than through a binding. the state changes have not
                 // been folded into the draws and dispatches yet, so this reads them where they
@@ -2129,6 +2157,13 @@ impl Module {
                     dynamic,
                     ..
                 }
+                | IR::DrawIndirect {
+                    pass,
+                    pipeline,
+                    state,
+                    dynamic,
+                    ..
+                }
                 | IR::CallOpaque {
                     pass,
                     pipeline,
@@ -2157,6 +2192,7 @@ impl Module {
                     pass,
                     pipeline,
                     push_constants,
+                    specialization,
                     ..
                 } => {
                     if let Some(in_force) = regions.get(pass).cloned() {
@@ -2165,6 +2201,7 @@ impl Module {
                         }
                         *pipeline = in_force.pipeline.unwrap_or(PipelineId::INVALID);
                         *push_constants = in_force.state.push_constants.clone();
+                        *specialization = in_force.state.specialization.clone();
                         regions.insert(*value_id, in_force);
                     }
                 },
@@ -2186,6 +2223,9 @@ impl Module {
         nodes
     }
 }
+
+pub const DRAW_INDIRECT_STRIDE: u32 = size_of::<vk::DrawIndirectCommand>() as u32;
+pub const DRAW_INDEXED_INDIRECT_STRIDE: u32 = size_of::<vk::DrawIndexedIndirectCommand>() as u32;
 
 pub trait Count {
     fn lower(self, module: &mut Module) -> ValueId;
@@ -2273,10 +2313,13 @@ impl Module {
     }
 
     pub fn push_constant_bytes(&mut self, offset: u32, data: &[u8]) -> &mut Self {
-        self.pass_state(StateChange::PushConstants {
-            offset,
-            data: data.to_vec(),
-        })
+        self.pass_state(
+            "push constants",
+            StateChange::PushConstants {
+                offset,
+                data: data.to_vec(),
+            },
+        )
     }
 
     pub fn push_constants_from(&mut self, variable: ValueId) -> &mut Self { self.push_constants_from_at(0, variable) }
@@ -2287,21 +2330,36 @@ impl Module {
             return self;
         };
 
-        self.pass_state(StateChange::PushConstantsFrom {
-            offset,
-            size,
-            source: variable,
-        })
+        self.pass_state(
+            "push constants",
+            StateChange::PushConstantsFrom {
+                offset,
+                size,
+                source: variable,
+            },
+        )
     }
 
     pub fn push_constant_address(&mut self, offset: u32, buffer: ValueId) -> &mut Self {
-        self.pass_state(StateChange::PushConstantAddress { offset, buffer })
+        self.pass_state("push constants", StateChange::PushConstantAddress { offset, buffer })
     }
 
-    /// Push constants are the one piece of state both kinds of pass carry, so they are chained
-    /// without asking which one is open.
-    fn pass_state(&mut self, change: StateChange) -> &mut Self {
-        self.chain(None, "push constants", |pass| IR::SetState { pass, change })
+    /// Sets a specialization constant for the draws and dispatches after it.
+    ///
+    /// Each distinct set of constants a pipeline is reached with is a pipeline of its own, built
+    /// the first time it is needed.
+    pub fn specialize_constant(&mut self, id: u32, value: impl Specializable) -> &mut Self {
+        self.pass_state(
+            "specialization constant",
+            StateChange::SpecializationConstant {
+                id,
+                value: value.spec_value(),
+            },
+        )
+    }
+
+    fn pass_state(&mut self, what: &str, change: StateChange) -> &mut Self {
+        self.chain(None, what, |pass| IR::SetState { pass, change })
     }
 
     fn bind_pipeline(&mut self, kind: PassKind, pipeline: PipelineId, bind_point: vk::PipelineBindPoint) -> &mut Self {
@@ -2535,6 +2593,85 @@ impl Module {
         })
     }
 
+    fn draw_indirect_command(
+        &mut self, indexed: bool, buffer: ValueId, offset: u64, stride: u32, count: ir::DrawCount,
+    ) -> &mut Self {
+        if !self.is_buffer(buffer) || count.buffer().is_some_and(|counts| !self.is_buffer(counts)) {
+            tracing::error!(%buffer, "an indirect draw can only read its commands out of a buffer");
+            return self;
+        }
+
+        self.chain(Some(PassKind::Rendering), "indirect draw", |pass| IR::DrawIndirect {
+            pass,
+            indexed,
+            buffer,
+            offset,
+            stride,
+            count,
+            pipeline: PipelineId::INVALID,
+            state: Default::default(),
+            dynamic: Default::default(),
+        })
+    }
+
+    pub fn draw_indirect(&mut self, buffer: ValueId, draw_count: impl Count) -> &mut Self {
+        self.draw_indirect_at(buffer, 0, draw_count, DRAW_INDIRECT_STRIDE)
+    }
+
+    pub fn draw_indirect_at(&mut self, buffer: ValueId, offset: u64, draw_count: impl Count, stride: u32) -> &mut Self {
+        let draw_count = draw_count.lower(self);
+        self.draw_indirect_command(false, buffer, offset, stride, ir::DrawCount::Fixed(draw_count))
+    }
+
+    pub fn draw_indexed_indirect(&mut self, buffer: ValueId, draw_count: impl Count) -> &mut Self {
+        self.draw_indexed_indirect_at(buffer, 0, draw_count, DRAW_INDEXED_INDIRECT_STRIDE)
+    }
+
+    pub fn draw_indexed_indirect_at(
+        &mut self, buffer: ValueId, offset: u64, draw_count: impl Count, stride: u32,
+    ) -> &mut Self {
+        let draw_count = draw_count.lower(self);
+        self.draw_indirect_command(true, buffer, offset, stride, ir::DrawCount::Fixed(draw_count))
+    }
+
+    pub fn draw_indirect_count(
+        &mut self, buffer: ValueId, count_buffer: ValueId, max_draw_count: impl Count,
+    ) -> &mut Self {
+        self.draw_indirect_count_at(buffer, 0, count_buffer, 0, max_draw_count, DRAW_INDIRECT_STRIDE)
+    }
+
+    pub fn draw_indirect_count_at(
+        &mut self, buffer: ValueId, offset: u64, count_buffer: ValueId, count_offset: u64, max_draw_count: impl Count,
+        stride: u32,
+    ) -> &mut Self {
+        let max = max_draw_count.lower(self);
+        let count = ir::DrawCount::Indirect {
+            buffer: count_buffer,
+            offset: count_offset,
+            max,
+        };
+        self.draw_indirect_command(false, buffer, offset, stride, count)
+    }
+
+    pub fn draw_indexed_indirect_count(
+        &mut self, buffer: ValueId, count_buffer: ValueId, max_draw_count: impl Count,
+    ) -> &mut Self {
+        self.draw_indexed_indirect_count_at(buffer, 0, count_buffer, 0, max_draw_count, DRAW_INDEXED_INDIRECT_STRIDE)
+    }
+
+    pub fn draw_indexed_indirect_count_at(
+        &mut self, buffer: ValueId, offset: u64, count_buffer: ValueId, count_offset: u64, max_draw_count: impl Count,
+        stride: u32,
+    ) -> &mut Self {
+        let max = max_draw_count.lower(self);
+        let count = ir::DrawCount::Indirect {
+            buffer: count_buffer,
+            offset: count_offset,
+            max,
+        };
+        self.draw_indirect_command(true, buffer, offset, stride, count)
+    }
+
     pub fn record_from(&mut self, body: ValueId) -> &mut Self {
         self.chain(Some(PassKind::Rendering), "callback", |pass| IR::CallOpaque {
             pass,
@@ -2560,6 +2697,7 @@ impl Module {
             size,
             pipeline: PipelineId::INVALID,
             push_constants: Default::default(),
+            specialization: Default::default(),
         })
     }
 
@@ -2694,7 +2832,17 @@ mod tests {
     use ash::vk::Handle;
 
     use super::*;
-    use crate::{BlendPreset, Image, PipelineState, ResolvedViewport, Unchecked, clear, graph::analysis::Declared};
+    use crate::{
+        BlendPreset,
+        Image,
+        PipelineState,
+        ResolvedViewport,
+        SpecValue,
+        Specialization,
+        Unchecked,
+        clear,
+        graph::analysis::Declared,
+    };
 
     const FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
     const LAYOUT: vk::ImageLayout = vk::ImageLayout::READ_ONLY_OPTIMAL;
@@ -2831,9 +2979,38 @@ mod tests {
             .instructions()
             .iter()
             .filter_map(|(_, ir)| match ir {
-                IR::Draw { pipeline, state, .. } | IR::DrawIndexed { pipeline, state, .. } => {
-                    Some((*pipeline, state.clone()))
-                },
+                IR::Draw { pipeline, state, .. }
+                | IR::DrawIndexed { pipeline, state, .. }
+                | IR::DrawIndirect { pipeline, state, .. } => Some((*pipeline, state.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn indirect_draws(program: &Program) -> Vec<(bool, ValueId, u64, u32, ir::DrawCount)> {
+        program
+            .instructions()
+            .iter()
+            .filter_map(|(_, ir)| match ir {
+                IR::DrawIndirect {
+                    indexed,
+                    buffer,
+                    offset,
+                    stride,
+                    count,
+                    ..
+                } => Some((*indexed, *buffer, *offset, *stride, *count)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn specializations(program: &Program) -> Vec<Specialization> {
+        program
+            .instructions()
+            .iter()
+            .filter_map(|(_, ir)| match ir {
+                IR::Dispatch { specialization, .. } => Some(specialization.clone()),
                 _ => None,
             })
             .collect()
@@ -4413,6 +4590,230 @@ mod tests {
             memory_barriers(&module, &compiled),
             vec![(Access::HostWrite, Access::IndirectRead)]
         );
+    }
+
+    /// The commands are no use to the device until the write that filled them is visible, the
+    /// same as for an indirect dispatch.
+    #[test]
+    fn an_indirect_draw_waits_for_the_buffer_of_commands() {
+        let (mut module, attachment) = module_with_attachment();
+        let commands = module.import_buffer(&Buffer::new(vk::Buffer::null(), 64, 0, None), Access::HostWrite);
+
+        let end = module
+            .begin_rendering([(attachment, Access::ColorRW)])
+            .bind_graphics_pipeline(PipelineId(0))
+            .draw_indirect(commands, 4)
+            .end_rendering::<1>()[0];
+
+        let compiled = module.compile(&Unchecked, end).unwrap();
+        assert_eq!(
+            memory_barriers(&module, &compiled),
+            vec![(Access::HostWrite, Access::IndirectRead)]
+        );
+        assert_eq!(
+            indirect_draws(&compiled)
+                .into_iter()
+                .map(|(indexed, buffer, offset, stride, _)| (indexed, buffer, offset, stride))
+                .collect::<Vec<_>>(),
+            vec![(false, commands, 0, DRAW_INDIRECT_STRIDE)]
+        );
+    }
+
+    /// The count is read as commands too, so a draw that reads two buffers waits on both. Being
+    /// adjacent, the two waits fold into the one barrier.
+    #[test]
+    fn a_counted_indirect_draw_waits_for_its_count_buffer_as_well() {
+        let (mut module, attachment) = module_with_attachment();
+        let commands = module.import_buffer(&Buffer::new(vk::Buffer::null(), 64, 0, None), Access::HostWrite);
+        let counts = module.import_buffer(&Buffer::new(vk::Buffer::null(), 4, 0, None), Access::ComputeWrite);
+
+        let end = module
+            .begin_rendering([(attachment, Access::ColorRW)])
+            .bind_graphics_pipeline(PipelineId(0))
+            .draw_indexed_indirect_count(commands, counts, 8)
+            .end_rendering::<1>()[0];
+
+        let compiled = module.compile(&Unchecked, end).unwrap();
+        assert_eq!(
+            memory_barriers(&module, &compiled),
+            vec![(Access::HostWrite | Access::ComputeWrite, Access::IndirectRead)],
+            "{}",
+            compiled.dump()
+        );
+
+        let recorded = indirect_draws(&compiled);
+        let [(indexed, buffer, offset, stride, count)] = recorded.as_slice() else {
+            panic!("expected one indirect draw");
+        };
+        assert!(*indexed);
+        assert_eq!((*buffer, *offset, *stride), (commands, 0, DRAW_INDEXED_INDIRECT_STRIDE));
+        assert!(matches!(count, ir::DrawCount::Indirect { buffer, offset: 0, .. } if *buffer == counts));
+    }
+
+    #[test]
+    fn indirect_draws_out_of_one_buffer_wait_on_it_once() {
+        let (mut module, attachment) = module_with_attachment();
+        let commands = module.import_buffer(&Buffer::new(vk::Buffer::null(), 64, 0, None), Access::HostWrite);
+
+        let end = module
+            .begin_rendering([(attachment, Access::ColorRW)])
+            .bind_graphics_pipeline(PipelineId(0))
+            .draw_indirect(commands, 1)
+            .draw_indirect_at(commands, 16, 2, DRAW_INDIRECT_STRIDE)
+            .end_rendering::<1>()[0];
+
+        let compiled = module.compile(&Unchecked, end).unwrap();
+        assert_eq!(
+            memory_barriers(&module, &compiled),
+            vec![(Access::HostWrite, Access::IndirectRead)]
+        );
+        assert_eq!(indirect_draws(&compiled).len(), 2);
+    }
+
+    #[test]
+    fn a_buffer_drawn_from_indirectly_is_created_as_an_indirect_buffer() {
+        let (mut module, attachment) = module_with_attachment();
+        let commands = module.transient_buffer(&BufferInfo::new(
+            64,
+            vk::BufferUsageFlags::empty(),
+            MemoryLocation::GpuOnly,
+        ));
+        let counts = module.transient_buffer(&BufferInfo::new(
+            4,
+            vk::BufferUsageFlags::empty(),
+            MemoryLocation::GpuOnly,
+        ));
+
+        let filled = module
+            .begin_compute([(commands, Access::ComputeWrite), (counts, Access::ComputeWrite)])
+            .bind_compute_pipeline(PipelineId(0))
+            .dispatch(1, 1, 1)
+            .end_compute::<2>();
+
+        let end = module
+            .begin_rendering([(attachment, Access::ColorRW)])
+            .bind_graphics_pipeline(PipelineId(0))
+            .draw_indirect_count(filled[0], filled[1], 4)
+            .end_rendering::<1>()[0];
+
+        let compiled = module.compile(&Unchecked, end).unwrap();
+        for buffer in [commands, counts] {
+            assert!(
+                buffer_usage(&compiled, buffer).contains(vk::BufferUsageFlags::INDIRECT_BUFFER),
+                "{buffer} should be created as an indirect buffer\n{}",
+                compiled.dump()
+            );
+        }
+    }
+
+    /// Nothing but the draw says the buffer a dispatch filled will be read as commands, which
+    /// is the whole reason an indirect draw declares a read of its own.
+    #[test]
+    fn an_indirect_draw_waits_for_the_dispatch_that_filled_it() {
+        let (mut module, attachment) = module_with_attachment();
+        let commands = module.import_buffer(&Buffer::new(vk::Buffer::null(), 64, 0, None), Access::HostWrite);
+
+        let filled = module
+            .begin_compute([(commands, Access::ComputeWrite)])
+            .bind_compute_pipeline(PipelineId(0))
+            .dispatch(1, 1, 1)
+            .end_compute::<1>()[0];
+
+        let end = module
+            .begin_rendering([(attachment, Access::ColorRW)])
+            .bind_graphics_pipeline(PipelineId(0))
+            .draw_indirect(filled, 4)
+            .end_rendering::<1>()[0];
+
+        let compiled = module.compile(&Unchecked, end).unwrap();
+        assert_eq!(
+            memory_barriers(&module, &compiled),
+            vec![
+                (Access::HostWrite, Access::ComputeWrite),
+                (Access::ComputeWrite, Access::IndirectRead),
+            ],
+            "{}",
+            compiled.dump()
+        );
+    }
+
+    #[test]
+    fn an_indirect_draw_inherits_the_pipeline_and_state_in_force() {
+        let (mut module, attachment) = module_with_attachment();
+        let pipeline = PipelineId(2);
+        let commands = module.import_buffer(&Buffer::new(vk::Buffer::null(), 64, 0, None), Access::HostWrite);
+
+        let end = module
+            .begin_rendering([(attachment, Access::ColorRW)])
+            .bind_graphics_pipeline(pipeline)
+            .set_primitive_topology(vk::PrimitiveTopology::LINE_STRIP)
+            .draw_indirect(commands, 4)
+            .end_rendering::<1>()[0];
+
+        let draws = draws(&module.compile(&Unchecked, end).unwrap());
+        assert_eq!(draws.len(), 1);
+        assert_eq!(draws[0].0, pipeline);
+        assert_eq!(draws[0].1.topology, vk::PrimitiveTopology::LINE_STRIP);
+    }
+
+    /// Two dispatches under different constants are two pipelines, which is what the
+    /// specialization each carries is for.
+    #[test]
+    fn dispatches_under_different_constants_carry_different_specializations() {
+        let (mut module, attachment) = module_with_attachment();
+
+        let end = module
+            .begin_compute([(attachment, Access::ComputeWrite)])
+            .bind_compute_pipeline(PipelineId(0))
+            .specialize_constant(0, 64u32)
+            .dispatch(1, 1, 1)
+            .specialize_constant(0, 128u32)
+            .specialize_constant(1, true)
+            .dispatch(1, 1, 1)
+            .end_compute::<1>()[0];
+
+        assert_eq!(
+            specializations(&module.compile(&Unchecked, end).unwrap()),
+            vec![
+                Specialization::from_iter([(0, SpecValue::U32(64))]),
+                Specialization::from_iter([(0, SpecValue::U32(128)), (1, SpecValue::Bool(true))]),
+            ]
+        );
+    }
+
+    /// Constants are pass state, so where they are set relative to the pipeline being bound
+    /// does not matter; what matters is that they stand when the command is reached.
+    #[test]
+    fn a_constant_set_before_the_pipeline_still_reaches_the_dispatch() {
+        let (mut module, attachment) = module_with_attachment();
+
+        let end = module
+            .begin_compute([(attachment, Access::ComputeWrite)])
+            .specialize_constant(3, 2.5f32)
+            .bind_compute_pipeline(PipelineId(0))
+            .dispatch(1, 1, 1)
+            .end_compute::<1>()[0];
+
+        assert_eq!(
+            specializations(&module.compile(&Unchecked, end).unwrap()),
+            vec![Specialization::from_iter([(3, SpecValue::F32(2.5f32.to_bits()))])]
+        );
+    }
+
+    #[test]
+    fn a_specialized_draw_keeps_its_constants_in_the_state_it_is_compiled_with() {
+        let (mut module, attachment) = module_with_attachment();
+
+        let end = module
+            .begin_rendering([(attachment, Access::ColorRW)])
+            .bind_graphics_pipeline(PipelineId(0))
+            .specialize_constant(0, -1i32)
+            .draw(3, 1)
+            .end_rendering::<1>()[0];
+
+        let draws = draws(&module.compile(&Unchecked, end).unwrap());
+        assert_eq!(draws.len(), 1);
+        assert_eq!(draws[0].1.specialization.get(0), Some(SpecValue::I32(-1)));
     }
 
     #[test]

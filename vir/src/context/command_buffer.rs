@@ -174,6 +174,58 @@ impl CommandBuffer {
         }
     }
 
+    pub fn draw_indirect(&self, buffer: vk::Buffer, offset: vk::DeviceSize, draw_count: u32, stride: u32) {
+        unsafe {
+            self.device
+                .as_ref()
+                .cmd_draw_indirect(self.handle, buffer, offset, draw_count, stride)
+        }
+    }
+
+    pub fn draw_indexed_indirect(&self, buffer: vk::Buffer, offset: vk::DeviceSize, draw_count: u32, stride: u32) {
+        unsafe {
+            self.device
+                .as_ref()
+                .cmd_draw_indexed_indirect(self.handle, buffer, offset, draw_count, stride)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_indirect_count(
+        &self, buffer: vk::Buffer, offset: vk::DeviceSize, count_buffer: vk::Buffer, count_offset: vk::DeviceSize,
+        max_draw_count: u32, stride: u32,
+    ) {
+        unsafe {
+            self.device.as_ref().cmd_draw_indirect_count(
+                self.handle,
+                buffer,
+                offset,
+                count_buffer,
+                count_offset,
+                max_draw_count,
+                stride,
+            )
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_indexed_indirect_count(
+        &self, buffer: vk::Buffer, offset: vk::DeviceSize, count_buffer: vk::Buffer, count_offset: vk::DeviceSize,
+        max_draw_count: u32, stride: u32,
+    ) {
+        unsafe {
+            self.device.as_ref().cmd_draw_indexed_indirect_count(
+                self.handle,
+                buffer,
+                offset,
+                count_buffer,
+                count_offset,
+                max_draw_count,
+                stride,
+            )
+        }
+    }
+
     pub fn dispatch(&self, groups_x: u32, groups_y: u32, groups_z: u32) {
         unsafe {
             self.device

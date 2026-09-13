@@ -12,8 +12,8 @@ pub mod value;
 pub use analysis::{PipelineBindings, Unchecked};
 pub use attachment::ImageAttachment;
 // dont export Constant, i think its ok to use it as ir::Constant
-pub use ir::{Descriptor, DispatchSize, IR, ResourceSideEffect, SideEffect, SideEffectAccess};
-pub use module::{ConditionResult, Count, Module};
+pub use ir::{Descriptor, DispatchSize, DrawCount, IR, ResourceSideEffect, SideEffect, SideEffectAccess};
+pub use module::{ConditionResult, Count, DRAW_INDEXED_INDIRECT_STRIDE, DRAW_INDIRECT_STRIDE, Module};
 pub use pass::PassCallback;
 pub use program::Program;
 pub use render_graph::{Recorder, RenderGraph};

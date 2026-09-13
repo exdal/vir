@@ -27,6 +27,9 @@ pub use pipeline::{
     RenderingState,
     ResolvedViewport,
     SetLayout,
+    SpecValue,
+    Specializable,
+    Specialization,
     StateChange,
     VertexAttribute,
     VertexLayout,
@@ -34,5 +37,5 @@ pub use pipeline::{
     push_constant_ranges,
 };
 pub use sampler::SamplerInfo;
-pub use shader::{DescriptorBinding, Reflection};
+pub use shader::{DescriptorBinding, Reflection, SpecConstant};
 pub use swapchain::{AcquiredSwapchain, SwapChain};

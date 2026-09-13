@@ -16,6 +16,9 @@ pub use state::{
     Rect2D,
     RenderingState,
     ResolvedViewport,
+    SpecValue,
+    Specializable,
+    Specialization,
     StateChange,
     Viewport,
 };
@@ -373,6 +376,112 @@ impl PipelineLayout {
     }
 }
 
+/// One value blob for the whole pipeline, and the map entries each stage reads it through.
+///
+/// A constant declared by more than one stage is written once and named by every stage that
+/// declares it, which is what the offsets in the entries are for.
+pub(crate) struct PackedSpecialization {
+    pub data: Vec<u8>,
+    pub entries: Vec<Vec<vk::SpecializationMapEntry>>,
+}
+
+pub(crate) fn pack_specialization(
+    reflections: &[Reflection], specialization: &Specialization,
+) -> Result<PackedSpecialization, vk::Result> {
+    let mut merged: BTreeMap<u32, (u32, vk::ShaderStageFlags)> = BTreeMap::new();
+    for reflection in reflections {
+        for constant in &reflection.spec_constants {
+            match merged.entry(constant.id) {
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    let (size, stages) = entry.get_mut();
+                    if *size != constant.size {
+                        tracing::error!(
+                            id = constant.id,
+                            declared = *size,
+                            found = constant.size,
+                            "shader stages disagree on the size of a specialization constant"
+                        );
+                        return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+                    }
+                    *stages |= constant.stage;
+                },
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert((constant.size, constant.stage));
+                },
+            }
+        }
+    }
+
+    // an id the shaders never declare is not an error: the constants in force are whatever the
+    // pass set, and a pass sets them for whichever pipeline it goes on to bind
+    for (id, value) in specialization.iter() {
+        match merged.get(&id) {
+            Some((size, _)) if *size != value.size() => {
+                tracing::error!(
+                    id,
+                    declared = *size,
+                    given = value.size(),
+                    "the value given for a specialization constant is not the size the shader declares"
+                );
+                return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+            },
+            Some(_) => {},
+            None => tracing::debug!(
+                id,
+                "no shader stage declares this specialization constant; it is dropped"
+            ),
+        }
+    }
+
+    let mut data = Vec::new();
+    let mut placed: Vec<(u32, u32, u32, vk::ShaderStageFlags)> = Vec::new();
+    for (id, (size, stages)) in merged {
+        let Some(value) = specialization.get(id) else {
+            continue;
+        };
+
+        let offset = data.len() as u32;
+        data.extend_from_slice(&value.bytes()[..size as usize]);
+        placed.push((id, offset, size, stages));
+    }
+
+    let entries = reflections
+        .iter()
+        .map(|reflection| {
+            placed
+                .iter()
+                .filter(|(_, _, _, stages)| stages.contains(reflection.stage))
+                .map(|(id, offset, size, _)| {
+                    vk::SpecializationMapEntry::default()
+                        .constant_id(*id)
+                        .offset(*offset)
+                        .size(*size as usize)
+                })
+                .collect()
+        })
+        .collect();
+
+    Ok(PackedSpecialization { data, entries })
+}
+
+/// The `VkSpecializationInfo` each stage is given, or none where the stage specializes nothing.
+///
+/// Vulkan reads the pointers inside these through the create infos, so both this and the
+/// [`PackedSpecialization`] it borrows have to outlive the `vkCreate*Pipelines` call.
+fn specialization_infos<'a>(packed: &'a PackedSpecialization) -> Vec<Option<vk::SpecializationInfo<'a>>> {
+    packed
+        .entries
+        .iter()
+        .map(|entries| {
+            (!entries.is_empty()).then(|| {
+                vk::SpecializationInfo::default()
+                    .map_entries(entries)
+                    .data(&packed.data)
+            })
+        })
+        .collect()
+}
+
 pub(crate) struct PipelineRequest<'a> {
     pub info: &'a GraphicsPipelineInfo,
     pub reflections: &'a [Reflection],
@@ -387,6 +496,12 @@ pub(crate) fn create_pipelines(
     if requests.is_empty() {
         return Ok(Vec::new());
     }
+
+    let packed = requests
+        .iter()
+        .map(|request| pack_specialization(request.reflections, &request.state.specialization))
+        .collect::<Result<Vec<_>, _>>()?;
+    let specializations = packed.iter().map(specialization_infos).collect::<Vec<_>>();
 
     let mut modules: Vec<Vec<vk::ShaderModule>> = Vec::with_capacity(requests.len());
     let destroy_modules = |modules: &[Vec<vk::ShaderModule>]| {
@@ -414,16 +529,22 @@ pub(crate) fn create_pipelines(
     let stages = requests
         .iter()
         .zip(&modules)
-        .map(|(request, modules)| {
+        .zip(&specializations)
+        .map(|((request, modules), specializations)| {
             request
                 .reflections
                 .iter()
                 .zip(modules)
-                .map(|(reflection, module)| {
-                    vk::PipelineShaderStageCreateInfo::default()
+                .zip(specializations)
+                .map(|((reflection, module), specialization)| {
+                    let stage = vk::PipelineShaderStageCreateInfo::default()
                         .stage(reflection.stage)
                         .module(*module)
-                        .name(&reflection.entry_point)
+                        .name(&reflection.entry_point);
+                    match specialization {
+                        Some(specialization) => stage.specialization_info(specialization),
+                        None => stage,
+                    }
                 })
                 .collect::<Vec<_>>()
         })
@@ -597,6 +718,7 @@ pub(crate) fn create_pipelines(
 pub(crate) struct ComputePipelineRequest<'a> {
     pub info: &'a ComputePipelineInfo,
     pub reflection: &'a Reflection,
+    pub specialization: &'a Specialization,
     pub layout: vk::PipelineLayout,
 }
 
@@ -606,6 +728,12 @@ pub(crate) fn create_compute_pipelines(
     if requests.is_empty() {
         return Ok(Vec::new());
     }
+
+    let packed = requests
+        .iter()
+        .map(|request| pack_specialization(std::slice::from_ref(request.reflection), request.specialization))
+        .collect::<Result<Vec<_>, _>>()?;
+    let specializations = packed.iter().map(specialization_infos).collect::<Vec<_>>();
 
     let mut modules: Vec<vk::ShaderModule> = Vec::with_capacity(requests.len());
     let destroy_modules = |modules: &[vk::ShaderModule]| {
@@ -628,11 +756,16 @@ pub(crate) fn create_compute_pipelines(
     let create_infos = requests
         .iter()
         .zip(&modules)
-        .map(|(request, module)| {
+        .zip(&specializations)
+        .map(|((request, module), specialization)| {
             let stage = vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::COMPUTE)
                 .module(*module)
                 .name(&request.reflection.entry_point);
+            let stage = match specialization.first().and_then(Option::as_ref) {
+                Some(specialization) => stage.specialization_info(specialization),
+                None => stage,
+            };
 
             vk::ComputePipelineCreateInfo::default()
                 .stage(stage)
@@ -660,7 +793,7 @@ mod tests {
     use super::*;
     use crate::{
         Access,
-        resource::shader::{DescriptorBinding, VertexInput},
+        resource::shader::{DescriptorBinding, SpecConstant, VertexInput},
     };
 
     fn reflection(stage: vk::ShaderStageFlags, vertex_inputs: Vec<VertexInput>) -> Reflection {
@@ -668,11 +801,86 @@ mod tests {
             stage,
             entry_point: CString::new("main").unwrap(),
             bindings: Vec::new(),
+            spec_constants: Vec::new(),
+            local_size_spec_ids: [None; 3],
             push_constant_offset: 0,
             push_constant_size: 0,
             vertex_inputs,
             local_size: [1, 1, 1],
         }
+    }
+
+    fn with_spec_constants(stage: vk::ShaderStageFlags, constants: &[(u32, u32)]) -> Reflection {
+        Reflection {
+            spec_constants: constants
+                .iter()
+                .map(|(id, size)| SpecConstant {
+                    id: *id,
+                    size: *size,
+                    stage,
+                })
+                .collect(),
+            ..reflection(stage, Vec::new())
+        }
+    }
+
+    fn entry(entry: &vk::SpecializationMapEntry) -> (u32, u32, usize) { (entry.constant_id, entry.offset, entry.size) }
+
+    #[test]
+    fn a_constant_two_stages_declare_is_written_once_and_named_by_both() {
+        let reflections = [
+            with_spec_constants(vk::ShaderStageFlags::VERTEX, &[(0, 4), (1, 4)]),
+            with_spec_constants(vk::ShaderStageFlags::FRAGMENT, &[(1, 4)]),
+        ];
+        let specialization = Specialization::from_iter([(0, SpecValue::U32(7)), (1, SpecValue::F32(1.0f32.to_bits()))]);
+
+        let packed = pack_specialization(&reflections, &specialization).expect("the values fit the reflection");
+        assert_eq!(packed.data.len(), 8);
+        assert_eq!(&packed.data[..4], &7u32.to_le_bytes());
+        assert_eq!(&packed.data[4..], &1.0f32.to_bits().to_le_bytes());
+        assert_eq!(
+            packed.entries[0].iter().map(entry).collect::<Vec<_>>(),
+            vec![(0, 0, 4), (1, 4, 4)]
+        );
+        assert_eq!(packed.entries[1].iter().map(entry).collect::<Vec<_>>(), vec![(1, 4, 4)]);
+    }
+
+    #[test]
+    fn a_constant_left_unset_contributes_no_bytes_and_no_entry() {
+        let reflections = [with_spec_constants(vk::ShaderStageFlags::COMPUTE, &[(0, 4), (1, 4)])];
+        let specialization = Specialization::from_iter([(1, SpecValue::U32(3))]);
+
+        let packed = pack_specialization(&reflections, &specialization).expect("the values fit the reflection");
+        assert_eq!(packed.data, 3u32.to_le_bytes());
+        assert_eq!(packed.entries[0].iter().map(entry).collect::<Vec<_>>(), vec![(1, 0, 4)]);
+    }
+
+    /// A pass sets its constants for whichever pipeline it goes on to bind, so one the shader
+    /// never declares is nothing to complain about.
+    #[test]
+    fn a_constant_no_stage_declares_is_dropped() {
+        let reflections = [with_spec_constants(vk::ShaderStageFlags::COMPUTE, &[(0, 4)])];
+        let specialization = Specialization::from_iter([(9, SpecValue::U32(3))]);
+
+        let packed = pack_specialization(&reflections, &specialization).expect("an unknown id is not an error");
+        assert!(packed.data.is_empty());
+        assert!(packed.entries[0].is_empty());
+    }
+
+    #[test]
+    fn a_value_of_the_wrong_width_is_rejected() {
+        let reflections = [with_spec_constants(vk::ShaderStageFlags::COMPUTE, &[(0, 4)])];
+        let specialization = Specialization::from_iter([(0, SpecValue::F64(0))]);
+        assert!(pack_specialization(&reflections, &specialization).is_err());
+    }
+
+    #[test]
+    fn stages_that_disagree_on_the_width_of_a_constant_are_rejected() {
+        let reflections = [
+            with_spec_constants(vk::ShaderStageFlags::VERTEX, &[(0, 4)]),
+            with_spec_constants(vk::ShaderStageFlags::FRAGMENT, &[(0, 8)]),
+        ];
+        assert!(pack_specialization(&reflections, &Specialization::default()).is_err());
     }
 
     fn with_push_constants(stage: vk::ShaderStageFlags, offset: u32, size: u32) -> Reflection {

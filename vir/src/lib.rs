@@ -12,12 +12,16 @@ use std::{
 
 pub use allocator::{AllocatorKind, FrameAllocator, PersistentAllocator, SuperFrameAllocator};
 use ash::vk;
+pub use ash::vk::{DispatchIndirectCommand, DrawIndexedIndirectCommand, DrawIndirectCommand};
 pub use context::{Access, CommandBuffer, Context, DomainFlag};
 pub use graph::{
     ConditionResult,
     Count,
+    DRAW_INDEXED_INDIRECT_STRIDE,
+    DRAW_INDIRECT_STRIDE,
     Descriptor,
     DispatchSize,
+    DrawCount,
     IR,
     ImageAttachment,
     LabelId,
@@ -63,6 +67,10 @@ pub use resource::{
     ResolvedViewport,
     SamplerInfo,
     SetLayout,
+    SpecConstant,
+    SpecValue,
+    Specializable,
+    Specialization,
     StateChange,
     SwapChain,
     VertexAttribute,

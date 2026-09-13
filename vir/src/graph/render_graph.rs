@@ -18,6 +18,8 @@ use crate::{
     CommandBuffer,
     ComputePipelineInfo,
     Context,
+    DRAW_INDEXED_INDIRECT_STRIDE,
+    DRAW_INDIRECT_STRIDE,
     DescriptorBinding,
     DomainFlag,
     DynamicValues,
@@ -35,6 +37,8 @@ use crate::{
     PushConstants,
     Rect2D,
     ResolvedViewport,
+    SpecValue,
+    Specialization,
     Value,
     ValueId,
     VertexLayout,
@@ -168,7 +172,7 @@ enum PipelineKind {
     },
     Compute {
         info: ComputePipelineInfo,
-        handle: Option<vk::Pipeline>,
+        variants: HashMap<Specialization, vk::Pipeline>,
     },
 }
 
@@ -436,6 +440,77 @@ impl Recorder<'_> {
         })
     }
 
+    pub fn draw_indirect(&mut self, buffer: &Buffer, draw_count: u32) -> &mut Self {
+        self.draw_indirect_at(buffer, 0, draw_count, DRAW_INDIRECT_STRIDE)
+    }
+
+    pub fn draw_indirect_at(&mut self, buffer: &Buffer, offset: u64, draw_count: u32, stride: u32) -> &mut Self {
+        let handle = buffer.handle();
+        self.indirect(move |graph| {
+            graph.batch()?.draw_indirect(handle, offset, draw_count, stride);
+            Ok(())
+        })
+    }
+
+    pub fn draw_indexed_indirect(&mut self, buffer: &Buffer, draw_count: u32) -> &mut Self {
+        self.draw_indexed_indirect_at(buffer, 0, draw_count, DRAW_INDEXED_INDIRECT_STRIDE)
+    }
+
+    pub fn draw_indexed_indirect_at(
+        &mut self, buffer: &Buffer, offset: u64, draw_count: u32, stride: u32,
+    ) -> &mut Self {
+        let handle = buffer.handle();
+        self.indirect(move |graph| {
+            graph.batch()?.draw_indexed_indirect(handle, offset, draw_count, stride);
+            Ok(())
+        })
+    }
+
+    pub fn draw_indirect_count(&mut self, buffer: &Buffer, count_buffer: &Buffer, max_draw_count: u32) -> &mut Self {
+        self.draw_indirect_count_at(buffer, 0, count_buffer, 0, max_draw_count, DRAW_INDIRECT_STRIDE)
+    }
+
+    pub fn draw_indirect_count_at(
+        &mut self, buffer: &Buffer, offset: u64, count_buffer: &Buffer, count_offset: u64, max_draw_count: u32,
+        stride: u32,
+    ) -> &mut Self {
+        let (handle, counts) = (buffer.handle(), count_buffer.handle());
+        self.indirect(move |graph| {
+            graph
+                .batch()?
+                .draw_indirect_count(handle, offset, counts, count_offset, max_draw_count, stride);
+            Ok(())
+        })
+    }
+
+    pub fn draw_indexed_indirect_count(
+        &mut self, buffer: &Buffer, count_buffer: &Buffer, max_draw_count: u32,
+    ) -> &mut Self {
+        self.draw_indexed_indirect_count_at(buffer, 0, count_buffer, 0, max_draw_count, DRAW_INDEXED_INDIRECT_STRIDE)
+    }
+
+    pub fn draw_indexed_indirect_count_at(
+        &mut self, buffer: &Buffer, offset: u64, count_buffer: &Buffer, count_offset: u64, max_draw_count: u32,
+        stride: u32,
+    ) -> &mut Self {
+        let (handle, counts) = (buffer.handle(), count_buffer.handle());
+        self.indirect(move |graph| {
+            graph
+                .batch()?
+                .draw_indexed_indirect_count(handle, offset, counts, count_offset, max_draw_count, stride);
+            Ok(())
+        })
+    }
+
+    fn indirect(&mut self, draw: impl FnOnce(&mut RenderGraph) -> Result<(), vk::Result>) -> &mut Self {
+        let pipeline = self.pipeline;
+        let descriptors = self.descriptors.values().copied().collect::<Vec<_>>();
+        self.record(move |graph| {
+            graph.bind_resolved_descriptor_sets(pipeline, vk::PipelineBindPoint::GRAPHICS, &descriptors)?;
+            draw(graph)
+        })
+    }
+
     pub fn buffer(&self, id: ValueId) -> Buffer { self.graph.get::<Buffer>(&id) }
 
     pub fn image(&self, id: ValueId) -> ImageAttachment { self.graph.get::<ImageAttachment>(&id) }
@@ -655,7 +730,10 @@ impl RenderGraph {
             bindings: merged_bindings(std::slice::from_ref(&reflection)),
             reflections: vec![reflection],
             layout: None,
-            kind: PipelineKind::Compute { info, handle: None },
+            kind: PipelineKind::Compute {
+                info,
+                variants: HashMap::new(),
+            },
         });
 
         Ok(id)
@@ -663,12 +741,13 @@ impl RenderGraph {
 
     fn construct_pipelines(&mut self, instructions: &[ir::Instr]) -> Result<(), vk::Result> {
         let mut graphics: Vec<(PipelineId, PipelineState)> = Vec::new();
-        let mut compute: Vec<PipelineId> = Vec::new();
+        let mut compute: Vec<(PipelineId, Specialization)> = Vec::new();
 
         for (value_id, ir) in instructions {
             let pipeline = match ir {
                 IR::Draw { pipeline, .. }
                 | IR::DrawIndexed { pipeline, .. }
+                | IR::DrawIndirect { pipeline, .. }
                 | IR::CallOpaque { pipeline, .. }
                 | IR::Dispatch { pipeline, .. } => pipeline,
                 _ => continue,
@@ -686,7 +765,10 @@ impl RenderGraph {
 
             match (ir, &declared.kind) {
                 (
-                    IR::Draw { state, .. } | IR::DrawIndexed { state, .. } | IR::CallOpaque { state, .. },
+                    IR::Draw { state, .. }
+                    | IR::DrawIndexed { state, .. }
+                    | IR::DrawIndirect { state, .. }
+                    | IR::CallOpaque { state, .. },
                     PipelineKind::Graphics { variants, .. },
                 ) => {
                     if variants.contains_key(state) {
@@ -698,12 +780,18 @@ impl RenderGraph {
 
                     graphics.push((*pipeline, state.clone()));
                 },
-                (IR::Dispatch { .. }, PipelineKind::Compute { handle, .. }) => {
-                    if handle.is_some() || compute.contains(pipeline) {
+                (IR::Dispatch { specialization, .. }, PipelineKind::Compute { variants, .. }) => {
+                    if variants.contains_key(specialization) {
+                        continue;
+                    }
+                    if compute
+                        .iter()
+                        .any(|(id, pending)| id == pipeline && pending == specialization)
+                    {
                         continue;
                     }
 
-                    compute.push(*pipeline);
+                    compute.push((*pipeline, specialization.clone()));
                 },
                 (IR::Dispatch { .. }, _) => {
                     tracing::error!(%pipeline, "dispatch with a graphics pipeline bound");
@@ -723,7 +811,11 @@ impl RenderGraph {
         let device_ptr = self.device;
         let device = unsafe { device_ptr.as_ref() };
 
-        for id in graphics.iter().map(|(id, _)| *id).chain(compute.iter().copied()) {
+        for id in graphics
+            .iter()
+            .map(|(id, _)| *id)
+            .chain(compute.iter().map(|(id, _)| *id))
+        {
             let index = id.0 as usize;
             if self.pipelines[index].layout.is_some() {
                 continue;
@@ -764,7 +856,7 @@ impl RenderGraph {
         }
 
         let mut requests = Vec::with_capacity(compute.len());
-        for id in &compute {
+        for (id, specialization) in &compute {
             let declared = &self.pipelines[id.0 as usize];
             let (PipelineKind::Compute { info, .. }, Some(reflection)) = (&declared.kind, declared.reflections.first())
             else {
@@ -774,6 +866,7 @@ impl RenderGraph {
             requests.push(ComputePipelineRequest {
                 info,
                 reflection,
+                specialization,
                 layout: declared.layout_handle(),
             });
         }
@@ -782,9 +875,9 @@ impl RenderGraph {
         let handles = create_compute_pipelines(device, &requests)?;
         drop(requests);
 
-        for (id, compiled) in compute.into_iter().zip(handles) {
-            if let PipelineKind::Compute { handle, .. } = &mut self.pipelines[id.0 as usize].kind {
-                *handle = Some(compiled);
+        for ((id, specialization), handle) in compute.into_iter().zip(handles) {
+            if let PipelineKind::Compute { variants, .. } = &mut self.pipelines[id.0 as usize].kind {
+                variants.insert(specialization, handle);
             }
         }
 
@@ -934,6 +1027,7 @@ impl RenderGraph {
             let pipeline = match instruction {
                 IR::Draw { pipeline, .. }
                 | IR::DrawIndexed { pipeline, .. }
+                | IR::DrawIndirect { pipeline, .. }
                 | IR::CallOpaque { pipeline, .. }
                 | IR::Dispatch { pipeline, .. } => *pipeline,
                 _ => PipelineId::INVALID,
@@ -1516,16 +1610,30 @@ impl RenderGraph {
         self.record_push_constants(pipeline, &dynamic.push_constants)
     }
 
-    fn local_size(&self, pipeline: PipelineId) -> [u32; 3] {
-        self.pipelines
+    fn local_size(&self, pipeline: PipelineId, specialization: &Specialization) -> [u32; 3] {
+        let Some(reflection) = self
+            .pipelines
             .get(pipeline.0 as usize)
             .and_then(|declared| declared.reflections.first())
-            .map_or([1; 3], |reflection| reflection.local_size)
+        else {
+            return [1; 3];
+        };
+
+        let mut local_size = reflection.local_size;
+        for (axis, extent) in local_size.iter_mut().enumerate() {
+            let specialized = reflection.local_size_spec_ids[axis]
+                .and_then(|id| specialization.get(id))
+                .and_then(SpecValue::as_workgroup_axis);
+            if let Some(specialized) = specialized.filter(|extent| *extent > 0) {
+                *extent = specialized;
+            }
+        }
+        local_size
     }
 
-    fn groups_for(&self, invocations: [u32; 3], pipeline: PipelineId) -> [u32; 3] {
+    fn groups_for(&self, invocations: [u32; 3], pipeline: PipelineId, specialization: &Specialization) -> [u32; 3] {
         let local_size = match pipeline.is_valid() {
-            true => self.local_size(pipeline),
+            true => self.local_size(pipeline, specialization),
             false => [1; 3],
         };
         [
@@ -1535,7 +1643,9 @@ impl RenderGraph {
         ]
     }
 
-    fn prepare_dispatch(&mut self, pipeline: PipelineId, push_constants: &PushConstants) -> Result<(), vk::Result> {
+    fn prepare_dispatch(
+        &mut self, pipeline: PipelineId, specialization: &Specialization, push_constants: &PushConstants,
+    ) -> Result<(), vk::Result> {
         if pipeline.is_invalid() {
             return Err(vk::Result::ERROR_UNKNOWN);
         }
@@ -1543,7 +1653,7 @@ impl RenderGraph {
             .pipelines
             .get(pipeline.0 as usize)
             .and_then(|declared| match &declared.kind {
-                PipelineKind::Compute { handle, .. } => *handle,
+                PipelineKind::Compute { variants, .. } => variants.get(specialization).copied(),
                 PipelineKind::Graphics { .. } => None,
             })
             .ok_or(vk::Result::ERROR_UNKNOWN)?;
@@ -1970,6 +2080,55 @@ impl RenderGraph {
                 self.batch()?
                     .draw_indexed(index_count, instance_count, first_index, vertex_offset, first_instance);
             },
+            IR::DrawIndirect {
+                pass,
+                indexed,
+                buffer,
+                offset,
+                stride,
+                count,
+                pipeline,
+                state,
+                dynamic,
+            } => {
+                self.set_value(value_id, Value::Reference(*pass));
+                self.prepare_draw(*pipeline, state, dynamic, true)?;
+
+                let handle = self.get::<Buffer>(buffer).handle();
+                match count {
+                    ir::DrawCount::Fixed(draw_count) => {
+                        let draw_count = self.get::<u32>(draw_count);
+                        match indexed {
+                            true => self
+                                .batch()?
+                                .draw_indexed_indirect(handle, *offset, draw_count, *stride),
+                            false => self.batch()?.draw_indirect(handle, *offset, draw_count, *stride),
+                        }
+                    },
+                    ir::DrawCount::Indirect {
+                        buffer: counts,
+                        offset: count_offset,
+                        max,
+                    } => {
+                        let counts = self.get::<Buffer>(counts).handle();
+                        let max = self.get::<u32>(max);
+                        match indexed {
+                            true => self.batch()?.draw_indexed_indirect_count(
+                                handle,
+                                *offset,
+                                counts,
+                                *count_offset,
+                                max,
+                                *stride,
+                            ),
+                            false => {
+                                self.batch()?
+                                    .draw_indirect_count(handle, *offset, counts, *count_offset, max, *stride)
+                            },
+                        }
+                    },
+                }
+            },
             IR::CallOpaque {
                 pass,
                 body,
@@ -2031,10 +2190,11 @@ impl RenderGraph {
                 size,
                 pipeline,
                 push_constants,
+                specialization,
             } => {
                 self.set_value(value_id, Value::Reference(*pass));
                 self.ensure_batch(ctx, allocator)?;
-                self.prepare_dispatch(*pipeline, push_constants)?;
+                self.prepare_dispatch(*pipeline, specialization, push_constants)?;
 
                 match size {
                     ir::DispatchSize::Groups { x, y, z } => {
@@ -2043,7 +2203,7 @@ impl RenderGraph {
                     },
                     ir::DispatchSize::Invocations { x, y, z } => {
                         let invocations = [self.get::<u32>(x), self.get::<u32>(y), self.get::<u32>(z)];
-                        let groups = self.groups_for(invocations, *pipeline);
+                        let groups = self.groups_for(invocations, *pipeline, specialization);
                         self.batch()?.dispatch(groups[0], groups[1], groups[2]);
                     },
                     ir::DispatchSize::InvocationsPerPixel { image, scale } => {
@@ -2054,7 +2214,7 @@ impl RenderGraph {
                             scaled(extent.height as u64, scale[1]),
                             scaled(extent.depth as u64, scale[2]),
                         ];
-                        let groups = self.groups_for(invocations, *pipeline);
+                        let groups = self.groups_for(invocations, *pipeline, specialization);
                         self.batch()?.dispatch(groups[0], groups[1], groups[2]);
                     },
                     ir::DispatchSize::InvocationsPerElement {
@@ -2064,7 +2224,7 @@ impl RenderGraph {
                     } => {
                         let size = self.get::<Buffer>(buffer).size();
                         let invocations = [scaled(size / element_size.max(&1), f32::from_bits(*scale)), 1, 1];
-                        let groups = self.groups_for(invocations, *pipeline);
+                        let groups = self.groups_for(invocations, *pipeline, specialization);
                         self.batch()?.dispatch(groups[0], groups[1], groups[2]);
                     },
                     ir::DispatchSize::Indirect { buffer, offset } => {
@@ -2135,12 +2295,11 @@ impl Drop for RenderGraph {
                         unsafe { device.destroy_pipeline(*handle, None) };
                     }
                 },
-                PipelineKind::Compute {
-                    handle: Some(handle), ..
-                } => {
-                    unsafe { device.destroy_pipeline(*handle, None) };
+                PipelineKind::Compute { variants, .. } => {
+                    for handle in variants.values() {
+                        unsafe { device.destroy_pipeline(*handle, None) };
+                    }
                 },
-                PipelineKind::Compute { .. } => {},
             }
 
             if let Some(layout) = &declared.layout {

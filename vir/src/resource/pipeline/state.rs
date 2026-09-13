@@ -463,6 +463,119 @@ impl PushConstants {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SpecValue {
+    Bool(bool),
+    U32(u32),
+    I32(i32),
+    F32(u32),
+    F64(u64),
+}
+
+impl SpecValue {
+    pub const fn size(self) -> u32 {
+        match self {
+            Self::Bool(_) => size_of::<vk::Bool32>() as u32,
+            Self::U32(_) | Self::I32(_) | Self::F32(_) => 4,
+            Self::F64(_) => 8,
+        }
+    }
+
+    pub fn bytes(self) -> [u8; 8] {
+        let mut bytes = [0u8; 8];
+        match self {
+            Self::Bool(value) => bytes[..4].copy_from_slice(&vk::Bool32::from(value).to_le_bytes()),
+            Self::U32(value) | Self::F32(value) => bytes[..4].copy_from_slice(&value.to_le_bytes()),
+            Self::I32(value) => bytes[..4].copy_from_slice(&value.to_le_bytes()),
+            Self::F64(value) => bytes = value.to_le_bytes(),
+        }
+        bytes
+    }
+
+    pub fn as_workgroup_axis(self) -> Option<u32> {
+        match self {
+            Self::U32(value) => Some(value),
+            Self::I32(value) => u32::try_from(value).ok(),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for SpecValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::Bool(value) => write!(f, "{value}"),
+            Self::U32(value) => write!(f, "{value}"),
+            Self::I32(value) => write!(f, "{value}"),
+            Self::F32(bits) => write!(f, "{}", f32::from_bits(bits)),
+            Self::F64(bits) => write!(f, "{}", f64::from_bits(bits)),
+        }
+    }
+}
+
+pub trait Specializable {
+    fn spec_value(self) -> SpecValue;
+}
+
+impl Specializable for SpecValue {
+    fn spec_value(self) -> SpecValue { self }
+}
+
+impl Specializable for bool {
+    fn spec_value(self) -> SpecValue { SpecValue::Bool(self) }
+}
+
+impl Specializable for u32 {
+    fn spec_value(self) -> SpecValue { SpecValue::U32(self) }
+}
+
+impl Specializable for i32 {
+    fn spec_value(self) -> SpecValue { SpecValue::I32(self) }
+}
+
+impl Specializable for f32 {
+    fn spec_value(self) -> SpecValue { SpecValue::F32(self.to_bits()) }
+}
+
+impl Specializable for f64 {
+    fn spec_value(self) -> SpecValue { SpecValue::F64(self.to_bits()) }
+}
+
+/// The specialization constants in force, kept sorted by constant id.
+///
+/// Two pipelines built from the same shaders but different constants are different pipelines,
+/// so this is part of what a pipeline is keyed by.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct Specialization(Vec<(u32, SpecValue)>);
+
+impl Specialization {
+    pub fn is_empty(&self) -> bool { self.0.is_empty() }
+
+    pub fn get(&self, id: u32) -> Option<SpecValue> {
+        let at = self.0.binary_search_by_key(&id, |(constant, _)| *constant).ok()?;
+        Some(self.0[at].1)
+    }
+
+    pub fn set(&mut self, id: u32, value: SpecValue) {
+        match self.0.binary_search_by_key(&id, |(constant, _)| *constant) {
+            Ok(at) => self.0[at].1 = value,
+            Err(at) => self.0.insert(at, (id, value)),
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (u32, SpecValue)> + '_ { self.0.iter().copied() }
+}
+
+impl FromIterator<(u32, SpecValue)> for Specialization {
+    fn from_iter<T: IntoIterator<Item = (u32, SpecValue)>>(iter: T) -> Self {
+        let mut specialization = Self::default();
+        for (id, value) in iter {
+            specialization.set(id, value);
+        }
+        specialization
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum StateChange {
     PrimitiveTopology(vk::PrimitiveTopology),
@@ -494,6 +607,10 @@ pub enum StateChange {
         offset: u32,
         buffer: ValueId,
     },
+    SpecializationConstant {
+        id: u32,
+        value: SpecValue,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -507,6 +624,7 @@ pub struct PassState {
     pub scissors: Vec<Rect2D>,
     pub dynamic: DynamicStateFlags,
     pub push_constants: PushConstants,
+    pub specialization: Specialization,
 }
 
 impl Default for PassState {
@@ -521,6 +639,7 @@ impl Default for PassState {
             scissors: vec![Rect2D::default()],
             dynamic: DynamicStateFlags::default(),
             push_constants: PushConstants::default(),
+            specialization: Specialization::default(),
         }
     }
 }
@@ -567,6 +686,7 @@ impl PassState {
                 self.push_constants.from_variable(offset, size, source)
             },
             StateChange::PushConstantAddress { offset, buffer } => self.push_constants.address(offset, buffer),
+            StateChange::SpecializationConstant { id, value } => self.specialization.set(id, value),
         }
     }
 
@@ -596,6 +716,7 @@ impl PassState {
             viewports: Vec::new(),
             scissors: Vec::new(),
             dynamic: self.dynamic,
+            specialization: self.specialization.clone(),
         };
         let mut values = DynamicValues {
             push_constants: self.push_constants.clone(),
@@ -629,6 +750,7 @@ pub struct PipelineState {
     pub viewports: Vec<ResolvedViewport>,
     pub scissors: Vec<vk::Rect2D>,
     pub dynamic: DynamicStateFlags,
+    pub specialization: Specialization,
 }
 
 impl Default for PipelineState {
@@ -713,5 +835,49 @@ mod tests {
         assert_eq!(state, plain_state);
         assert!(plain_values.push_constants.is_empty());
         assert_eq!(values.push_constants.data, vec![1, 2, 3, 4]);
+    }
+
+    /// Unlike pushed bytes, a specialized constant is baked into the pipeline, so it has to be
+    /// part of what tells one pipeline from another.
+    #[test]
+    fn specialized_constants_are_part_of_the_permutation_key() {
+        let mut specialized = PassState::default();
+        specialized.apply(StateChange::SpecializationConstant {
+            id: 0,
+            value: SpecValue::U32(64),
+        });
+
+        let area = vk::Rect2D::default();
+        let (plain_state, _) = PassState::default().resolve(area);
+        let (state, _) = specialized.resolve(area);
+
+        assert_ne!(state, plain_state);
+        assert_eq!(state.specialization.get(0), Some(SpecValue::U32(64)));
+    }
+
+    #[test]
+    fn setting_a_constant_again_replaces_it_and_leaves_the_ids_in_order() {
+        let mut state = PassState::default();
+        for (id, value) in [(3, 1u32), (0, 2), (3, 9)] {
+            state.apply(StateChange::SpecializationConstant {
+                id,
+                value: SpecValue::U32(value),
+            });
+        }
+
+        assert_eq!(
+            state.specialization.iter().collect::<Vec<_>>(),
+            vec![(0, SpecValue::U32(2)), (3, SpecValue::U32(9))]
+        );
+    }
+
+    #[test]
+    fn a_value_is_packed_as_the_bytes_vulkan_reads() {
+        assert_eq!(SpecValue::Bool(true).size(), 4);
+        assert_eq!(&SpecValue::Bool(true).bytes()[..4], &1u32.to_le_bytes());
+        assert_eq!(&SpecValue::Bool(false).bytes()[..4], &0u32.to_le_bytes());
+        assert_eq!(&SpecValue::I32(-1).bytes()[..4], &(-1i32).to_le_bytes());
+        assert_eq!(SpecValue::F64(0).size(), 8);
+        assert_eq!(SpecValue::F64(2.5f64.to_bits()).bytes(), 2.5f64.to_le_bytes());
     }
 }
