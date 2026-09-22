@@ -1,6 +1,6 @@
 //! Uploading an image to the GPU and sampling it.
 //!
-//! Startup runs a one-shot module: staging buffer, one copy into the image, then a release into
+//! Startup runs a one-shot module: staging buffer, one copy into the image, then an export into
 //! the layout a shader read wants. The draw then binds that graph image directly to the scalar
 //! descriptor reflected from the fragment shader.
 
@@ -126,14 +126,14 @@ impl Example for Texture {
         )?;
         staging.write(0, &pixels)?;
 
-        // one module run to completion: the copy, then the release into the resting layout
+        // one module run to completion: the copy, then the export into the resting layout
         let mut module = vir::Module::default();
         let source = module.import_buffer(&staging, vir::Access::HostWrite);
         let destination = module.import_attachment(&ImageAttachment::from_image(&image, vk::ImageLayout::UNDEFINED));
         module.set_name(source, "texture staging");
         module.set_name(destination, "vir logo");
         let uploaded = module.copy_buffer_to_image(source, destination);
-        let ready = module.release(uploaded, RESTING_ACCESS, DomainFlag::Graphics);
+        let ready = module.export(uploaded, RESTING_ACCESS, DomainFlag::Graphics);
         let program = module.compile(&*setup.graph, ready)?;
         setup
             .graph

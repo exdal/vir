@@ -35,8 +35,6 @@ pub type Instr = (ValueId, IR);
 
 pub type Name = Option<Arc<str>>;
 
-pub const MAX_RESOLVE_DEPTH: usize = 256;
-
 #[derive(Clone, Copy, Default, Hash, PartialEq, Eq)]
 pub struct SourceLocation {
     #[cfg(debug_assertions)]
@@ -283,11 +281,7 @@ impl DispatchSize {
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub enum DrawCount {
     Fixed(ValueId),
-    Indirect {
-        buffer: ValueId,
-        offset: u64,
-        max: ValueId,
-    },
+    Indirect { buffer: ValueId, offset: u64, max: ValueId },
 }
 
 impl DrawCount {
@@ -351,11 +345,7 @@ pub enum IR {
         format: vk::Format,
         samples: vk::SampleCountFlags,
     },
-    Acquire {
-        resource: ValueId,
-        access: ValueId,
-    },
-    Release {
+    Export {
         resource: ValueId,
         access: ValueId,
         dst_domain: DomainFlag,
@@ -523,7 +513,7 @@ pub fn underlying_object(ir: &IR) -> UnderlyingObject {
         IR::Clear { attachment, .. } => UnderlyingObject::Forwards(*attachment),
         IR::Blit { dst, .. } => UnderlyingObject::Forwards(*dst),
         IR::CopyBufferToImage { image, .. } => UnderlyingObject::Forwards(*image),
-        IR::Acquire { resource, .. } | IR::Release { resource, .. } => UnderlyingObject::Forwards(*resource),
+        IR::Export { resource, .. } => UnderlyingObject::Forwards(*resource),
 
         IR::PassResult { resource, .. } => UnderlyingObject::Forwards(*resource),
 
@@ -557,6 +547,100 @@ pub fn underlying_object(ir: &IR) -> UnderlyingObject {
         | IR::Return
         | IR::MemoryBarrier { .. }
         | IR::ImageBarrier { .. } => UnderlyingObject::None,
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ResourceResolution {
+    pub root: ValueId,
+    pub base: Option<ValueId>,
+    pub through_array: bool,
+}
+
+impl ResourceResolution {
+    fn unknown(id: ValueId) -> Self {
+        Self {
+            root: id,
+            base: None,
+            through_array: false,
+        }
+    }
+
+    pub fn for_instruction(id: ValueId, ir: &IR, lookup: impl FnOnce(ValueId) -> Option<Self>) -> Self {
+        match underlying_object(ir) {
+            UnderlyingObject::Base => Self {
+                root: id,
+                base: Some(id),
+                through_array: false,
+            },
+            UnderlyingObject::Forwards(next) => lookup(next).unwrap_or_else(|| Self::unknown(next)),
+            UnderlyingObject::Element(next) => Self {
+                root: id,
+                base: lookup(next).and_then(|resolution| resolution.base),
+                through_array: true,
+            },
+            UnderlyingObject::None => Self::unknown(id),
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct ResourceIndex<'a> {
+    values: HashMap<ValueId, &'a IR>,
+    resolutions: HashMap<ValueId, ResourceResolution>,
+}
+
+impl<'a> ResourceIndex<'a> {
+    pub fn new(instructions: &'a [Instr]) -> Self {
+        let values: HashMap<_, _> = instructions.iter().map(|(id, ir)| (*id, ir)).collect();
+        let mut resolutions = HashMap::with_capacity(values.len());
+
+        for &start in values.keys() {
+            let mut current = start;
+            let mut pending = Vec::new();
+            let mut seen = HashSet::new();
+
+            loop {
+                if resolutions.contains_key(&current) {
+                    break;
+                }
+
+                if !seen.insert(current) {
+                    resolutions.insert(current, ResourceResolution::unknown(current));
+                    break;
+                }
+
+                let Some(&ir) = values.get(&current) else {
+                    resolutions.insert(current, ResourceResolution::unknown(current));
+                    break;
+                };
+
+                match underlying_object(ir) {
+                    UnderlyingObject::Forwards(next) | UnderlyingObject::Element(next) => {
+                        pending.push((current, ir));
+                        current = next;
+                    },
+                    _ => {
+                        resolutions.insert(current, ResourceResolution::for_instruction(current, ir, |_| None));
+                        break;
+                    },
+                }
+            }
+
+            for (id, ir) in pending.into_iter().rev() {
+                let resolution = ResourceResolution::for_instruction(id, ir, |next| resolutions.get(&next).copied());
+                resolutions.insert(id, resolution);
+            }
+        }
+
+        Self { values, resolutions }
+    }
+
+    pub fn get(&self, id: ValueId) -> Option<&'a IR> { self.values.get(&id).copied() }
+
+    pub fn resolve(&self, id: ValueId) -> Option<(ResourceResolution, &'a IR)> {
+        let resolution = *self.resolutions.get(&id)?;
+        Some((resolution, self.get(resolution.base?)?))
     }
 }
 
@@ -644,8 +728,7 @@ impl IR {
             IR::ConstructBuffer { .. } | IR::ConstructImage { .. } | IR::SwapchainImage { .. } => SideEffect::Defines,
             IR::AcquireNextImage { .. } => SideEffect::Defines | SideEffect::External,
 
-            IR::Acquire { .. } => SideEffect::Memory | SideEffect::Sync,
-            IR::Release { .. } => SideEffect::Memory | SideEffect::Sync | SideEffect::External,
+            IR::Export { .. } => SideEffect::Memory | SideEffect::Sync | SideEffect::External,
 
             IR::Clear { .. } => SideEffect::Write | SideEffect::Command,
             IR::Blit { .. } | IR::CopyBufferToImage { .. } => SideEffect::Memory | SideEffect::Command,
@@ -756,7 +839,7 @@ impl IR {
                 visit(*swapchain);
                 visit(*acquire);
             },
-            IR::Acquire { resource, access } | IR::Release { resource, access, .. } => {
+            IR::Export { resource, access, .. } => {
                 visit(*resource);
                 visit(*access);
             },
@@ -930,7 +1013,7 @@ impl IR {
         };
 
         match self {
-            IR::Acquire { resource, access } | IR::Release { resource, access, .. } => visit(ResourceSideEffect {
+            IR::Export { resource, access, .. } => visit(ResourceSideEffect {
                 resource: *resource,
                 access: SideEffectAccess::Operand(*access),
             }),
@@ -988,7 +1071,7 @@ impl IR {
 
 #[derive(Default)]
 pub struct Symbols<'a> {
-    values: HashMap<ValueId, &'a IR>,
+    resources: ResourceIndex<'a>,
     bound: HashSet<ValueId>,
     inline_constants: bool,
 }
@@ -1008,7 +1091,7 @@ impl<'a> Symbols<'a> {
         instructions: &'a [Instr], bound: impl IntoIterator<Item = ValueId>, inline_constants: bool,
     ) -> Self {
         Self {
-            values: instructions.iter().map(|(id, ir)| (*id, ir)).collect(),
+            resources: ResourceIndex::new(instructions),
             bound: bound.into_iter().collect(),
             inline_constants,
         }
@@ -1018,7 +1101,7 @@ impl<'a> Symbols<'a> {
     /// allocates or one whose handle was written into it.
     fn is_bound(&self, id: ValueId) -> bool { self.bound.contains(&id) }
 
-    fn get(&self, id: ValueId) -> Option<&'a IR> { self.values.get(&id).copied() }
+    fn get(&self, id: ValueId) -> Option<&'a IR> { self.resources.get(id) }
 
     fn constant(&self, id: ValueId) -> Option<&'a Constant> {
         match self.get(id)? {
@@ -1055,23 +1138,8 @@ impl<'a> Symbols<'a> {
     fn resource(&self, id: ValueId) -> Option<&'a IR> { self.resolve(id).map(|(ir, _)| ir) }
 
     fn resolve(&self, id: ValueId) -> Option<(&'a IR, bool)> {
-        let mut id = id;
-        let mut through_array = false;
-
-        for _ in 0..MAX_RESOLVE_DEPTH {
-            let ir = self.get(id)?;
-            id = match underlying_object(ir) {
-                UnderlyingObject::Base => return Some((ir, through_array)),
-                UnderlyingObject::Forwards(next) => next,
-                UnderlyingObject::Element(next) => {
-                    through_array = true;
-                    next
-                },
-                UnderlyingObject::None => return None,
-            };
-        }
-
-        None
+        let (resolution, ir) = self.resources.resolve(id)?;
+        Some((ir, resolution.through_array))
     }
 
     pub fn name(&self, id: ValueId) -> Option<&str> {
@@ -1490,16 +1558,13 @@ impl IR {
                     false => Ok(()),
                 }
             },
-            IR::Acquire { resource, access } => {
-                write!(f, "acquire {} access={}", p.operand(*resource), p.operand(*access))
-            },
-            IR::Release {
+            IR::Export {
                 resource,
                 access,
                 dst_domain,
             } => write!(
                 f,
-                "release {} access={} domain={}",
+                "export {} access={} domain={}",
                 p.operand(*resource),
                 p.operand(*access),
                 fmt_flags(*dst_domain)
@@ -2174,7 +2239,7 @@ mod tests {
             (value(0), IR::Constant(Constant::Access(Access::Present))),
             (
                 value(1),
-                IR::Release {
+                IR::Export {
                     resource: value(2),
                     access: value(0),
                     dst_domain: DomainFlag::empty(),

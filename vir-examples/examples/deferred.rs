@@ -386,7 +386,7 @@ impl Deferred {
     }
 
     /// Uploads every material image in one go: a staging buffer and a copy each, then a single
-    /// release apiece into the layout a sample wants.
+    /// export apiece into the layout a sample wants.
     fn upload_textures(setup: &mut Setup, images: &[ImageData]) -> Result<Vec<Texture>, vk::Result> {
         if images.is_empty() {
             return Ok(Vec::new());
@@ -418,7 +418,7 @@ impl Deferred {
             module.set_name(destination, "material texture");
 
             let copied = module.copy_buffer_to_image(source, destination);
-            roots.push(module.release(copied, TEXTURE_RESTING, DomainFlag::Graphics));
+            roots.push(module.export(copied, TEXTURE_RESTING, DomainFlag::Graphics));
 
             tracing::debug!(
                 index,

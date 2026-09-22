@@ -319,6 +319,7 @@ pub struct Module {
     types: HashMap<ir::Type, ValueId>,
     constants: HashMap<ir::Constant, ValueId>,
     instructions: Vec<IR>,
+    resolutions: Vec<ir::ResourceResolution>,
     variables: Vec<Variable>,
     variable_ids: Vec<ValueId>,
     blocks: Vec<Block>,
@@ -335,6 +336,7 @@ impl Default for Module {
             types: HashMap::default(),
             constants: HashMap::default(),
             instructions: Vec::new(),
+            resolutions: Vec::new(),
             variables: Vec::new(),
             variable_ids: Vec::new(),
             blocks: vec![Block {
@@ -371,7 +373,10 @@ impl Module {
     fn emit(&mut self, ir: IR) -> ValueId {
         let id = ValueId(self.instructions.len() as u32);
         assert!(id.is_valid(), "exhausted valid ValueId values");
+        let resolution =
+            ir::ResourceResolution::for_instruction(id, &ir, |next| self.resolutions.get(next.0 as usize).copied());
         self.instructions.push(ir);
+        self.resolutions.push(resolution);
         self.instruction_block.push(self.current_block);
         id
     }
@@ -770,9 +775,9 @@ impl Module {
         self.acquire_next_image_from(variable, swapchain.format(), swapchain.samples())
     }
 
-    pub fn release(&mut self, resource: ValueId, access: Access, dst_domain: DomainFlag) -> ValueId {
+    pub fn export(&mut self, resource: ValueId, access: Access, dst_domain: DomainFlag) -> ValueId {
         let access = self.lower_access(access);
-        self.emit(IR::Release {
+        self.emit(IR::Export {
             resource,
             access,
             dst_domain,
@@ -780,7 +785,7 @@ impl Module {
     }
 
     pub fn present(&mut self, attachment: ValueId) -> ValueId {
-        self.release(attachment, Access::Present, DomainFlag::Present)
+        self.export(attachment, Access::Present, DomainFlag::Present)
     }
 
     pub fn blit(&mut self, src: ValueId, dst: ValueId) -> ValueId { self.blit_filtered(src, dst, vk::Filter::LINEAR) }
@@ -1009,11 +1014,7 @@ impl Module {
                         stack.push(*index);
                         stack.push(*array);
                     },
-                    IR::Acquire { access, resource, .. } => {
-                        stack.push(*access);
-                        stack.push(*resource);
-                    },
-                    IR::Release { access, resource, .. } => {
+                    IR::Export { access, resource, .. } => {
                         stack.push(*access);
                         stack.push(*resource);
                     },
@@ -1659,10 +1660,6 @@ impl Module {
                     buffer_states.insert(value_id, BufferState { last_access, access });
                 },
 
-                IR::Acquire { resource, access } => {
-                    transition!(*resource, *access, resolve_access(access));
-                },
-
                 IR::Clear { attachment, .. } => {
                     let access_id = emit_access!(Access::Clear);
                     transition!(*attachment, access_id, Access::Clear);
@@ -1749,8 +1746,15 @@ impl Module {
                     }
                 },
 
-                IR::Release { resource, access, .. } => {
-                    transition!(*resource, *access, resolve_access(access));
+                IR::Export { resource, access, .. } => {
+                    let access_value = resolve_access(access);
+                    for element in self.resource_elements(*resource) {
+                        if self.is_buffer(element) {
+                            buffer_barrier!(self.resource_root(element), access_value);
+                        } else {
+                            transition!(element, *access, access_value);
+                        }
+                    }
                 },
 
                 _ => {},
@@ -1782,48 +1786,21 @@ impl Module {
     }
 
     fn resource_elements(&self, resource: ValueId) -> Vec<ValueId> {
-        fn append(module: &Module, resource: ValueId, result: &mut Vec<ValueId>) {
-            let mut current = resource;
-            for _ in 0..ir::MAX_RESOLVE_DEPTH {
-                let Some(instruction) = module.instructions.get(current.0 as usize) else {
-                    break;
-                };
-                match instruction {
-                    IR::Array { elements, .. } => {
-                        for element in elements {
-                            append(module, *element, result);
-                        }
-                        return;
-                    },
-                    _ => match ir::underlying_object(instruction) {
-                        ir::UnderlyingObject::Forwards(next) => current = next,
-                        _ => break,
-                    },
-                }
-            }
-            result.push(resource);
-        }
-
+        let mut pending = vec![resource];
         let mut result = Vec::new();
-        append(self, resource, &mut result);
+        while let Some(value) = pending.pop() {
+            match self.instructions.get(self.resource_root(value).0 as usize) {
+                Some(IR::Array { elements, .. }) => pending.extend(elements.iter().rev().copied()),
+                _ => result.push(value),
+            }
+        }
         result
     }
 
     fn resource_root(&self, id: ValueId) -> ValueId {
-        let mut id = id;
-
-        for _ in 0..ir::MAX_RESOLVE_DEPTH {
-            let Some(ir) = self.instructions.get(id.0 as usize) else {
-                return id;
-            };
-
-            match ir::underlying_object(ir) {
-                ir::UnderlyingObject::Forwards(next) => id = next,
-                _ => return id,
-            }
-        }
-
-        id
+        self.resolutions
+            .get(id.0 as usize)
+            .map_or(id, |resolution| resolution.root)
     }
 
     fn infer_usage(&self, nodes: &mut [ir::Instr]) {
@@ -1907,6 +1884,15 @@ impl Module {
                         used(&counts, vk::BufferUsageFlags::INDIRECT_BUFFER);
                     }
                 },
+                IR::Export { resource, access, .. } => {
+                    if let Some(access) = access_of(access) {
+                        for resource in self.resource_elements(*resource) {
+                            if self.is_buffer(resource) {
+                                used(&resource, vk::BufferUsageFlags::from(access));
+                            }
+                        }
+                    }
+                },
                 // a pushed address is the only thing that says a shader reaches the buffer
                 // through a pointer rather than through a binding. the state changes have not
                 // been folded into the draws and dispatches yet, so this reads them where they
@@ -1941,18 +1927,8 @@ impl Module {
     }
 
     fn resolve_resource(&self, id: ValueId) -> Option<&IR> {
-        let mut id = id;
-
-        for _ in 0..ir::MAX_RESOLVE_DEPTH {
-            let ir = self.instructions.get(id.0 as usize)?;
-            id = match ir::underlying_object(ir) {
-                ir::UnderlyingObject::Base => return Some(ir),
-                ir::UnderlyingObject::Forwards(next) | ir::UnderlyingObject::Element(next) => next,
-                ir::UnderlyingObject::None => return None,
-            };
-        }
-
-        None
+        let base = self.resolutions.get(id.0 as usize)?.base?;
+        self.instructions.get(base.0 as usize)
     }
 
     fn variable_bytes_size(&self, id: ValueId) -> Option<u32> {
@@ -3222,16 +3198,106 @@ mod tests {
     }
 
     #[test]
-    fn a_release_to_the_layout_an_image_already_rests_in_costs_nothing() {
+    fn an_imported_buffer_can_be_exported_without_changing_its_access() {
+        let mut module = Module::default();
+        let buffer = module.import_buffer(&Buffer::default(), Access::ComputeRead);
+        let exported = module.export(buffer, Access::ComputeRead, DomainFlag::Compute);
+
+        let compiled = module.compile(&Unchecked, exported).unwrap();
+        assert_eq!(module.resource_root(exported), buffer);
+        assert!(matches!(
+            module.resolve_resource(exported),
+            Some(IR::ConstructBuffer { .. })
+        ));
+        assert!(memory_barriers(&module, &compiled).is_empty(), "{}", compiled.dump());
+        assert!(image_barriers(&module, &compiled).is_empty(), "{}", compiled.dump());
+        assert!(
+            compiled
+                .instructions()
+                .iter()
+                .any(|(id, ir)| *id == exported && matches!(ir, IR::Export { .. }))
+        );
+    }
+
+    #[test]
+    fn exporting_an_imported_buffer_after_a_write_emits_a_memory_barrier() {
+        let mut module = Module::default();
+        let buffer = module.import_buffer(&Buffer::default(), Access::HostWrite);
+        let [written] = module
+            .begin_compute([(buffer, Access::ComputeWrite)])
+            .bind_compute_pipeline(PipelineId(0))
+            .dispatch(1, 1, 1)
+            .end_compute();
+        let exported = module.export(written, Access::HostRead, DomainFlag::Compute);
+
+        let compiled = module.compile(&Unchecked, exported).unwrap();
+        assert_eq!(module.resource_root(exported), buffer);
+        assert_eq!(
+            memory_barriers(&module, &compiled),
+            vec![
+                (Access::HostWrite, Access::ComputeWrite),
+                (Access::ComputeWrite, Access::HostRead),
+            ],
+            "{}",
+            compiled.dump()
+        );
+        assert!(image_barriers(&module, &compiled).is_empty(), "{}", compiled.dump());
+    }
+
+    #[test]
+    fn exporting_a_transient_buffer_infers_the_external_access_usage() {
+        let mut module = Module::default();
+        let buffer = module.transient_buffer(&BufferInfo::new(
+            64,
+            vk::BufferUsageFlags::empty(),
+            MemoryLocation::GpuOnly,
+        ));
+        let exported = module.export(buffer, Access::CopyRead, DomainFlag::Transfer);
+
+        let compiled = module.compile(&Unchecked, exported).unwrap();
+        let usage = compiled
+            .instructions()
+            .iter()
+            .find_map(|(id, ir)| match ir {
+                IR::ConstructBuffer { usage, .. } if *id == buffer => Some(*usage),
+                _ => None,
+            })
+            .unwrap();
+        assert!(usage.contains(vk::BufferUsageFlags::TRANSFER_SRC));
+    }
+
+    #[test]
+    fn resource_lookups_resolve_an_export_chain_longer_than_the_old_limit() {
+        let mut module = Module::default();
+        let buffer = module.import_buffer(&Buffer::default(), Access::ComputeRead);
+        module.set_name(buffer, "input");
+        let mut exported = buffer;
+        for _ in 0..300 {
+            exported = module.export(exported, Access::ComputeRead, DomainFlag::Compute);
+        }
+
+        assert_eq!(module.resource_root(exported), buffer);
+        assert!(matches!(
+            module.resolve_resource(exported),
+            Some(IR::ConstructBuffer { .. })
+        ));
+        let compiled = module.compile(&Unchecked, exported).unwrap();
+        let symbols = ir::Symbols::new(compiled.instructions());
+        assert_eq!(symbols.name(exported), Some("input"));
+        assert!(memory_barriers(&module, &compiled).is_empty(), "{}", compiled.dump());
+    }
+
+    #[test]
+    fn an_export_to_the_layout_an_image_already_rests_in_costs_nothing() {
         let (mut module, destination) = module_with_attachment();
         let source = module.transient_image(&transient_info());
         let blit = module.blit(source, destination);
 
         let present = module.present(blit);
-        let resting = module.release(source, Access::BlitRead, DomainFlag::Graphics);
+        let resting = module.export(source, Access::BlitRead, DomainFlag::Graphics);
         let compiled = module.compile_all(&Unchecked, &[present, resting]).unwrap();
 
-        // nothing consumes the release, so only naming it as a root keeps it
+        // nothing consumes the export, so only naming it as a root keeps it
         let position = |id: ValueId| compiled.instructions().iter().position(|(instr_id, _)| *instr_id == id);
         assert!(position(resting) > position(blit));
         assert!(
@@ -3249,13 +3315,13 @@ mod tests {
     }
 
     #[test]
-    fn a_release_that_does_change_the_layout_still_emits_its_barrier() {
+    fn an_export_that_does_change_the_layout_still_emits_its_barrier() {
         let (mut module, destination) = module_with_attachment();
         let source = module.transient_image(&transient_info());
         let blit = module.blit(source, destination);
 
         let present = module.present(blit);
-        let resting = module.release(source, Access::ColorRW, DomainFlag::Graphics);
+        let resting = module.export(source, Access::ColorRW, DomainFlag::Graphics);
         let compiled = module.compile_all(&Unchecked, &[present, resting]).unwrap();
 
         let barriers = image_barriers(&module, &compiled);
@@ -6157,7 +6223,7 @@ mod tests {
             |_| target,
         );
 
-        let end = module.release(drawn, Access::Present, DomainFlag::Present);
+        let end = module.export(drawn, Access::Present, DomainFlag::Present);
         let compiled = module.compile(&Unchecked, end).unwrap();
         let (merge, _, skipped) = selection_labels(&compiled);
         let caught_up = compiled.instructions()[block_at(&compiled, skipped)..block_at(&compiled, merge)]

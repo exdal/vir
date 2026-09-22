@@ -8,7 +8,7 @@ use crate::{
     PipelineId,
     Program,
     ValueId,
-    graph::ir::{Descriptor, Instr, MAX_RESOLVE_DEPTH, UnderlyingObject, underlying_object},
+    graph::ir::{Descriptor, ResourceIndex},
 };
 
 /// Where the analyzer reads what a program's pipelines declare, as their shaders were reflected.
@@ -100,6 +100,7 @@ impl Table {
 }
 
 pub(crate) fn analyze_descriptors(program: &Program, pipelines: &impl PipelineBindings) -> Result<(), vk::Result> {
+    let resources = ResourceIndex::new(program.instructions());
     let mut table = Table::default();
     let mut failed = false;
 
@@ -115,7 +116,7 @@ pub(crate) fn analyze_descriptors(program: &Program, pipelines: &impl PipelineBi
                 descriptor_type,
                 ..
             } => {
-                failed |= !write_is_sound(program, value_id, &table, *set, *binding, descriptor);
+                failed |= !write_is_sound(&resources, value_id, &table, *set, *binding, descriptor);
                 table
                     .written
                     .insert((*set, *binding), (*value_id, *descriptor, *descriptor_type));
@@ -143,7 +144,7 @@ pub(crate) fn analyze_descriptors(program: &Program, pipelines: &impl PipelineBi
 }
 
 fn write_is_sound(
-    program: &Program, value_id: &ValueId, table: &Table, set: u32, binding: u32, descriptor: &Descriptor,
+    resources: &ResourceIndex<'_>, value_id: &ValueId, table: &Table, set: u32, binding: u32, descriptor: &Descriptor,
 ) -> bool {
     if !table.open {
         tracing::error!(%value_id, set, binding, "a descriptor is written outside of any pass");
@@ -151,14 +152,14 @@ fn write_is_sound(
     }
 
     if let Some(image) = descriptor.image()
-        && !names_an_image(program.instructions(), image)
+        && !names_an_image(resources, image)
     {
         tracing::error!(%value_id, set, binding, %image, "an image descriptor names a value that is not an image");
         return false;
     }
 
     if let Some(buffer) = descriptor.buffer()
-        && !names_a_buffer(program.instructions(), buffer)
+        && !names_a_buffer(resources, buffer)
     {
         tracing::error!(
             %value_id,
@@ -276,32 +277,18 @@ fn descriptors_are_compatible_with_pipeline(
     sound
 }
 
-fn names_an_image(instructions: &[Instr], id: ValueId) -> bool {
-    names_a_resource(instructions, id, |ir| {
+fn names_an_image(resources: &ResourceIndex<'_>, id: ValueId) -> bool {
+    names_a_resource(resources, id, |ir| {
         matches!(ir, IR::ConstructImage { .. } | IR::SwapchainImage { .. })
     })
 }
 
-fn names_a_buffer(instructions: &[Instr], id: ValueId) -> bool {
-    names_a_resource(instructions, id, |ir| matches!(ir, IR::ConstructBuffer { .. }))
+fn names_a_buffer(resources: &ResourceIndex<'_>, id: ValueId) -> bool {
+    names_a_resource(resources, id, |ir| matches!(ir, IR::ConstructBuffer { .. }))
 }
 
-fn names_a_resource(instructions: &[Instr], id: ValueId, is_base: fn(&IR) -> bool) -> bool {
-    let mut id = id;
-
-    for _ in 0..MAX_RESOLVE_DEPTH {
-        let Some((_, ir)) = instructions.iter().find(|(instr, _)| *instr == id) else {
-            return false;
-        };
-
-        id = match underlying_object(ir) {
-            UnderlyingObject::Base => return is_base(ir),
-            UnderlyingObject::Forwards(next) | UnderlyingObject::Element(next) => next,
-            UnderlyingObject::None => return false,
-        };
-    }
-
-    false
+fn names_a_resource(resources: &ResourceIndex<'_>, id: ValueId, is_base: fn(&IR) -> bool) -> bool {
+    resources.resolve(id).is_some_and(|(_, ir)| is_base(ir))
 }
 
 #[cfg(test)]
@@ -390,6 +377,34 @@ mod tests {
         });
 
         assert!(module.compile(&combined, end).is_ok());
+    }
+
+    #[test]
+    fn a_buffer_descriptor_resolves_through_more_than_256_exports() {
+        let mut module = Module::default();
+        let attachment = target(&mut module);
+        let buffer = module.transient_buffer(&BufferInfo::new(
+            256,
+            vk::BufferUsageFlags::empty(),
+            MemoryLocation::GpuOnly,
+        ));
+        let mut forwarded = buffer;
+        for _ in 0..300 {
+            forwarded = module.export(forwarded, Access::FragmentUniformRead, crate::DomainFlag::Graphics);
+        }
+
+        module
+            .begin_rendering([(attachment, Access::ColorRW)])
+            .bind_graphics_pipeline(PipelineId(0));
+        module.bind_buffer(0, 0, forwarded);
+        let end = module.draw(3, 1).end_rendering::<1>()[0];
+        let declared = Declared::with_access(
+            &[(0, 0, vk::DescriptorType::UNIFORM_BUFFER)],
+            vk::ShaderStageFlags::FRAGMENT,
+            Access::FragmentUniformRead,
+        );
+
+        assert!(module.compile(&declared, end).is_ok());
     }
 
     #[test]

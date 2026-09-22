@@ -551,7 +551,7 @@ impl EguiPass {
 
         let roots = values
             .iter()
-            .map(|(_, value)| module.release(*value, TEXTURE_RESTING, vir::DomainFlag::Graphics))
+            .map(|(_, value)| module.export(*value, TEXTURE_RESTING, vir::DomainFlag::Graphics))
             .collect::<Vec<_>>();
         let program = module.compile_all(&*graph, &roots)?;
         graph.execute_blocking(ctx, &program, &mut AllocatorKind::Frame(allocator))?;

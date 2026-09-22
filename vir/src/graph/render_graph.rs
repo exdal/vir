@@ -616,6 +616,25 @@ impl Recorder<'_> {
     }
 }
 
+fn canonical_value_id(values: &[Value], id: ValueId) -> ValueId {
+    match values.get(id.0 as usize) {
+        Some(Value::Reference(root)) => *root,
+        _ => id,
+    }
+}
+
+fn set_runtime_value(values: &mut Vec<Value>, id: ValueId, value: Value) {
+    let value = match value {
+        Value::Reference(target) => Value::Reference(canonical_value_id(values, target)),
+        value => value,
+    };
+    let index = id.0 as usize;
+    if index >= values.len() {
+        values.resize(index + 1, Value::None);
+    }
+    values[index] = value;
+}
+
 pub struct RenderGraph {
     device: NonNull<ash::Device>,
     pipelines: Vec<DeclaredPipeline>,
@@ -926,55 +945,25 @@ impl RenderGraph {
         Ok(())
     }
 
-    fn set_value(&mut self, value_id: &ValueId, value: Value) {
-        let index = value_id.0 as usize;
-        if index >= self.values.len() {
-            self.values.resize(index + 1, Value::None);
-        }
-        self.values[index] = value;
-    }
+    fn set_value(&mut self, value_id: &ValueId, value: Value) { set_runtime_value(&mut self.values, *value_id, value); }
 
-    fn get<T: FromValue>(&self, id: &ValueId) -> T {
-        match self.get_value(id) {
-            Value::Reference(v) => self.get::<T>(v),
-            value => T::from_value(value),
-        }
-    }
+    fn get<T: FromValue>(&self, id: &ValueId) -> T { T::from_value(self.get_value(&self.resolve_id(id))) }
 
     fn resource_elements(&self, resource: &ValueId) -> Vec<ValueId> {
-        fn append(graph: &RenderGraph, resource: ValueId, result: &mut Vec<ValueId>) {
-            let mut current = resource;
-            for _ in 0..ir::MAX_RESOLVE_DEPTH {
-                match graph.get_value(&current) {
-                    Value::Reference(next) => current = *next,
-                    Value::Slice(elements) => {
-                        for element in elements {
-                            append(graph, *element, result);
-                        }
-                        return;
-                    },
-                    _ => {
-                        result.push(resource);
-                        return;
-                    },
-                }
-            }
-            result.push(resource);
-        }
-
+        let mut pending = vec![*resource];
         let mut result = Vec::new();
-        append(self, *resource, &mut result);
+        while let Some(value) = pending.pop() {
+            match self.get_value(&self.resolve_id(&value)) {
+                Value::Slice(elements) => pending.extend(elements.iter().rev().copied()),
+                _ => result.push(value),
+            }
+        }
         result
     }
 
     fn get_value(&self, value_id: &ValueId) -> &Value { self.values.get(value_id.0 as usize).unwrap() }
 
-    fn resolve_id(&self, value_id: &ValueId) -> ValueId {
-        match self.get_value(value_id) {
-            Value::Reference(inner) => self.resolve_id(inner),
-            _ => *value_id,
-        }
-    }
+    fn resolve_id(&self, value_id: &ValueId) -> ValueId { canonical_value_id(&self.values, *value_id) }
 
     fn device(&self) -> &ash::Device { unsafe { self.device.as_ref() } }
 
@@ -1816,8 +1805,7 @@ impl RenderGraph {
                 );
                 self.set_value(value_id, Value::ImageAttachment(attachment));
             },
-            IR::Acquire { .. } => todo!(),
-            IR::Release {
+            IR::Export {
                 resource,
                 access,
                 dst_domain,
@@ -1840,6 +1828,7 @@ impl RenderGraph {
                 } else if *dst_domain != self.current_submit.domain {
                     self.flush_submit(None)?;
                 }
+                self.set_value(value_id, Value::Reference(*resource));
             },
             IR::Clear { attachment, color } => {
                 self.ensure_batch(ctx, allocator)?;
@@ -2312,6 +2301,18 @@ impl Drop for RenderGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_references_are_canonicalized_across_long_chains() {
+        let mut values = Vec::new();
+        set_runtime_value(&mut values, ValueId(0), Value::Buffer(Buffer::default()));
+        for id in 1..=300 {
+            set_runtime_value(&mut values, ValueId(id), Value::Reference(ValueId(id - 1)));
+        }
+
+        assert!(matches!(values[300], Value::Reference(ValueId(0))));
+        assert_eq!(canonical_value_id(&values, ValueId(300)), ValueId(0));
+    }
 
     #[test]
     fn resolved_descriptor_payloads_support_every_reflected_scalar_type() {

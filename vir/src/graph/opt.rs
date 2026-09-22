@@ -407,7 +407,7 @@ mod tests {
         // that skips the second pass is not asked to bring it anywhere
         let drawn = draw_into(&mut module, target);
         let maybe = module.set_condition(enabled, move |m| draw_into(m, drawn), move |_| drawn);
-        let end = module.release(maybe, Access::BlitRead, DomainFlag::Graphics);
+        let end = module.export(maybe, Access::BlitRead, DomainFlag::Graphics);
 
         let compiled = module.compile(&Unchecked, end).unwrap();
         let dump = compiled.dump();
@@ -439,7 +439,7 @@ mod tests {
         let enabled = module.declare_bool_var("enabled", true);
 
         let drawn = module.set_condition(enabled, move |m| draw_into(m, target), move |_| target);
-        let end = module.release(drawn, Access::BlitRead, DomainFlag::Graphics);
+        let end = module.export(drawn, Access::BlitRead, DomainFlag::Graphics);
 
         let compiled = module.compile(&Unchecked, end).unwrap();
         let dump = compiled.dump();
@@ -461,7 +461,7 @@ mod tests {
 
         let drawn = draw_into(&mut module, target);
         let maybe = module.set_condition(enabled, move |_| drawn, move |_| drawn);
-        let end = module.release(maybe, Access::BlitRead, DomainFlag::Graphics);
+        let end = module.export(maybe, Access::BlitRead, DomainFlag::Graphics);
 
         let compiled = module.compile(&Unchecked, end).unwrap();
         let dump = compiled.dump();
@@ -492,7 +492,7 @@ mod tests {
         let enabled = module.declare_bool_var("enabled", true);
 
         let chosen = module.set_condition(enabled, move |_| first, move |_| second);
-        let end = module.release(chosen, Access::BlitRead, DomainFlag::Graphics);
+        let end = module.export(chosen, Access::BlitRead, DomainFlag::Graphics);
 
         let compiled = module.compile(&Unchecked, end).unwrap();
         let dump = compiled.dump();
@@ -518,7 +518,7 @@ mod tests {
             .bind_index_buffer(indices, vk::IndexType::UINT32)
             .draw(3, 1)
             .end_rendering::<1>()[0];
-        let end = module.release(drawn, Access::BlitRead, DomainFlag::Graphics);
+        let end = module.export(drawn, Access::BlitRead, DomainFlag::Graphics);
 
         let compiled = module.compile(&Unchecked, end).unwrap();
         assert_eq!(
@@ -550,7 +550,7 @@ mod tests {
             .bind_index_buffer(indices, vk::IndexType::UINT32)
             .draw(3, 1)
             .end_rendering::<1>()[0];
-        let end = module.release(second, Access::BlitRead, DomainFlag::Graphics);
+        let end = module.export(second, Access::BlitRead, DomainFlag::Graphics);
 
         let compiled = module.compile(&Unchecked, end).unwrap();
         assert_eq!(

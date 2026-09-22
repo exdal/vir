@@ -485,7 +485,7 @@ mod tests {
         let animate = module.declare_bool_var("animate", true);
         let color = module.declare_clear_var("hue", crate::clear::f32::BLACK);
         let cleared = module.set_condition(animate, |m| m.clear_from(target, color), |_| target);
-        let end = module.release(cleared, crate::Access::BlitRead, crate::DomainFlag::Graphics);
+        let end = module.export(cleared, crate::Access::BlitRead, crate::DomainFlag::Graphics);
 
         let dump = module.compile(&Unchecked, end).unwrap().dump();
         assert!(dump.contains("4 blocks"), "{dump}");
