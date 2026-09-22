@@ -103,10 +103,25 @@ impl Context {
     }
 
     pub fn create_persistent_allocator(&self) -> PersistentAllocator {
-        PersistentAllocator::new(NonNull::from(self.device.as_ref()), self.memory.clone())
+        let limits = unsafe { self.instance.get_physical_device_properties(self.physical_device) }.limits;
+        let queue_families = self.command_queues.iter().map(CommandQueue::family_index).collect();
+        PersistentAllocator::new(
+            NonNull::from(self.device.as_ref()),
+            self.memory.clone(),
+            limits,
+            queue_families,
+        )
     }
 
     pub fn create_super_frame_allocator(&self, frame_count: usize) -> SuperFrameAllocator {
-        SuperFrameAllocator::new(NonNull::from(self.device.as_ref()), self.memory.clone(), frame_count)
+        let limits = unsafe { self.instance.get_physical_device_properties(self.physical_device) }.limits;
+        let queue_families = self.command_queues.iter().map(CommandQueue::family_index).collect();
+        SuperFrameAllocator::new(
+            NonNull::from(self.device.as_ref()),
+            self.memory.clone(),
+            limits,
+            queue_families,
+            frame_count,
+        )
     }
 }

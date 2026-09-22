@@ -248,6 +248,7 @@ enum ResolvedDescriptorValue {
     Buffer {
         buffer: vk::Buffer,
         buffer_size: u64,
+        base_offset: u64,
         offset: u64,
         range: u64,
     },
@@ -282,6 +283,32 @@ impl ResolvedDescriptorValue {
         }
     }
 
+    fn buffer_info(self) -> Option<vk::DescriptorBufferInfo> {
+        let Self::Buffer {
+            buffer,
+            buffer_size,
+            base_offset,
+            offset,
+            range,
+        } = self
+        else {
+            return None;
+        };
+        let absolute_offset = base_offset.checked_add(offset)?;
+        let range = if range == vk::WHOLE_SIZE {
+            buffer_size.checked_sub(offset)?
+        } else {
+            range
+        };
+        absolute_offset.checked_add(range)?;
+        Some(
+            vk::DescriptorBufferInfo::default()
+                .buffer(buffer)
+                .offset(absolute_offset)
+                .range(range),
+        )
+    }
+
     fn validate(self, set: u32, binding: u32) -> Result<(), vk::Result> {
         let invalid = match self {
             Self::Sampler { sampler } => sampler.is_null(),
@@ -293,11 +320,13 @@ impl ResolvedDescriptorValue {
                 buffer_size,
                 offset,
                 range,
+                ..
             } => {
                 buffer.is_null()
                     || range == 0
                     || offset >= buffer_size
                     || (range != vk::WHOLE_SIZE && offset.checked_add(range).is_none_or(|end| end > buffer_size))
+                    || self.buffer_info().is_none()
             },
             Self::AccelerationStructure {
                 backing_buffer,
@@ -445,9 +474,11 @@ impl Recorder<'_> {
     }
 
     pub fn draw_indirect_at(&mut self, buffer: &Buffer, offset: u64, draw_count: u32, stride: u32) -> &mut Self {
-        let handle = buffer.handle();
+        let buffer = *buffer;
         self.indirect(move |graph| {
-            graph.batch()?.draw_indirect(handle, offset, draw_count, stride);
+            graph
+                .batch()?
+                .draw_indirect(buffer.handle(), buffer.checked_offset(offset)?, draw_count, stride);
             Ok(())
         })
     }
@@ -459,9 +490,11 @@ impl Recorder<'_> {
     pub fn draw_indexed_indirect_at(
         &mut self, buffer: &Buffer, offset: u64, draw_count: u32, stride: u32,
     ) -> &mut Self {
-        let handle = buffer.handle();
+        let buffer = *buffer;
         self.indirect(move |graph| {
-            graph.batch()?.draw_indexed_indirect(handle, offset, draw_count, stride);
+            graph
+                .batch()?
+                .draw_indexed_indirect(buffer.handle(), buffer.checked_offset(offset)?, draw_count, stride);
             Ok(())
         })
     }
@@ -474,11 +507,16 @@ impl Recorder<'_> {
         &mut self, buffer: &Buffer, offset: u64, count_buffer: &Buffer, count_offset: u64, max_draw_count: u32,
         stride: u32,
     ) -> &mut Self {
-        let (handle, counts) = (buffer.handle(), count_buffer.handle());
+        let (buffer, count_buffer) = (*buffer, *count_buffer);
         self.indirect(move |graph| {
-            graph
-                .batch()?
-                .draw_indirect_count(handle, offset, counts, count_offset, max_draw_count, stride);
+            graph.batch()?.draw_indirect_count(
+                buffer.handle(),
+                buffer.checked_offset(offset)?,
+                count_buffer.handle(),
+                count_buffer.checked_offset(count_offset)?,
+                max_draw_count,
+                stride,
+            );
             Ok(())
         })
     }
@@ -493,11 +531,16 @@ impl Recorder<'_> {
         &mut self, buffer: &Buffer, offset: u64, count_buffer: &Buffer, count_offset: u64, max_draw_count: u32,
         stride: u32,
     ) -> &mut Self {
-        let (handle, counts) = (buffer.handle(), count_buffer.handle());
+        let (buffer, count_buffer) = (*buffer, *count_buffer);
         self.indirect(move |graph| {
-            graph
-                .batch()?
-                .draw_indexed_indirect_count(handle, offset, counts, count_offset, max_draw_count, stride);
+            graph.batch()?.draw_indexed_indirect_count(
+                buffer.handle(),
+                buffer.checked_offset(offset)?,
+                count_buffer.handle(),
+                count_buffer.checked_offset(count_offset)?,
+                max_draw_count,
+                stride,
+            );
             Ok(())
         })
     }
@@ -554,6 +597,7 @@ impl Recorder<'_> {
             ResolvedDescriptorValue::Buffer {
                 buffer: buffer.handle(),
                 buffer_size: buffer.size(),
+                base_offset: buffer.offset(),
                 offset,
                 range,
             },
@@ -1335,6 +1379,7 @@ impl RenderGraph {
                 ResolvedDescriptorValue::Buffer {
                     buffer: buffer.handle(),
                     buffer_size: buffer.size(),
+                    base_offset: buffer.offset(),
                     offset,
                     range,
                 }
@@ -1474,15 +1519,13 @@ impl RenderGraph {
                                 texel_buffer_views.push(view);
                                 WriteBacking::TexelBuffer(at)
                             },
-                            ResolvedDescriptorValue::Buffer {
-                                buffer, offset, range, ..
-                            } => {
+                            ResolvedDescriptorValue::Buffer { .. } => {
                                 let at = buffer_infos.len();
                                 buffer_infos.push(
-                                    vk::DescriptorBufferInfo::default()
-                                        .buffer(buffer)
-                                        .offset(offset)
-                                        .range(range),
+                                    descriptor
+                                        .value
+                                        .buffer_info()
+                                        .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?,
                                 );
                                 WriteBacking::Buffer(at)
                             },
@@ -1704,6 +1747,7 @@ impl RenderGraph {
                         },
                         usage: *usage,
                         location: *location,
+                        alignment: 1,
                         name: match name.is_valid() {
                             true => self.get::<Arc<str>>(name).to_string(),
                             false => format!("transient buffer {value_id}"),
@@ -1877,7 +1921,7 @@ impl RenderGraph {
                 let region = region.unwrap_or_else(|| BufferImageCopy::whole(attachment.extent()));
 
                 let copy = vk::BufferImageCopy::default()
-                    .buffer_offset(region.buffer_offset)
+                    .buffer_offset(buffer.checked_offset(region.buffer_offset)?)
                     .image_subresource(
                         vk::ImageSubresourceLayers::default()
                             .aspect_mask(subresource_range.aspect_mask)
@@ -2008,11 +2052,18 @@ impl RenderGraph {
 
                 let buffers = self.get::<Vec<ValueId>>(buffers);
                 let offsets = self.get::<Vec<ValueId>>(offsets);
-                let handles = buffers
+                if buffers.len() != offsets.len() {
+                    return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+                }
+                let bindings = buffers
                     .iter()
-                    .map(|id| self.get::<Buffer>(id).handle())
-                    .collect::<Vec<_>>();
-                let offsets = offsets.iter().map(|id| self.get::<u64>(id)).collect::<Vec<_>>();
+                    .zip(&offsets)
+                    .map(|(buffer, offset)| {
+                        let buffer = self.get::<Buffer>(buffer);
+                        Ok((buffer.handle(), buffer.checked_offset(self.get::<u64>(offset))?))
+                    })
+                    .collect::<Result<Vec<_>, vk::Result>>()?;
+                let (handles, offsets): (Vec<_>, Vec<_>) = bindings.into_iter().unzip();
                 self.batch()?.bind_vertex_buffers(*first_binding, &handles, &offsets);
             },
             IR::BindIndexBuffer {
@@ -2024,8 +2075,9 @@ impl RenderGraph {
                 self.set_value(value_id, Value::Reference(*pass));
                 self.ensure_batch(ctx, allocator)?;
 
-                let handle = self.get::<Buffer>(buffer).handle();
-                self.batch()?.bind_index_buffer(handle, *offset, *index_type);
+                let buffer = self.get::<Buffer>(buffer);
+                self.batch()?
+                    .bind_index_buffer(buffer.handle(), buffer.checked_offset(*offset)?, *index_type);
             },
             IR::Draw {
                 pass,
@@ -2083,15 +2135,15 @@ impl RenderGraph {
                 self.set_value(value_id, Value::Reference(*pass));
                 self.prepare_draw(*pipeline, state, dynamic, true)?;
 
-                let handle = self.get::<Buffer>(buffer).handle();
+                let buffer = self.get::<Buffer>(buffer);
+                let handle = buffer.handle();
+                let offset = buffer.checked_offset(*offset)?;
                 match count {
                     ir::DrawCount::Fixed(draw_count) => {
                         let draw_count = self.get::<u32>(draw_count);
                         match indexed {
-                            true => self
-                                .batch()?
-                                .draw_indexed_indirect(handle, *offset, draw_count, *stride),
-                            false => self.batch()?.draw_indirect(handle, *offset, draw_count, *stride),
+                            true => self.batch()?.draw_indexed_indirect(handle, offset, draw_count, *stride),
+                            false => self.batch()?.draw_indirect(handle, offset, draw_count, *stride),
                         }
                     },
                     ir::DrawCount::Indirect {
@@ -2099,20 +2151,22 @@ impl RenderGraph {
                         offset: count_offset,
                         max,
                     } => {
-                        let counts = self.get::<Buffer>(counts).handle();
+                        let counts = self.get::<Buffer>(counts);
+                        let count_offset = counts.checked_offset(*count_offset)?;
+                        let counts = counts.handle();
                         let max = self.get::<u32>(max);
                         match indexed {
                             true => self.batch()?.draw_indexed_indirect_count(
                                 handle,
-                                *offset,
+                                offset,
                                 counts,
-                                *count_offset,
+                                count_offset,
                                 max,
                                 *stride,
                             ),
                             false => {
                                 self.batch()?
-                                    .draw_indirect_count(handle, *offset, counts, *count_offset, max, *stride)
+                                    .draw_indirect_count(handle, offset, counts, count_offset, max, *stride)
                             },
                         }
                     },
@@ -2217,8 +2271,9 @@ impl RenderGraph {
                         self.batch()?.dispatch(groups[0], groups[1], groups[2]);
                     },
                     ir::DispatchSize::Indirect { buffer, offset } => {
-                        let handle = self.get::<Buffer>(buffer).handle();
-                        self.batch()?.dispatch_indirect(handle, *offset);
+                        let buffer = self.get::<Buffer>(buffer);
+                        self.batch()?
+                            .dispatch_indirect(buffer.handle(), buffer.checked_offset(*offset)?);
                     },
                 }
             },
@@ -2352,6 +2407,7 @@ mod tests {
                 ResolvedDescriptorValue::Buffer {
                     buffer,
                     buffer_size: 256,
+                    base_offset: 0,
                     offset: 16,
                     range: 64,
                 },
@@ -2396,6 +2452,7 @@ mod tests {
         let descriptor = |offset, range| ResolvedDescriptorValue::Buffer {
             buffer,
             buffer_size: 128,
+            base_offset: 0,
             offset,
             range,
         };
@@ -2404,6 +2461,18 @@ mod tests {
         assert!(descriptor(128, vk::WHOLE_SIZE).validate(0, 0).is_err());
         assert!(descriptor(96, 64).validate(0, 0).is_err());
         assert!(descriptor(32, vk::WHOLE_SIZE).validate(0, 0).is_ok());
+
+        let slice = ResolvedDescriptorValue::Buffer {
+            buffer,
+            buffer_size: 128,
+            base_offset: 256,
+            offset: 32,
+            range: vk::WHOLE_SIZE,
+        };
+        assert!(slice.validate(0, 0).is_ok());
+        let info = slice.buffer_info().unwrap();
+        assert_eq!(info.offset, 288);
+        assert_eq!(info.range, 96);
     }
 
     #[test]
@@ -2434,6 +2503,7 @@ mod tests {
             value: ResolvedDescriptorValue::Buffer {
                 buffer: vk::Buffer::from_raw(2),
                 buffer_size: 64,
+                base_offset: 0,
                 offset: 0,
                 range: vk::WHOLE_SIZE,
             },

@@ -2,7 +2,9 @@ use std::{cell::RefCell, rc::Rc};
 
 use ash::vk;
 
+mod buffer_pool;
 pub mod frame;
+mod image_cache;
 pub mod persistent;
 
 pub use self::{
