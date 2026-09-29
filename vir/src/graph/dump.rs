@@ -287,7 +287,7 @@ mod tests {
         );
 
         let mut module = Module::default();
-        let target = module.import_attachment(&attachment);
+        let target = module.import_attachment(&attachment, Access::None);
         module.set_name(target, "target");
 
         let [rendered] = module
@@ -520,7 +520,7 @@ mod tests {
         let bindings = Declared::new(&[(1, 2, vk::DescriptorType::COMBINED_IMAGE_SAMPLER)]);
         let dump = module.compile(&bindings, end).unwrap().dump();
         assert!(dump.contains("write_descriptor set=1 binding=2"), "{dump}");
-        assert!(dump.contains("combined_image_sampler %5(source)"), "{dump}");
+        assert!(dump.contains("combined_image_sampler %6(source)"), "{dump}");
         assert!(dump.contains("access=%"), "{dump}");
         assert!(dump.contains("(FragmentSampled)"), "{dump}");
         assert!(

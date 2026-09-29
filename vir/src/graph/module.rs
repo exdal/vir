@@ -512,6 +512,7 @@ impl Module {
         let layer_count = self.lower_u32(1);
         self.lower_type(ir::Type::Image { format, samples });
         let lowered_name = self.lower_name(name_of(name));
+        let initial_access = self.lower_access(Access::None);
 
         let resource = self.emit(IR::ConstructImage {
             image: Image::default(),
@@ -526,6 +527,7 @@ impl Module {
             layer_count,
             usage: vk::ImageUsageFlags::empty(),
             initial_layout: layout,
+            initial_access,
             name: lowered_name,
         });
 
@@ -605,13 +607,16 @@ impl Module {
         name.map_or(ValueId::INVALID, |name| self.lower_string(name))
     }
 
-    fn lower_image_attachment(&mut self, attachment: &ImageAttachment, name: ir::Name) -> (ValueId, ValueId) {
+    fn lower_image_attachment(
+        &mut self, attachment: &ImageAttachment, access: Access, name: ir::Name,
+    ) -> (ValueId, ValueId) {
         let extent = self.lower_constant(ir::Constant::Extent3D(attachment.extent()));
         let base_level = self.lower_u32(attachment.base_level());
         let level_count = self.lower_u32(attachment.level_count());
         let base_layer = self.lower_u32(attachment.base_layer());
         let layer_count = self.lower_u32(attachment.layer_count());
         let name = self.lower_name(name);
+        let initial_access = self.lower_access(access);
 
         let ty_instr = self.lower_type(ir::Type::Image {
             format: attachment.format(),
@@ -635,6 +640,7 @@ impl Module {
             layer_count,
             usage: attachment.image().usage(),
             initial_layout: attachment.layout(),
+            initial_access,
             name,
         });
 
@@ -652,6 +658,7 @@ impl Module {
         let base_layer = self.lower_u32(0);
         let layer_count = self.lower_u32(info.array_layers);
         let name = self.lower_name(name_of(&info.name));
+        let initial_access = self.lower_access(Access::None);
 
         self.lower_type(ir::Type::Image {
             format: info.format,
@@ -676,16 +683,17 @@ impl Module {
             layer_count,
             usage: info.usage,
             initial_layout: vk::ImageLayout::UNDEFINED,
+            initial_access,
             name,
         })
     }
 
-    pub fn import_image(&mut self, image: &Image, layout: vk::ImageLayout) -> ValueId {
-        self.import_attachment(&ImageAttachment::from_image(image, layout))
+    pub fn import_image(&mut self, image: &Image, layout: vk::ImageLayout, access: Access) -> ValueId {
+        self.import_attachment(&ImageAttachment::from_image(image, layout), access)
     }
 
-    pub fn import_attachment(&mut self, attachment: &ImageAttachment) -> ValueId {
-        self.lower_image_attachment(attachment, None).1
+    pub fn import_attachment(&mut self, attachment: &ImageAttachment, access: Access) -> ValueId {
+        self.lower_image_attachment(attachment, access, None).1
     }
 
     pub fn transient_buffer(&mut self, info: &BufferInfo) -> ValueId {
@@ -989,12 +997,14 @@ impl Module {
                         level_count,
                         base_layer,
                         layer_count,
+                        initial_access,
                         name,
                         ..
                     } => {
                         if name.is_valid() {
                             stack.push(*name);
                         }
+                        stack.push(*initial_access);
                         stack.push(*layer_count);
                         stack.push(*base_layer);
                         stack.push(*level_count);
@@ -1643,13 +1653,19 @@ impl Module {
                     buffer_states = joined.1;
                 },
 
-                IR::ConstructImage { initial_layout, .. } => {
+                IR::ConstructImage {
+                    initial_layout,
+                    initial_access,
+                    ..
+                } => {
+                    let access = resolve_access(initial_access);
+                    let last_access = resting_access!(access);
                     image_states.insert(
                         value_id,
                         ImageState {
                             layout: *initial_layout,
-                            last_access: no_access_id,
-                            access: Access::None,
+                            last_access,
+                            access,
                         },
                     );
                 },
@@ -2840,7 +2856,7 @@ mod tests {
             vk::SampleCountFlags::TYPE_1,
             vk::ImageLayout::UNDEFINED,
         );
-        let (_, construct) = module.lower_image_attachment(&attachment, Some("target".into()));
+        let (_, construct) = module.lower_image_attachment(&attachment, Access::None, Some("target".into()));
         (module, construct)
     }
 
@@ -3168,7 +3184,7 @@ mod tests {
             vk::SampleCountFlags::TYPE_1,
         );
 
-        let imported = module.import_image(&image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+        let imported = module.import_image(&image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, Access::None);
         let end = module.clear(imported, crate::clear::f32::BLACK);
 
         let compiled = module.compile(&Unchecked, end).unwrap();
@@ -3176,6 +3192,27 @@ mod tests {
         assert_eq!(barriers.len(), 1);
         assert_eq!(barriers[0].old_layout, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
         assert_eq!(barriers[0].new_layout, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+    }
+
+    #[test]
+    fn an_imported_image_waits_on_the_access_its_owner_left_it_in() {
+        let mut module = Module::default();
+        let image = Image::imported(
+            vk::Image::null(),
+            DEPTH_FORMAT,
+            vk::Extent3D::default().width(WIDTH).height(HEIGHT).depth(1),
+            vk::SampleCountFlags::TYPE_1,
+        );
+
+        let imported = module.import_image(&image, vk::ImageLayout::UNDEFINED, Access::DepthStencilRW);
+        let end = module.clear(imported, crate::ClearValue::depth(1.0));
+
+        let compiled = module.compile(&Unchecked, end).unwrap();
+        let barriers = image_barriers(&module, &compiled);
+        assert_eq!(barriers.len(), 1);
+        assert_eq!(barriers[0].src, Access::DepthStencilRW);
+        assert_eq!(barriers[0].dst, Access::Clear);
+        assert_eq!(barriers[0].old_layout, vk::ImageLayout::UNDEFINED);
     }
 
     #[test]

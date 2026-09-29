@@ -1841,6 +1841,7 @@ impl RenderGraph {
                 usage,
                 initial_layout,
                 name,
+                ..
             } => {
                 let extent = match extent.is_valid() {
                     true => self.get::<vk::Extent3D>(extent),

@@ -129,7 +129,10 @@ impl Example for Texture {
         // one module run to completion: the copy, then the export into the resting layout
         let mut module = vir::Module::default();
         let source = module.import_buffer(&staging, vir::Access::HostWrite);
-        let destination = module.import_attachment(&ImageAttachment::from_image(&image, vk::ImageLayout::UNDEFINED));
+        let destination = module.import_attachment(
+            &ImageAttachment::from_image(&image, vk::ImageLayout::UNDEFINED),
+            Access::None,
+        );
         module.set_name(source, "texture staging");
         module.set_name(destination, "vir logo");
         let uploaded = module.copy_buffer_to_image(source, destination);
@@ -176,7 +179,7 @@ impl Example for Texture {
 
         let target = module.clear(recording.swapchain_image, BACKGROUND);
 
-        let texture = module.import_attachment(&self.attachment());
+        let texture = module.import_attachment(&self.attachment(), Access::FragmentSampled);
         module.set_name(texture, "sample texture");
 
         let [target] = module

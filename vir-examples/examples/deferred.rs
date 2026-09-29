@@ -413,8 +413,10 @@ impl Deferred {
             buffer.write(0, &data.pixels)?;
 
             let source = module.import_buffer(&buffer, vir::Access::HostWrite);
-            let destination =
-                module.import_attachment(&ImageAttachment::from_image(&image, vk::ImageLayout::UNDEFINED));
+            let destination = module.import_attachment(
+                &ImageAttachment::from_image(&image, vk::ImageLayout::UNDEFINED),
+                Access::None,
+            );
             module.set_name(destination, "material texture");
 
             let copied = module.copy_buffer_to_image(source, destination);
@@ -621,13 +623,13 @@ impl Example for Deferred {
         let material_textures = self
             .textures
             .iter()
-            .map(|texture| module.import_attachment(&texture.attachment()))
+            .map(|texture| module.import_attachment(&texture.attachment(), Access::FragmentSampled))
             .collect::<Vec<_>>();
 
-        let albedo = module.import_attachment(&gbuffer.albedo.attachment());
-        let normal = module.import_attachment(&gbuffer.normal.attachment());
-        let position = module.import_attachment(&gbuffer.position.attachment());
-        let depth = module.import_attachment(&gbuffer.depth_attachment());
+        let albedo = module.import_attachment(&gbuffer.albedo.attachment(), Access::FragmentSampled);
+        let normal = module.import_attachment(&gbuffer.normal.attachment(), Access::FragmentSampled);
+        let position = module.import_attachment(&gbuffer.position.attachment(), Access::FragmentSampled);
+        let depth = module.import_attachment(&gbuffer.depth_attachment(), Access::DepthStencilRW);
         module.set_name(albedo, "g-buffer albedo");
         module.set_name(normal, "g-buffer normal");
         module.set_name(position, "g-buffer position");

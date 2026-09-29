@@ -333,6 +333,7 @@ pub enum IR {
         layer_count: ValueId,
         usage: vk::ImageUsageFlags,
         initial_layout: vk::ImageLayout,
+        initial_access: ValueId,
         name: ValueId,
     },
 
@@ -819,6 +820,7 @@ impl IR {
                 level_count,
                 base_layer,
                 layer_count,
+                initial_access,
                 name,
                 ..
             } => {
@@ -829,6 +831,7 @@ impl IR {
                 visit(*level_count);
                 visit(*base_layer);
                 visit(*layer_count);
+                visit(*initial_access);
                 if name.is_valid() {
                     visit(*name);
                 }
@@ -1501,6 +1504,7 @@ impl IR {
                 layer_count,
                 usage,
                 initial_layout,
+                initial_access,
                 name,
             } => {
                 write!(f, "image{}", fmt_name(p, name))?;
@@ -1530,7 +1534,13 @@ impl IR {
                         p.operand(*layer_count)
                     )?;
                 }
-                write!(f, " usage={} layout={}", fmt_usage(*usage), fmt_layout(*initial_layout))?;
+                write!(
+                    f,
+                    " usage={} layout={} access={}",
+                    fmt_usage(*usage),
+                    fmt_layout(*initial_layout),
+                    p.operand(*initial_access)
+                )?;
 
                 match (p.is_bound(id), image.is_null()) {
                     (true, _) => write!(f, " bound"),
