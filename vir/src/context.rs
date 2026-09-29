@@ -1,6 +1,6 @@
 use std::{cell::RefCell, ptr::NonNull, rc::Rc, sync::Arc};
 
-use ash::{khr, vk};
+use ash::{ext, khr, vk};
 use gpu_allocator::{
     AllocatorDebugSettings,
     vulkan::{Allocator as GpuAllocator, AllocatorCreateDesc},
@@ -24,6 +24,7 @@ pub struct Context {
     command_queues: Vec<CommandQueue>,
     swapchain_loader: khr::swapchain::Device,
     surface_loader: khr::surface::Instance,
+    debug_utils: Option<ext::debug_utils::Device>,
 }
 
 impl Context {
@@ -32,6 +33,12 @@ impl Context {
     ) -> Result<Self, vk::Result> {
         let swapchain_loader = khr::swapchain::Device::new(&instance, &device);
         let surface_loader = khr::surface::Instance::new(entry, &instance);
+
+        // ash fills missing pointers with panicking stubs, so only load it when the user enabled the extension
+        let debug_utils = [c"vkCmdBeginDebugUtilsLabelEXT", c"vkCmdEndDebugUtilsLabelEXT"]
+            .iter()
+            .all(|name| unsafe { instance.get_device_proc_addr(device.handle(), name.as_ptr()) }.is_some())
+            .then(|| ext::debug_utils::Device::new(&instance, &device));
 
         // one memory allocator per device; every allocator handed out below shares it
         let memory = GpuAllocator::new(&AllocatorCreateDesc {
@@ -52,6 +59,7 @@ impl Context {
             command_queues: Vec::new(),
             swapchain_loader,
             surface_loader,
+            debug_utils,
         })
     }
 
@@ -64,6 +72,8 @@ impl Context {
     pub fn swapchain_loader(&self) -> &khr::swapchain::Device { &self.swapchain_loader }
 
     pub fn surface_loader(&self) -> &khr::surface::Instance { &self.surface_loader }
+
+    pub fn debug_utils(&self) -> Option<&ext::debug_utils::Device> { self.debug_utils.as_ref() }
 
     pub fn command_queue_by_domain(&self, domain: DomainFlag) -> Option<&CommandQueue> {
         self.command_queues.iter().find(|queue| queue.domain_flags() == domain)

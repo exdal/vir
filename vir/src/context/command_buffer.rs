@@ -1,6 +1,6 @@
-use std::ptr::NonNull;
+use std::{ffi::CStr, ptr::NonNull};
 
-use ash::vk;
+use ash::{ext, vk};
 
 use crate::{Access, ClearValue};
 
@@ -273,6 +273,15 @@ impl CommandBuffer {
                 ranges,
             );
         }
+    }
+
+    pub fn begin_label(&self, debug_utils: &ext::debug_utils::Device, name: &CStr, color: [f32; 4]) {
+        let label = vk::DebugUtilsLabelEXT::default().label_name(name).color(color);
+        unsafe { debug_utils.cmd_begin_debug_utils_label(self.handle, &label) }
+    }
+
+    pub fn end_label(&self, debug_utils: &ext::debug_utils::Device) {
+        unsafe { debug_utils.cmd_end_debug_utils_label(self.handle) }
     }
 
     pub fn clear_depth_stencil(

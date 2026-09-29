@@ -1,5 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    ffi::CString,
+    hash::{DefaultHasher, Hash, Hasher},
     io::IsTerminal,
     ptr::NonNull,
     sync::Arc,
@@ -161,6 +163,18 @@ fn blit_offsets(extent: vk::Extent3D) -> [vk::Offset3D; 2] {
             y: extent.height as i32,
             z: extent.depth.max(1) as i32,
         },
+    ]
+}
+
+fn label_color(name: &str) -> [f32; 4] {
+    let mut hasher = DefaultHasher::new();
+    name.hash(&mut hasher);
+    let hash = hasher.finish() as u32;
+    [
+        (hash & 255) as f32 / 255.0,
+        ((hash >> 8) & 255) as f32 / 255.0,
+        ((hash >> 16) & 255) as f32 / 255.0,
+        1.0,
     ]
 }
 
@@ -694,6 +708,7 @@ pub struct RenderGraph {
     recorded_viewports: Vec<ResolvedViewport>,
     recorded_scissors: Vec<vk::Rect2D>,
     recorded_push_constants: Option<(vk::PipelineLayout, PushConstants)>,
+    labeled_pass: bool,
     current_batch: Option<Batch>,
     current_submit: Submit,
     submits: Vec<Submit>,
@@ -734,6 +749,7 @@ impl RenderGraph {
             recorded_viewports: Vec::new(),
             recorded_scissors: Vec::new(),
             recorded_push_constants: None,
+            labeled_pass: false,
             current_batch: None,
             current_submit: Submit::default(),
             submits: Vec::new(),
@@ -979,6 +995,7 @@ impl RenderGraph {
         self.recorded_viewports.clear();
         self.recorded_scissors.clear();
         self.recorded_push_constants = None;
+        self.labeled_pass = false;
         self.current_batch = None;
         self.current_submit = Submit::default();
         self.submits.clear();
@@ -1034,6 +1051,35 @@ impl RenderGraph {
             .as_ref()
             .map(|b| b.cmd_buf())
             .ok_or(vk::Result::ERROR_UNKNOWN)
+    }
+
+    fn begin_pass_label(&mut self, ctx: &Context, name: &ValueId) -> Result<(), vk::Result> {
+        let Some(debug_utils) = ctx.debug_utils() else {
+            return Ok(());
+        };
+
+        if !name.is_valid() {
+            return Ok(());
+        }
+
+        let name = self.get::<Arc<str>>(name);
+        let Ok(label) = CString::new(name.as_bytes()) else {
+            return Ok(());
+        };
+
+        self.batch()?.begin_label(debug_utils, &label, label_color(&name));
+        self.labeled_pass = true;
+
+        Ok(())
+    }
+
+    fn end_pass_label(&mut self, ctx: &Context) -> Result<(), vk::Result> {
+        if let Some(debug_utils) = ctx.debug_utils()
+            && std::mem::take(&mut self.labeled_pass)
+        {
+            self.batch()?.end_label(debug_utils);
+        }
+        Ok(())
     }
 
     fn flush_submit(&mut self, signal_sema: Option<SemaphoreSubmitInfo>) -> Result<(), vk::Result> {
@@ -1942,9 +1988,11 @@ impl RenderGraph {
             IR::BeginRendering {
                 attachments,
                 render_area,
+                name,
                 ..
             } => {
                 self.ensure_batch(ctx, allocator)?;
+                self.begin_pass_label(ctx, name)?;
                 self.open_descriptors();
 
                 let mut color_attachments = Vec::new();
@@ -2211,10 +2259,12 @@ impl RenderGraph {
             IR::EndRendering { pass } => {
                 self.set_value(value_id, Value::Reference(*pass));
                 self.batch()?.end_rendering();
+                self.end_pass_label(ctx)?;
                 self.open_descriptors();
             },
-            IR::BeginCompute { attachments, .. } => {
+            IR::BeginCompute { attachments, name } => {
                 self.ensure_batch(ctx, allocator)?;
+                self.begin_pass_label(ctx, name)?;
                 self.open_descriptors();
                 match attachments.first() {
                     Some((first, _)) => self.set_value(value_id, Value::Reference(*first)),
@@ -2223,6 +2273,7 @@ impl RenderGraph {
             },
             IR::EndCompute { pass } => {
                 self.set_value(value_id, Value::Reference(*pass));
+                self.end_pass_label(ctx)?;
                 self.open_descriptors();
             },
             IR::PassResult { resource, .. } => {
@@ -2356,6 +2407,14 @@ impl Drop for RenderGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn label_colors_are_stable_and_opaque() {
+        let color = label_color("gbuffer");
+        assert_eq!(color, label_color("gbuffer"));
+        assert_eq!(color[3], 1.0);
+        assert!(color.iter().all(|channel| (0.0..=1.0).contains(channel)));
+    }
 
     #[test]
     fn runtime_references_are_canonicalized_across_long_chains() {
