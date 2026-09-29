@@ -247,6 +247,7 @@ impl Renderer {
         let physical_device = PhysicalDeviceSelector::default()
             .set_min_api_version(1, 3, 0)
             .add_required_extension(khr::swapchain::NAME.to_owned())
+            .add_optional_extension(khr::push_descriptor::NAME.to_owned())
             .set_preferred_device_type(vk::PhysicalDeviceType::DISCRETE_GPU)
             .allow_any_device_type(true)
             .require_separate_compute_queue(true)

@@ -1,6 +1,6 @@
 use std::{ffi::CStr, ptr::NonNull};
 
-use ash::{ext, vk};
+use ash::{ext, khr, vk};
 
 use crate::{Access, ClearValue};
 
@@ -282,6 +282,13 @@ impl CommandBuffer {
 
     pub fn end_label(&self, debug_utils: &ext::debug_utils::Device) {
         unsafe { debug_utils.cmd_end_debug_utils_label(self.handle) }
+    }
+
+    pub fn push_descriptor_set(
+        &self, loader: &khr::push_descriptor::Device, bind_point: vk::PipelineBindPoint, layout: vk::PipelineLayout,
+        set: u32, writes: &[vk::WriteDescriptorSet],
+    ) {
+        unsafe { loader.cmd_push_descriptor_set(self.handle, bind_point, layout, set, writes) }
     }
 
     pub fn clear_depth_stencil(

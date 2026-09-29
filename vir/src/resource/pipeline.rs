@@ -220,6 +220,7 @@ pub(crate) fn validate_descriptor_bindings(
 pub struct SetLayout {
     pub handle: vk::DescriptorSetLayout,
     pub sizes: Vec<(vk::DescriptorType, u32)>,
+    pub push: bool,
     owned: bool,
 }
 
@@ -243,6 +244,7 @@ impl PipelineLayout {
 
     pub(crate) fn create(
         device: &ash::Device, reflections: &[Reflection], bindless: Option<BindlessDescriptorSet>,
+        max_push_descriptors: Option<u32>,
     ) -> Result<Self, vk::Result> {
         struct Merged {
             descriptor_type: vk::DescriptorType,
@@ -305,6 +307,7 @@ impl PipelineLayout {
                 sets.push(SetLayout {
                     handle: external.layout,
                     sizes: Vec::new(),
+                    push: false,
                     owned: false,
                 });
                 continue;
@@ -327,12 +330,23 @@ impl PipelineLayout {
                 sizes.push((info.descriptor_type, info.count));
             }
 
-            let create_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+            let descriptor_count = sizes.iter().map(|(_, count)| count).sum::<u32>();
+            let push = !bindings.is_empty()
+                && !sets.iter().any(|set| set.push)
+                && max_push_descriptors.is_some_and(|max| descriptor_count <= max);
+            let flags = match push {
+                true => vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR,
+                false => vk::DescriptorSetLayoutCreateFlags::empty(),
+            };
+            let create_info = vk::DescriptorSetLayoutCreateInfo::default()
+                .flags(flags)
+                .bindings(&bindings);
 
             match unsafe { device.create_descriptor_set_layout(&create_info, None) } {
                 Ok(handle) => sets.push(SetLayout {
                     handle,
                     sizes,
+                    push,
                     owned: true,
                 }),
                 Err(err) => {

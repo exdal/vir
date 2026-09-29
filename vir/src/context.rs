@@ -25,6 +25,13 @@ pub struct Context {
     swapchain_loader: khr::swapchain::Device,
     surface_loader: khr::surface::Instance,
     debug_utils: Option<ext::debug_utils::Device>,
+    push_descriptor: Option<PushDescriptor>,
+}
+
+#[derive(Clone)]
+pub(crate) struct PushDescriptor {
+    pub(crate) loader: khr::push_descriptor::Device,
+    pub(crate) max_descriptors: u32,
 }
 
 impl Context {
@@ -34,11 +41,24 @@ impl Context {
         let swapchain_loader = khr::swapchain::Device::new(&instance, &device);
         let surface_loader = khr::surface::Instance::new(entry, &instance);
 
-        // ash fills missing pointers with panicking stubs, so only load it when the user enabled the extension
+        // ash fills missing pointers with panicking stubs, so extensions only load when the user enabled them
         let debug_utils = [c"vkCmdBeginDebugUtilsLabelEXT", c"vkCmdEndDebugUtilsLabelEXT"]
             .iter()
             .all(|name| unsafe { instance.get_device_proc_addr(device.handle(), name.as_ptr()) }.is_some())
             .then(|| ext::debug_utils::Device::new(&instance, &device));
+
+        let push_descriptor =
+            unsafe { instance.get_device_proc_addr(device.handle(), c"vkCmdPushDescriptorSetKHR".as_ptr()) }
+                .is_some()
+                .then(|| {
+                    let mut limits = vk::PhysicalDevicePushDescriptorPropertiesKHR::default();
+                    let mut properties = vk::PhysicalDeviceProperties2::default().push_next(&mut limits);
+                    unsafe { instance.get_physical_device_properties2(physical_device, &mut properties) };
+                    PushDescriptor {
+                        loader: khr::push_descriptor::Device::new(&instance, &device),
+                        max_descriptors: limits.max_push_descriptors,
+                    }
+                });
 
         // one memory allocator per device; every allocator handed out below shares it
         let memory = GpuAllocator::new(&AllocatorCreateDesc {
@@ -60,6 +80,7 @@ impl Context {
             swapchain_loader,
             surface_loader,
             debug_utils,
+            push_descriptor,
         })
     }
 
@@ -74,6 +95,8 @@ impl Context {
     pub fn surface_loader(&self) -> &khr::surface::Instance { &self.surface_loader }
 
     pub fn debug_utils(&self) -> Option<&ext::debug_utils::Device> { self.debug_utils.as_ref() }
+
+    pub(crate) fn push_descriptor(&self) -> Option<&PushDescriptor> { self.push_descriptor.as_ref() }
 
     pub fn command_queue_by_domain(&self, domain: DomainFlag) -> Option<&CommandQueue> {
         self.command_queues.iter().find(|queue| queue.domain_flags() == domain)

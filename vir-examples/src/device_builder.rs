@@ -164,6 +164,7 @@ fn get_present_queue_index(
 pub struct PhysicalDeviceSelector {
     min_vulkan_version: u32,
     required_extensions: Vec<CString>,
+    optional_extensions: Vec<CString>,
     preferred_device_type: vk::PhysicalDeviceType,
     allow_any_device_type: bool,
     require_present: bool,
@@ -178,6 +179,7 @@ impl Default for PhysicalDeviceSelector {
         Self {
             min_vulkan_version: vk::make_api_version(0, 1, 3, 0),
             required_extensions: Vec::default(),
+            optional_extensions: Vec::default(),
             preferred_device_type: vk::PhysicalDeviceType::DISCRETE_GPU,
             allow_any_device_type: true,
             require_present: false,
@@ -197,6 +199,11 @@ impl PhysicalDeviceSelector {
 
     pub fn add_required_extension(mut self, extension: CString) -> Self {
         self.required_extensions.push(extension.to_owned());
+        self
+    }
+
+    pub fn add_optional_extension(mut self, extension: CString) -> Self {
+        self.optional_extensions.push(extension);
         self
     }
 
@@ -300,6 +307,13 @@ impl PhysicalDeviceSelector {
                     return None;
                 }
 
+                let extensions_to_enable = self
+                    .required_extensions
+                    .iter()
+                    .chain(self.optional_extensions.iter().filter(|x| extension_names.contains(x)))
+                    .cloned()
+                    .collect();
+
                 let features = unsafe { instance.get_physical_device_features(handle) };
                 let name = unsafe { CStr::from_ptr(properties.device_name.as_ptr()) }
                     .to_str()
@@ -312,7 +326,7 @@ impl PhysicalDeviceSelector {
                     features,
                     properties,
                     queue_family_properties,
-                    extensions_to_enable: self.required_extensions.clone(),
+                    extensions_to_enable,
                 })
             })
             .collect::<Vec<_>>();
