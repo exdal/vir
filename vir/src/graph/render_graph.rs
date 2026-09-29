@@ -1971,7 +1971,7 @@ impl RenderGraph {
                     }))?;
 
                     self.presents.push(present);
-                } else if *dst_domain != self.current_submit.domain {
+                } else if *dst_domain != DomainFlag::Host && *dst_domain != self.current_submit.domain {
                     self.flush_submit(None)?;
                 }
                 self.set_value(value_id, Value::Reference(*resource));
