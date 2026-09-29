@@ -938,6 +938,8 @@ impl Module {
         let nodes = resolve_descriptors(nodes, pipelines, &mut next_id)?;
         let nodes = self.sync(nodes, &mut next_id);
         let nodes = self.simplify_cfg(nodes);
+        let nodes = globals_first(nodes);
+        let nodes = self.schedule_barriers(nodes);
         let nodes = self.fold_barriers(nodes, &mut next_id);
         let mut nodes = globals_first(nodes);
         self.infer_usage(&mut nodes);
@@ -1782,7 +1784,7 @@ impl Module {
         result
     }
 
-    fn is_buffer(&self, id: ValueId) -> bool {
+    pub(super) fn is_buffer(&self, id: ValueId) -> bool {
         matches!(
             self.instructions.get(self.resource_root(id).0 as usize),
             Some(IR::ConstructBuffer { .. })
@@ -1791,7 +1793,7 @@ impl Module {
 
     /// The roots an instruction takes a barrier on, which is the whole of what reads the
     /// state a join records.
-    fn resource_uses(&self, ir: &IR, uses: &mut Vec<ValueId>) {
+    pub(super) fn resource_uses(&self, ir: &IR, uses: &mut Vec<ValueId>) {
         ir.visit_resource_side_effects(|effect| {
             uses.extend(
                 self.resource_elements(effect.resource)
@@ -1813,7 +1815,7 @@ impl Module {
         result
     }
 
-    fn resource_root(&self, id: ValueId) -> ValueId {
+    pub(super) fn resource_root(&self, id: ValueId) -> ValueId {
         self.resolutions
             .get(id.0 as usize)
             .map_or(id, |resolution| resolution.root)

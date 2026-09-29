@@ -276,7 +276,98 @@ fn constant_for(
     id
 }
 
+enum BarrierScope {
+    Image(ValueId),
+    Memory,
+}
+
+fn is_barrier(ir: &IR) -> bool { matches!(ir, IR::MemoryBarrier { .. } | IR::ImageBarrier { .. }) }
+
+fn is_fixed(ir: &IR) -> bool {
+    // moving a barrier above a pass would make the pass wait on the barrier's source
+    let fixed = ir::SideEffect::Control | ir::SideEffect::External | ir::SideEffect::Host;
+    ir.side_effects().intersects(fixed) || ir.opens_region() || ir.closes_region()
+}
+
 impl Module {
+    fn barrier_scope(&self, ir: &IR) -> Option<BarrierScope> {
+        match ir {
+            IR::ImageBarrier { value, .. } => Some(BarrierScope::Image(self.resource_root(*value))),
+            IR::MemoryBarrier { .. } => Some(BarrierScope::Memory),
+            _ => None,
+        }
+    }
+
+    fn holds_back(
+        &self, (id, ir): &ir::Instr, scope: &BarrierScope, operands: &[ValueId], uses: &mut Vec<ValueId>,
+    ) -> bool {
+        operands.contains(id) || is_fixed(ir) || self.touches(scope, ir, uses)
+    }
+
+    fn touches(&self, scope: &BarrierScope, ir: &IR, uses: &mut Vec<ValueId>) -> bool {
+        match (scope, self.barrier_scope(ir)) {
+            (BarrierScope::Image(root), Some(BarrierScope::Image(other))) => return *root == other,
+            (_, Some(_)) => return false,
+            _ => {},
+        }
+
+        uses.clear();
+        self.resource_uses(ir, uses);
+        match scope {
+            BarrierScope::Image(root) => uses.contains(root),
+            // a memory barrier does not say which buffer it is for
+            BarrierScope::Memory => uses.iter().any(|resource| self.is_buffer(*resource)),
+        }
+    }
+
+    pub(crate) fn schedule_barriers(&self, nodes: Vec<ir::Instr>) -> Vec<ir::Instr> {
+        let mut result: Vec<ir::Instr> = Vec::with_capacity(nodes.len());
+        let mut operands = Vec::new();
+        let mut uses = Vec::new();
+
+        for (id, ir) in nodes {
+            let Some(scope) = self.barrier_scope(&ir) else {
+                // a command no pending barrier is for goes ahead of them, so the barriers it
+                // lets through can join the ones the next command needs
+                let run = result.iter().rev().take_while(|(_, ir)| is_barrier(ir)).count();
+                let start = result.len() - run;
+                let free = run > 0
+                    && !is_fixed(&ir)
+                    && result[start..].iter().all(|(_, barrier)| {
+                        self.barrier_scope(barrier)
+                            .is_some_and(|scope| !self.touches(&scope, &ir, &mut uses))
+                    });
+                match free {
+                    true => result.insert(start, (id, ir)),
+                    false => result.push((id, ir)),
+                }
+                continue;
+            };
+
+            operands.clear();
+            ir.visit_operands(|operand| operands.push(operand));
+
+            // a barrier moves only to join an earlier run, since moving alone batches nothing
+            let after = result
+                .iter()
+                .rposition(|node| self.holds_back(node, &scope, &operands, &mut uses))
+                .map_or(0, |index| index + 1);
+            let at = match result[after..].iter().position(|(_, ir)| is_barrier(ir)) {
+                Some(offset) => {
+                    let mut at = after + offset;
+                    while result.get(at).is_some_and(|(_, ir)| is_barrier(ir)) {
+                        at += 1;
+                    }
+                    at
+                },
+                None => result.len(),
+            };
+            result.insert(at, (id, ir));
+        }
+
+        result
+    }
+
     pub(crate) fn simplify_cfg(&self, mut nodes: Vec<ir::Instr>) -> Vec<ir::Instr> {
         loop {
             let mut changed = wire_empty_block(&mut nodes);
@@ -392,6 +483,103 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    fn positions(program: &Program, found: impl Fn(&IR) -> bool) -> Vec<usize> {
+        program
+            .instructions()
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, ir))| found(ir))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// No clear touches another clear's target, so the transitions into all three are asked for
+    /// together ahead of the first clear.
+    #[test]
+    fn barriers_in_front_of_unrelated_clears_gather_before_them() {
+        let mut module = Module::default();
+        let targets = [(); 3].map(|_| transient_target(&mut module));
+        let cleared = targets.map(|target| module.clear(target, crate::clear::f32::BLACK));
+        let drawn = module
+            .begin_rendering(cleared.map(|cleared| (cleared, Access::ColorRW)))
+            .bind_graphics_pipeline(PipelineId(0))
+            .draw(3, 1)
+            .end_rendering::<3>()[0];
+        let end = module.export(drawn, Access::BlitRead, DomainFlag::Graphics);
+
+        let compiled = module.compile(&Unchecked, end).unwrap();
+        let dump = compiled.dump();
+
+        let clears = positions(&compiled, |ir| matches!(ir, IR::Clear { .. }));
+        let barriers = positions(&compiled, |ir| matches!(ir, IR::ImageBarrier { .. }));
+        assert_eq!(clears, (clears[0]..clears[0] + 3).collect::<Vec<_>>(), "{dump}");
+        assert_eq!(barriers[..3], [clears[0] - 3, clears[0] - 2, clears[0] - 1], "{dump}");
+        // the pass still waits for the clears it draws over
+        assert!(barriers[3] > clears[2], "{dump}");
+    }
+
+    /// Hoisting the second pass's transition above the first pass would make the first pass wait
+    /// on it, so it stays after the first pass ends.
+    #[test]
+    fn a_barrier_does_not_climb_above_a_pass() {
+        let mut module = Module::default();
+        let first = transient_target(&mut module);
+        let second = transient_target(&mut module);
+
+        let drawn = draw_into(&mut module, first);
+        let both = module
+            .begin_rendering([(second, Access::ColorRW), (drawn, Access::ColorRW)])
+            .bind_graphics_pipeline(PipelineId(0))
+            .draw(3, 1)
+            .end_rendering::<2>()[1];
+        let end = module.export(both, Access::BlitRead, DomainFlag::Graphics);
+
+        let compiled = module.compile(&Unchecked, end).unwrap();
+        let dump = compiled.dump();
+
+        let first_end = positions(&compiled, |ir| matches!(ir, IR::EndRendering { .. }))[0];
+        let into_second = positions(
+            &compiled,
+            |ir| matches!(ir, IR::ImageBarrier { value, .. } if *value == second),
+        );
+        assert_eq!(into_second.len(), 1, "{dump}");
+        assert!(into_second[0] > first_end, "{dump}");
+    }
+
+    /// A memory barrier does not name the buffer it is for, so it stays behind anything that
+    /// touches a buffer.
+    #[test]
+    fn a_memory_barrier_does_not_climb_above_a_buffer_use() {
+        let mut module = Module::default();
+        let target = transient_target(&mut module);
+        let staging = module.declare_buffer_var("staging", Access::HostWrite);
+        let vertices = module.declare_buffer_var("vertices", Access::HostWrite);
+
+        let copied = module.copy_buffer_to_image(staging, target);
+        let drawn = module
+            .begin_rendering([(copied, Access::ColorRW)])
+            .bind_graphics_pipeline(PipelineId(0))
+            .bind_vertex_buffer(0, vertices)
+            .draw(3, 1)
+            .end_rendering::<1>()[0];
+        let end = module.export(drawn, Access::BlitRead, DomainFlag::Graphics);
+
+        let compiled = module.compile(&Unchecked, end).unwrap();
+        let dump = compiled.dump();
+
+        let copy = positions(&compiled, |ir| matches!(ir, IR::CopyBufferToImage { .. }))[0];
+        let waits = positions(&compiled, |ir| matches!(ir, IR::MemoryBarrier { .. }));
+        assert_eq!(
+            memory_barriers(&compiled),
+            vec![
+                (Access::HostWrite, Access::CopyRead),
+                (Access::HostWrite, Access::AttributeRead),
+            ],
+            "{dump}"
+        );
+        assert!(waits[0] < copy && copy < waits[1], "{dump}");
     }
 
     /// An arm that leaves every resource where the other arm leaves it has nothing to catch up

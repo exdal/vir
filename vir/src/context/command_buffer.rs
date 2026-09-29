@@ -35,25 +35,19 @@ impl CommandBuffer {
 
     pub fn end(&self) -> Result<(), vk::Result> { unsafe { self.device.as_ref().end_command_buffer(self.handle) } }
 
-    pub fn memory_barrier(&self, src_access: Access, dst_access: Access) {
-        let memory_barrier = [vk::MemoryBarrier2::default()
+    pub fn memory_barrier_info(src_access: Access, dst_access: Access) -> vk::MemoryBarrier2<'static> {
+        vk::MemoryBarrier2::default()
             .src_stage_mask(src_access.into())
             .src_access_mask(src_access.into())
             .dst_stage_mask(dst_access.into())
-            .dst_access_mask(dst_access.into())];
-        let dependency_info = vk::DependencyInfo::default().memory_barriers(&memory_barrier);
-        unsafe {
-            self.device
-                .as_ref()
-                .cmd_pipeline_barrier2(self.handle, &dependency_info)
-        }
+            .dst_access_mask(dst_access.into())
     }
 
-    pub fn image_barrier(
-        &self, image: vk::Image, src_access: Access, dst_access: Access, old_layout: vk::ImageLayout,
+    pub fn image_barrier_info(
+        image: vk::Image, src_access: Access, dst_access: Access, old_layout: vk::ImageLayout,
         new_layout: vk::ImageLayout, subresource_range: vk::ImageSubresourceRange,
-    ) {
-        let image_barrier = [vk::ImageMemoryBarrier2::default()
+    ) -> vk::ImageMemoryBarrier2<'static> {
+        vk::ImageMemoryBarrier2::default()
             .src_stage_mask(src_access.into())
             .src_access_mask(src_access.into())
             .dst_stage_mask(dst_access.into())
@@ -63,8 +57,26 @@ impl CommandBuffer {
             .src_queue_family_index(u32::MAX)
             .dst_queue_family_index(u32::MAX)
             .subresource_range(subresource_range)
-            .image(image)];
-        let dependency_info = vk::DependencyInfo::default().image_memory_barriers(&image_barrier);
+            .image(image)
+    }
+
+    pub fn memory_barrier(&self, src_access: Access, dst_access: Access) {
+        self.pipeline_barrier(&[Self::memory_barrier_info(src_access, dst_access)], &[]);
+    }
+
+    pub fn image_barrier(
+        &self, image: vk::Image, src_access: Access, dst_access: Access, old_layout: vk::ImageLayout,
+        new_layout: vk::ImageLayout, subresource_range: vk::ImageSubresourceRange,
+    ) {
+        let barrier =
+            Self::image_barrier_info(image, src_access, dst_access, old_layout, new_layout, subresource_range);
+        self.pipeline_barrier(&[], &[barrier]);
+    }
+
+    pub fn pipeline_barrier(&self, memory: &[vk::MemoryBarrier2], images: &[vk::ImageMemoryBarrier2]) {
+        let dependency_info = vk::DependencyInfo::default()
+            .memory_barriers(memory)
+            .image_memory_barriers(images);
         unsafe {
             self.device
                 .as_ref()

@@ -98,6 +98,21 @@ impl Batch {
     fn cmd_buf(&self) -> &CommandBuffer { &self.cmd_buf }
 }
 
+#[derive(Default)]
+struct PendingBarriers {
+    memory: Vec<vk::MemoryBarrier2<'static>>,
+    images: Vec<vk::ImageMemoryBarrier2<'static>>,
+}
+
+impl PendingBarriers {
+    fn is_empty(&self) -> bool { self.memory.is_empty() && self.images.is_empty() }
+
+    fn clear(&mut self) {
+        self.memory.clear();
+        self.images.clear();
+    }
+}
+
 struct Submit {
     domain: DomainFlag,
     wait_semas: Vec<SemaphoreSubmitInfo>,
@@ -832,6 +847,7 @@ pub struct RenderGraph {
     recorded_scissors: Vec<vk::Rect2D>,
     recorded_push_constants: Option<(vk::PipelineLayout, PushConstants)>,
     labeled_pass: bool,
+    pending_barriers: PendingBarriers,
     current_batch: Option<Batch>,
     current_submit: Submit,
     submits: Vec<Submit>,
@@ -874,6 +890,7 @@ impl RenderGraph {
             recorded_scissors: Vec::new(),
             recorded_push_constants: None,
             labeled_pass: false,
+            pending_barriers: PendingBarriers::default(),
             current_batch: None,
             current_submit: Submit::default(),
             submits: Vec::new(),
@@ -1121,6 +1138,7 @@ impl RenderGraph {
         self.recorded_scissors.clear();
         self.recorded_push_constants = None;
         self.labeled_pass = false;
+        self.pending_barriers.clear();
         self.current_batch = None;
         self.current_submit = Submit::default();
         self.submits.clear();
@@ -1204,6 +1222,17 @@ impl RenderGraph {
         {
             self.batch()?.end_label(debug_utils);
         }
+        Ok(())
+    }
+
+    fn flush_barriers(&mut self) -> Result<(), vk::Result> {
+        if self.pending_barriers.is_empty() {
+            return Ok(());
+        }
+
+        self.batch()?
+            .pipeline_barrier(&self.pending_barriers.memory, &self.pending_barriers.images);
+        self.pending_barriers.clear();
         Ok(())
     }
 
@@ -1311,6 +1340,10 @@ impl RenderGraph {
             let mut block = None;
             let mut arrived_from = None;
             while let Some((value_id, node)) = instructions.get(pc) {
+                if !matches!(node, IR::MemoryBarrier { .. } | IR::ImageBarrier { .. }) {
+                    self.flush_barriers()?;
+                }
+
                 match node {
                     IR::Label { label, .. } => block = Some(*label),
                     IR::SelectionMerge { .. } => {},
@@ -2361,7 +2394,9 @@ impl RenderGraph {
                 self.ensure_batch(ctx, allocator)?;
                 let src_access_flags = self.get::<Access>(src_access);
                 let dst_access_flags = self.get::<Access>(dst_access);
-                self.batch()?.memory_barrier(src_access_flags, dst_access_flags);
+                self.pending_barriers
+                    .memory
+                    .push(CommandBuffer::memory_barrier_info(src_access_flags, dst_access_flags));
             },
             IR::ImageBarrier {
                 src_access,
@@ -2374,15 +2409,26 @@ impl RenderGraph {
                 let src_access_flags = self.get::<Access>(src_access);
                 let dst_access_flags = self.get::<Access>(dst_access);
                 let attachment = self.get::<ImageAttachment>(value);
-                let subresource_range = attachment.subresource_range();
-                self.batch()?.image_barrier(
-                    attachment.image().into(),
+                let image = attachment.image().into();
+                let barrier = CommandBuffer::image_barrier_info(
+                    image,
                     src_access_flags,
                     dst_access_flags,
                     *old_layout,
                     *new_layout,
-                    subresource_range,
+                    attachment.subresource_range(),
                 );
+
+                // transitions of one image inside a single dependency are unordered
+                if self
+                    .pending_barriers
+                    .images
+                    .iter()
+                    .any(|pending| pending.image == image)
+                {
+                    self.flush_barriers()?;
+                }
+                self.pending_barriers.images.push(barrier);
             },
         }
 
