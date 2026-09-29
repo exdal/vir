@@ -369,6 +369,7 @@ pub enum IR {
 
     BeginRendering {
         attachments: Vec<(ValueId, ValueId)>,
+        clears: Vec<(ValueId, ValueId)>,
         render_area: ValueId,
         name: ValueId,
     },
@@ -862,14 +863,15 @@ impl IR {
 
             IR::BeginRendering {
                 attachments,
+                clears,
                 render_area,
                 name,
-                ..
             } => {
                 attachments.iter().for_each(|(resource, access)| {
                     visit(*resource);
                     visit(*access);
                 });
+                clears.iter().for_each(|(_, color)| visit(*color));
                 if render_area.is_valid() {
                     visit(*render_area);
                 }
@@ -1615,6 +1617,7 @@ impl IR {
             },
             IR::BeginRendering {
                 attachments,
+                clears,
                 render_area,
                 name,
             } => {
@@ -1622,11 +1625,13 @@ impl IR {
                     f,
                     "begin_rendering{} attachments=[{}]",
                     fmt_name(p, name),
-                    fmt_list(attachments, |(id, access)| format!(
-                        "{}:{}",
-                        p.operand(*id),
-                        p.operand(*access)
-                    ))
+                    fmt_list(attachments, |(id, access)| {
+                        let clear = match clears.iter().find(|(cleared, _)| cleared == id) {
+                            Some((_, color)) => format!(" clear={}", p.operand(*color)),
+                            None => String::new(),
+                        };
+                        format!("{}:{}{clear}", p.operand(*id), p.operand(*access))
+                    })
                 )?;
                 if render_area.is_valid() {
                     let area = *render_area;
@@ -2068,11 +2073,13 @@ mod tests {
             },
             IR::BeginRendering {
                 attachments: vec![(value(1), value(14)), (value(2), value(15))],
+                clears: Vec::new(),
                 render_area: ValueId::INVALID,
                 name: ValueId::INVALID,
             },
             IR::BeginRendering {
                 attachments: vec![(value(1), value(14)), (value(2), value(10))],
+                clears: Vec::new(),
                 render_area: ValueId::INVALID,
                 name: ValueId::INVALID,
             },
@@ -2215,6 +2222,7 @@ mod tests {
             },
             IR::BeginRendering {
                 attachments: vec![(value(1), access)],
+                clears: Vec::new(),
                 render_area: ValueId::INVALID,
                 name: ValueId::INVALID,
             },

@@ -225,10 +225,10 @@ fn alloc_id(next_id: &mut u32) -> ValueId {
 }
 
 #[derive(Clone, Copy)]
-struct ImageType {
-    format: vk::Format,
-    samples: vk::SampleCountFlags,
-    extent: Option<vk::Extent3D>,
+pub(super) struct ImageType {
+    pub(super) format: vk::Format,
+    pub(super) samples: vk::SampleCountFlags,
+    pub(super) extent: Option<vk::Extent3D>,
 }
 
 fn name_of(name: &str) -> ir::Name { (!name.is_empty()).then(|| Arc::from(name)) }
@@ -352,7 +352,7 @@ impl Default for Module {
 }
 
 impl Module {
-    fn get(&self, id: ValueId) -> &IR { &self.instructions[id.0 as usize] }
+    pub(super) fn get(&self, id: ValueId) -> &IR { &self.instructions[id.0 as usize] }
 
     fn array_elements(&self, id: ValueId) -> &[ValueId] {
         match self.get(id) {
@@ -363,7 +363,7 @@ impl Module {
 
     fn block_of(&self, id: ValueId) -> Option<LabelId> { self.instruction_block.get(id.0 as usize).copied().flatten() }
 
-    fn resolve_access(&self, id: ValueId) -> Access {
+    pub(super) fn resolve_access(&self, id: ValueId) -> Access {
         match self.get(id) {
             IR::Constant(ir::Constant::Access(a)) => *a,
             _ => panic!("{id} is not an Access constant"),
@@ -887,6 +887,7 @@ impl Module {
         let render_area = render_area.unwrap_or(ValueId::INVALID);
         let id = self.emit(IR::BeginRendering {
             attachments,
+            clears: Vec::new(),
             render_area,
             name: ValueId::INVALID,
         });
@@ -936,6 +937,7 @@ impl Module {
         let nodes = self.infer(nodes);
         // Reflected accesses drive barriers and reflected types drive usage, so resolve both first.
         let nodes = resolve_descriptors(nodes, pipelines, &mut next_id)?;
+        let nodes = self.fold_clears(nodes);
         let nodes = self.sync(nodes, &mut next_id);
         let nodes = self.simplify_cfg(nodes);
         let nodes = globals_first(nodes);
@@ -1696,7 +1698,9 @@ impl Module {
                     transition!(*image, write_id, Access::CopyWrite);
                 },
 
-                IR::BeginRendering { attachments, .. } => {
+                IR::BeginRendering {
+                    attachments, clears, ..
+                } => {
                     for (image, access) in region_images.get(&value_id).cloned().into_iter().flatten() {
                         let sampled_id = read_access!(access);
                         transition!(image, sampled_id, access);
@@ -1704,6 +1708,12 @@ impl Module {
 
                     for (resource, access_id) in attachments {
                         let access = resolve_access(access_id);
+                        // the load op overwrites the contents, but the last writer is still waited on
+                        if clears.iter().any(|(cleared, _)| cleared == resource)
+                            && let Some(state) = image_states.get_mut(&self.resource_root(*resource))
+                        {
+                            state.layout = vk::ImageLayout::UNDEFINED;
+                        }
                         for resource in self.resource_elements(*resource) {
                             if self.is_buffer(resource) {
                                 buffer_barrier!(self.resource_root(resource), access);
@@ -1803,7 +1813,7 @@ impl Module {
         });
     }
 
-    fn resource_elements(&self, resource: ValueId) -> Vec<ValueId> {
+    pub(super) fn resource_elements(&self, resource: ValueId) -> Vec<ValueId> {
         let mut pending = vec![resource];
         let mut result = Vec::new();
         while let Some(value) = pending.pop() {
@@ -1944,7 +1954,7 @@ impl Module {
         }
     }
 
-    fn resolve_resource(&self, id: ValueId) -> Option<&IR> {
+    pub(super) fn resolve_resource(&self, id: ValueId) -> Option<&IR> {
         let base = self.resolutions.get(id.0 as usize)?.base?;
         self.instructions.get(base.0 as usize)
     }
@@ -1966,7 +1976,7 @@ impl Module {
         )
     }
 
-    fn resolve_image(&self, id: ValueId) -> Option<ImageType> {
+    pub(super) fn resolve_image(&self, id: ValueId) -> Option<ImageType> {
         match self.resolve_resource(id)? {
             IR::ConstructImage {
                 format,
@@ -2005,7 +2015,7 @@ impl Module {
         }
     }
 
-    fn resolve_extent_2d(&self, id: ValueId) -> Option<vk::Extent2D> {
+    pub(super) fn resolve_extent_2d(&self, id: ValueId) -> Option<vk::Extent2D> {
         match self.instructions.get(id.0 as usize)? {
             IR::Constant(ir::Constant::Extent2D(extent)) => Some(*extent),
             _ => None,

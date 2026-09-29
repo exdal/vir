@@ -2043,9 +2043,9 @@ impl RenderGraph {
             },
             IR::BeginRendering {
                 attachments,
+                clears,
                 render_area,
                 name,
-                ..
             } => {
                 self.ensure_batch(ctx, allocator)?;
                 self.begin_pass_label(ctx, name)?;
@@ -2055,18 +2055,22 @@ impl RenderGraph {
                 let mut depth_attachment = None;
                 for (resource, access) in attachments {
                     let access = self.get::<Access>(access);
+                    let clear = clears
+                        .iter()
+                        .find(|(cleared, _)| cleared == resource)
+                        .map(|(_, color)| self.get::<ClearValue>(color));
                     if access.intersects(Access::ColorRW) {
                         color_attachments.extend(
                             self.resource_elements(resource)
                                 .into_iter()
-                                .map(|attachment| (self.get::<ImageAttachment>(&attachment), access)),
+                                .map(|attachment| (self.get::<ImageAttachment>(&attachment), access, clear)),
                         );
                     }
                     if depth_attachment.is_none()
                         && access.intersects(Access::DepthStencilRW)
                         && let Some(attachment) = self.resource_elements(resource).into_iter().next()
                     {
-                        depth_attachment = Some((self.get::<ImageAttachment>(&attachment), access));
+                        depth_attachment = Some((self.get::<ImageAttachment>(&attachment), access, clear));
                     }
                 }
 
@@ -2076,7 +2080,7 @@ impl RenderGraph {
                     false => color_attachments
                         .first()
                         .or(depth_attachment.as_ref())
-                        .map(|(attachment, _)| vk::Extent2D {
+                        .map(|(attachment, ..)| vk::Extent2D {
                             width: attachment.extent().width,
                             height: attachment.extent().height,
                         })
@@ -2086,24 +2090,18 @@ impl RenderGraph {
                 let render_area = vk::Rect2D::default().extent(extent);
                 self.render_area = render_area;
 
-                let attachment_infos = color_attachments
-                    .iter()
-                    .map(|(attachment, access)| {
-                        vk::RenderingAttachmentInfo::default()
-                            .image_view(attachment.image_view())
-                            .image_layout((*access).into())
-                            .load_op(vk::AttachmentLoadOp::LOAD)
-                            .store_op(vk::AttachmentStoreOp::STORE)
-                    })
-                    .collect::<Vec<_>>();
-
-                let depth_info = depth_attachment.as_ref().map(|(attachment, access)| {
-                    vk::RenderingAttachmentInfo::default()
+                let attachment_info = |(attachment, access, clear): &(ImageAttachment, Access, Option<ClearValue>)| {
+                    let info = vk::RenderingAttachmentInfo::default()
                         .image_view(attachment.image_view())
                         .image_layout((*access).into())
-                        .load_op(vk::AttachmentLoadOp::LOAD)
-                        .store_op(vk::AttachmentStoreOp::STORE)
-                });
+                        .store_op(vk::AttachmentStoreOp::STORE);
+                    match clear {
+                        Some(clear) => info.load_op(vk::AttachmentLoadOp::CLEAR).clear_value(clear.0),
+                        None => info.load_op(vk::AttachmentLoadOp::LOAD),
+                    }
+                };
+                let attachment_infos = color_attachments.iter().map(attachment_info).collect::<Vec<_>>();
+                let depth_info = depth_attachment.as_ref().map(attachment_info);
 
                 self.batch()?
                     .begin_rendering(render_area, &attachment_infos, depth_info.as_ref());
