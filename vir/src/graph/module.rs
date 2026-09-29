@@ -1601,6 +1601,10 @@ impl Module {
                     let last_access = if merged == state.access {
                         state.last_access
                     } else {
+                        if state.access != Access::None {
+                            emit_barrier!(state.last_access, $access_id, state.layout, new_layout, resource);
+                        }
+
                         emit_access!(merged)
                     };
                     ImageState {
@@ -3225,6 +3229,42 @@ mod tests {
         assert_eq!(barriers[0].src, Access::DepthStencilRW);
         assert_eq!(barriers[0].dst, Access::Clear);
         assert_eq!(barriers[0].old_layout, vk::ImageLayout::UNDEFINED);
+    }
+
+    /// The fragment read already has the image in SHADER_READ_ONLY_OPTIMAL, but the transition
+    /// into it was made visible to the fragment stage only, so the compute read still waits.
+    #[test]
+    fn a_read_from_a_new_stage_at_the_same_layout_still_waits() {
+        let mut module = Module::default();
+        let target = module.transient_image(&transient_info());
+        let other = module.transient_image(&transient_info());
+
+        let drawn = module
+            .begin_rendering([(target, Access::ColorRW)])
+            .bind_graphics_pipeline(PipelineId(0))
+            .draw(3, 1)
+            .end_rendering::<1>()[0];
+        let sampled = module
+            .begin_rendering([(other, Access::ColorRW), (drawn, Access::FragmentSampled)])
+            .bind_graphics_pipeline(PipelineId(0))
+            .draw(3, 1)
+            .end_rendering::<2>()[1];
+        let read = module
+            .begin_compute([(sampled, Access::ComputeSampled)])
+            .bind_compute_pipeline(PipelineId(1))
+            .dispatch(1u32, 1u32, 1u32)
+            .end_compute::<1>()[0];
+        let end = module.export(read, Access::ComputeSampled, DomainFlag::Graphics);
+
+        let compiled = module.compile(&Unchecked, end).unwrap();
+        let barriers = image_barriers(&module, &compiled);
+        let widening = barriers
+            .iter()
+            .find(|barrier| barrier.resource == target && barrier.dst == Access::ComputeSampled)
+            .expect("the compute read waits on the fragment read's barrier");
+        assert_eq!(widening.src, Access::FragmentSampled);
+        assert_eq!(widening.old_layout, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        assert_eq!(widening.new_layout, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
     }
 
     #[test]
