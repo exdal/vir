@@ -89,9 +89,9 @@ impl TimestampPool {
 
         self.completed = passes
             .into_iter()
-            .zip(ticks.chunks_exact(2))
-            .map(|(name, pair)| {
-                let elapsed = pair[1].wrapping_sub(pair[0]) & self.valid_mask;
+            .zip(ticks.as_chunks::<2>().0)
+            .map(|(name, [begin, end])| {
+                let elapsed = end.wrapping_sub(*begin) & self.valid_mask;
                 let nanos = (elapsed as f64 * self.period_ns) as u64;
 
                 PassTiming {

@@ -6,7 +6,7 @@ pub mod sampler;
 pub mod shader;
 pub mod swapchain;
 
-pub use buffer::{Buffer, BufferInfo, MemoryLocation};
+pub use buffer::{Buffer, BufferCopy, BufferInfo, MemoryLocation};
 pub use image::{BufferImageCopy, Image, ImageInfo, aspect_mask};
 pub use pipeline::{
     BindlessDescriptorSet,

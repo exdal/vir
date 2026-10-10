@@ -11,6 +11,7 @@ use crate::{
     Access,
     BlendPreset,
     Buffer,
+    BufferCopy,
     BufferImageCopy,
     ClearValue,
     ColorBlendAttachmentState,
@@ -361,6 +362,11 @@ pub enum IR {
         dst: ValueId,
         filter: vk::Filter,
     },
+    CopyBuffer {
+        src: ValueId,
+        dst: ValueId,
+        regions: Vec<BufferCopy>,
+    },
     CopyBufferToImage {
         buffer: ValueId,
         image: ValueId,
@@ -514,6 +520,7 @@ pub fn underlying_object(ir: &IR) -> UnderlyingObject {
 
         IR::Clear { attachment, .. } => UnderlyingObject::Forwards(*attachment),
         IR::Blit { dst, .. } => UnderlyingObject::Forwards(*dst),
+        IR::CopyBuffer { dst, .. } => UnderlyingObject::Forwards(*dst),
         IR::CopyBufferToImage { image, .. } => UnderlyingObject::Forwards(*image),
         IR::Export { resource, .. } => UnderlyingObject::Forwards(*resource),
 
@@ -733,7 +740,9 @@ impl IR {
             IR::Export { .. } => SideEffect::Memory | SideEffect::Sync | SideEffect::External,
 
             IR::Clear { .. } => SideEffect::Write | SideEffect::Command,
-            IR::Blit { .. } | IR::CopyBufferToImage { .. } => SideEffect::Memory | SideEffect::Command,
+            IR::Blit { .. } | IR::CopyBuffer { .. } | IR::CopyBufferToImage { .. } => {
+                SideEffect::Memory | SideEffect::Command
+            },
 
             IR::BeginRendering { .. } => SideEffect::Memory | SideEffect::Command | SideEffect::State,
             IR::BeginCompute { .. } => SideEffect::Memory | SideEffect::Sync | SideEffect::Command | SideEffect::State,
@@ -853,6 +862,10 @@ impl IR {
                 visit(*color);
             },
             IR::Blit { src, dst, .. } => {
+                visit(*src);
+                visit(*dst);
+            },
+            IR::CopyBuffer { src, dst, .. } => {
                 visit(*src);
                 visit(*dst);
             },
@@ -1027,6 +1040,10 @@ impl IR {
             IR::Blit { src, dst, .. } => {
                 fixed(*src, Access::BlitRead);
                 fixed(*dst, Access::BlitWrite);
+            },
+            IR::CopyBuffer { src, dst, .. } => {
+                fixed(*src, Access::CopyRead);
+                fixed(*dst, Access::CopyWrite);
             },
             IR::CopyBufferToImage { buffer, image, .. } => {
                 fixed(*buffer, Access::CopyRead);
@@ -1586,6 +1603,14 @@ impl IR {
             },
             IR::Blit { src, dst, filter } => {
                 write!(f, "blit {} -> {} filter={filter:?}", p.operand(*src), p.operand(*dst))
+            },
+            IR::CopyBuffer { src, dst, regions } => {
+                write!(f, "copy_buffer {} -> {}", p.operand(*src), p.operand(*dst))?;
+                for region in regions {
+                    write!(f, " [{}..+{} -> {}]", region.src_offset, region.size, region.dst_offset)?;
+                }
+
+                Ok(())
             },
             IR::CopyBufferToImage { buffer, image, region } => {
                 write!(

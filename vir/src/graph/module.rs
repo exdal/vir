@@ -9,6 +9,7 @@ use crate::{
     Access,
     AcquiredSwapchain,
     Buffer,
+    BufferCopy,
     BufferImageCopy,
     BufferInfo,
     ClearValue,
@@ -802,6 +803,20 @@ impl Module {
         self.emit(IR::Blit { src, dst, filter })
     }
 
+    pub fn copy_buffer(&mut self, src: ValueId, dst: ValueId, regions: &[BufferCopy]) -> ValueId {
+        let regions = regions
+            .iter()
+            .copied()
+            .filter(|region| region.size > 0)
+            .collect::<Vec<_>>();
+        if regions.is_empty() {
+            tracing::warn!(%dst, "every copy region is empty; the copy is dropped");
+            return dst;
+        }
+
+        self.emit(IR::CopyBuffer { src, dst, regions })
+    }
+
     pub fn copy_buffer_to_image(&mut self, buffer: ValueId, image: ValueId) -> ValueId {
         // an image bound to a variable has no extent to read here, so the whole of it is left
         // for the interpreter to measure off whatever was bound
@@ -1037,6 +1052,10 @@ impl Module {
                         stack.push(*attachment);
                     },
                     IR::Blit { src, dst, .. } => {
+                        stack.push(*dst);
+                        stack.push(*src);
+                    },
+                    IR::CopyBuffer { src, dst, .. } => {
                         stack.push(*dst);
                         stack.push(*src);
                     },
@@ -1696,6 +1715,11 @@ impl Module {
                     transition!(*dst, write_id, Access::BlitWrite);
                 },
 
+                IR::CopyBuffer { src, dst, .. } => {
+                    buffer_barrier!(self.resource_root(*src), Access::CopyRead);
+                    buffer_barrier!(self.resource_root(*dst), Access::CopyWrite);
+                },
+
                 IR::CopyBufferToImage { buffer, image, .. } => {
                     buffer_barrier!(self.resource_root(*buffer), Access::CopyRead);
                     let write_id = emit_access!(Access::CopyWrite);
@@ -1878,6 +1902,10 @@ impl Module {
         };
         for (_, ir) in nodes.iter() {
             match ir {
+                IR::CopyBuffer { src, dst, .. } => {
+                    used(src, vk::BufferUsageFlags::TRANSFER_SRC);
+                    used(dst, vk::BufferUsageFlags::TRANSFER_DST);
+                },
                 IR::CopyBufferToImage { buffer, .. } => used(buffer, vk::BufferUsageFlags::TRANSFER_SRC),
                 IR::BindVertexBuffers { buffers, .. } => self
                     .array_elements(*buffers)
@@ -5793,6 +5821,40 @@ mod tests {
         assert_eq!(
             image_usage(&module.compile(&Unchecked, end).unwrap(), texture),
             vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED
+        );
+    }
+
+    #[test]
+    fn a_buffer_copy_keeps_its_nonempty_regions_and_is_fenced_before_a_read() {
+        let mut module = Module::default();
+        let staging = module.import_buffer(&Buffer::default(), Access::HostWrite);
+        let device = module.import_buffer(&Buffer::default(), Access::None);
+        assert_eq!(module.copy_buffer(staging, device, &[BufferCopy::default()]), device);
+
+        let kept = BufferCopy {
+            src_offset: 0,
+            dst_offset: 64,
+            size: 16,
+        };
+        let empty = BufferCopy {
+            src_offset: 16,
+            dst_offset: 0,
+            size: 0,
+        };
+        let copied = module.copy_buffer(staging, device, &[kept, empty]);
+        let exported = module.export(copied, Access::ComputeRead, DomainFlag::Graphics);
+        let program = module.compile(&Unchecked, exported).unwrap();
+        let instructions = program.instructions();
+
+        let copy = instructions
+            .iter()
+            .position(|(_, ir)| matches!(ir, IR::CopyBuffer { .. }))
+            .unwrap();
+        assert!(matches!(&instructions[copy].1, IR::CopyBuffer { regions, .. } if *regions == [kept]));
+        assert!(
+            instructions[copy..]
+                .iter()
+                .any(|(_, ir)| matches!(ir, IR::MemoryBarrier { .. }))
         );
     }
 

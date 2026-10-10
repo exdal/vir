@@ -262,6 +262,10 @@ impl CommandBuffer {
         }
     }
 
+    pub fn copy_buffer(&self, src: vk::Buffer, dst: vk::Buffer, regions: &[vk::BufferCopy]) {
+        unsafe { self.device.as_ref().cmd_copy_buffer(self.handle, src, dst, regions) }
+    }
+
     pub fn copy_buffer_to_image(
         &self, buffer: vk::Buffer, image: vk::Image, image_layout: vk::ImageLayout, regions: &[vk::BufferImageCopy],
     ) {

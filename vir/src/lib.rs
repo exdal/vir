@@ -43,6 +43,7 @@ pub use resource::{
     BindlessDescriptorSet,
     BlendPreset,
     Buffer,
+    BufferCopy,
     BufferImageCopy,
     BufferInfo,
     ColorBlendAttachmentState,

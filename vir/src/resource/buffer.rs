@@ -6,6 +6,13 @@ use std::{
 use ash::vk::{self, Handle};
 pub use gpu_allocator::MemoryLocation;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct BufferCopy {
+    pub src_offset: u64,
+    pub dst_offset: u64,
+    pub size: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct BufferInfo {
     pub size: u64,

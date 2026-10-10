@@ -2041,6 +2041,31 @@ impl RenderGraph {
                     *filter,
                 );
             },
+            IR::CopyBuffer { src, dst, regions } => {
+                self.ensure_batch(ctx, allocator)?;
+                self.set_value(value_id, Value::Reference(*dst));
+
+                let src = self.get::<Buffer>(src);
+                let dst = self.get::<Buffer>(dst);
+                let regions = regions
+                    .iter()
+                    .map(|region| {
+                        let fits = |offset: u64, buffer: &Buffer| {
+                            offset.checked_add(region.size).is_some_and(|end| end <= buffer.size())
+                        };
+                        if !fits(region.src_offset, &src) || !fits(region.dst_offset, &dst) {
+                            return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
+                        }
+
+                        Ok(vk::BufferCopy::default()
+                            .src_offset(src.checked_offset(region.src_offset)?)
+                            .dst_offset(dst.checked_offset(region.dst_offset)?)
+                            .size(region.size))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                self.batch()?.copy_buffer(src.handle(), dst.handle(), &regions);
+            },
             IR::CopyBufferToImage { buffer, image, region } => {
                 self.ensure_batch(ctx, allocator)?;
                 self.set_value(value_id, Value::Reference(*image));
