@@ -6,10 +6,12 @@ mod buffer_pool;
 pub mod frame;
 mod image_cache;
 pub mod persistent;
+mod timestamps;
 
 pub use self::{
     frame::{FrameAllocator, SuperFrameAllocator},
     persistent::PersistentAllocator,
+    timestamps::PassTiming,
 };
 use crate::{Buffer, BufferInfo, CommandBuffer, Image, ImageInfo, SamplerInfo};
 
@@ -50,6 +52,13 @@ pub enum AllocatorKind<'a> {
 }
 
 impl<'a> AllocatorKind<'a> {
+    pub(crate) fn timestamps(&mut self) -> Option<&mut timestamps::TimestampPool> {
+        match self {
+            AllocatorKind::Persistent(_) => None,
+            AllocatorKind::Frame(a) => a.timestamps_mut(),
+        }
+    }
+
     pub fn allocate_binary_semaphore(&mut self) -> Result<vk::Semaphore, vk::Result> {
         match self {
             AllocatorKind::Persistent(a) => a.allocate_binary_semaphore(),

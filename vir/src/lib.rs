@@ -10,7 +10,7 @@ use std::{
     hash::{Hash, Hasher},
 };
 
-pub use allocator::{AllocatorKind, FrameAllocator, PersistentAllocator, SuperFrameAllocator};
+pub use allocator::{AllocatorKind, FrameAllocator, PassTiming, PersistentAllocator, SuperFrameAllocator};
 use ash::vk;
 pub use ash::vk::{DispatchIndirectCommand, DrawIndexedIndirectCommand, DrawIndirectCommand};
 pub use context::{Access, CommandBuffer, Context, DomainFlag};

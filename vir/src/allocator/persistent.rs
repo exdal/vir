@@ -91,6 +91,13 @@ impl PersistentAllocator {
         unsafe { self.device.as_ref().create_command_pool(&create_info, None) }
     }
 
+    /// The memory a buffer from this allocator was bound to, pooled buffers report their backing block.
+    pub fn memory_properties(&self, buffer: &Buffer) -> Option<vk::MemoryPropertyFlags> {
+        self.allocations
+            .get(&buffer.handle())
+            .map(|allocation| allocation.memory_properties())
+    }
+
     pub fn reset_command_pool(&self, cmd_pool: vk::CommandPool, release_resources: bool) -> Result<(), vk::Result> {
         let flags = if release_resources {
             vk::CommandPoolResetFlags::RELEASE_RESOURCES

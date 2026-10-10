@@ -847,6 +847,7 @@ pub struct RenderGraph {
     recorded_scissors: Vec<vk::Rect2D>,
     recorded_push_constants: Option<(vk::PipelineLayout, PushConstants)>,
     labeled_pass: bool,
+    timed_pass: Option<u32>,
     pending_barriers: PendingBarriers,
     current_batch: Option<Batch>,
     current_submit: Submit,
@@ -890,6 +891,7 @@ impl RenderGraph {
             recorded_scissors: Vec::new(),
             recorded_push_constants: None,
             labeled_pass: false,
+            timed_pass: None,
             pending_barriers: PendingBarriers::default(),
             current_batch: None,
             current_submit: Submit::default(),
@@ -1138,6 +1140,7 @@ impl RenderGraph {
         self.recorded_scissors.clear();
         self.recorded_push_constants = None;
         self.labeled_pass = false;
+        self.timed_pass = None;
         self.pending_barriers.clear();
         self.current_batch = None;
         self.current_submit = Submit::default();
@@ -1222,6 +1225,31 @@ impl RenderGraph {
         {
             self.batch()?.end_label(debug_utils);
         }
+        Ok(())
+    }
+
+    fn begin_pass_timestamp(&mut self, allocator: &mut AllocatorKind, name: &ValueId) -> Result<(), vk::Result> {
+        if !name.is_valid() {
+            return Ok(());
+        }
+
+        let Some(timestamps) = allocator.timestamps() else {
+            return Ok(());
+        };
+
+        let name = self.get::<Arc<str>>(name);
+        self.timed_pass = timestamps.begin(self.batch()?, name);
+
+        Ok(())
+    }
+
+    fn end_pass_timestamp(&mut self, allocator: &mut AllocatorKind) -> Result<(), vk::Result> {
+        if let Some(query) = self.timed_pass.take()
+            && let Some(timestamps) = allocator.timestamps()
+        {
+            timestamps.end(self.batch()?, query);
+        }
+
         Ok(())
     }
 
@@ -2049,6 +2077,7 @@ impl RenderGraph {
             } => {
                 self.ensure_batch(ctx, allocator)?;
                 self.begin_pass_label(ctx, name)?;
+                self.begin_pass_timestamp(allocator, name)?;
                 self.open_descriptors();
 
                 let mut color_attachments = Vec::new();
@@ -2313,12 +2342,14 @@ impl RenderGraph {
             IR::EndRendering { pass } => {
                 self.set_value(value_id, Value::Reference(*pass));
                 self.batch()?.end_rendering();
+                self.end_pass_timestamp(allocator)?;
                 self.end_pass_label(ctx)?;
                 self.open_descriptors();
             },
             IR::BeginCompute { attachments, name } => {
                 self.ensure_batch(ctx, allocator)?;
                 self.begin_pass_label(ctx, name)?;
+                self.begin_pass_timestamp(allocator, name)?;
                 self.open_descriptors();
                 match attachments.first() {
                     Some((first, _)) => self.set_value(value_id, Value::Reference(*first)),
@@ -2327,6 +2358,7 @@ impl RenderGraph {
             },
             IR::EndCompute { pass } => {
                 self.set_value(value_id, Value::Reference(*pass));
+                self.end_pass_timestamp(allocator)?;
                 self.end_pass_label(ctx)?;
                 self.open_descriptors();
             },

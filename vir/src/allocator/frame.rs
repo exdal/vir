@@ -8,8 +8,9 @@ use super::{
     buffer_pool::align_up,
     image_cache::FrameImageCache,
     persistent::{PersistentAllocator, allocation_alignment},
+    timestamps::{PassTiming, TimestampPool},
 };
-use crate::{Buffer, BufferInfo, CommandBuffer, Image, ImageInfo, MemoryLocation, SamplerInfo};
+use crate::{Buffer, BufferInfo, CommandBuffer, Context, DomainFlag, Image, ImageInfo, MemoryLocation, SamplerInfo};
 
 const FRAME_BLOCK_SIZE: u64 = 16 * 1024 * 1024;
 const IDLE_FRAMES: usize = 16;
@@ -36,6 +37,7 @@ pub struct FrameAllocator {
     image_cache: FrameImageCache,
     cmd_buffers: Vec<vk::CommandBuffer>,
     timeline_waits: Vec<(vk::Semaphore, u64)>,
+    timestamps: Option<TimestampPool>,
 }
 
 impl FrameAllocator {
@@ -56,8 +58,15 @@ impl FrameAllocator {
             image_cache: FrameImageCache::default(),
             cmd_buffers: Vec::new(),
             timeline_waits: Vec::new(),
+            timestamps: None,
         }
     }
+
+    /// GPU time of each named pass the last time this frame was used, empty unless
+    /// [`SuperFrameAllocator::enable_timestamps`] succeeded.
+    pub fn completed_timings(&self) -> &[PassTiming] { self.timestamps.as_ref().map_or(&[], TimestampPool::completed) }
+
+    pub(crate) fn timestamps_mut(&mut self) -> Option<&mut TimestampPool> { self.timestamps.as_mut() }
 
     pub fn add_timeline_wait(&mut self, semaphore: vk::Semaphore, value: u64) {
         self.timeline_waits.push((semaphore, value));
@@ -82,6 +91,9 @@ impl FrameAllocator {
     fn deallocate(&mut self, issued_frame: usize) -> Result<(), vk::Result> {
         self.wait_idle()?;
         self.timeline_waits.clear();
+        if let Some(timestamps) = self.timestamps.as_mut() {
+            timestamps.resolve();
+        }
 
         if !self.cmd_pool.is_null() {
             if !self.cmd_buffers.is_empty() {
@@ -298,6 +310,34 @@ impl SuperFrameAllocator {
 
     fn current_frame(&mut self) -> &mut FrameAllocator {
         self.frames.get_mut(self.frame_counter % self.frames_in_flight).unwrap()
+    }
+
+    /// Returns false when the graphics queue cannot write timestamps.
+    pub fn enable_timestamps(&mut self, ctx: &Context) -> Result<bool, vk::Result> {
+        let Some(queue) = ctx.command_queue_by_domain(DomainFlag::Graphics) else {
+            return Ok(false);
+        };
+
+        let families = unsafe {
+            ctx.instance()
+                .get_physical_device_queue_family_properties(*ctx.physical_device())
+        };
+        let valid_bits = families
+            .get(queue.family_index() as usize)
+            .map_or(0, |family| family.timestamp_valid_bits);
+        if valid_bits == 0 {
+            return Ok(false);
+        }
+
+        for frame in &mut self.frames {
+            frame.timestamps = Some(TimestampPool::new(
+                frame.device,
+                frame.limits.timestamp_period,
+                valid_bits,
+            )?);
+        }
+
+        Ok(true)
     }
 
     pub fn get_next_frame(&mut self) -> Result<&mut FrameAllocator, vk::Result> {

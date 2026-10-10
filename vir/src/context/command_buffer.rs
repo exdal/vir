@@ -296,6 +296,22 @@ impl CommandBuffer {
         unsafe { debug_utils.cmd_end_debug_utils_label(self.handle) }
     }
 
+    pub fn reset_query_pool(&self, pool: vk::QueryPool, first_query: u32, query_count: u32) {
+        unsafe {
+            self.device
+                .as_ref()
+                .cmd_reset_query_pool(self.handle, pool, first_query, query_count)
+        }
+    }
+
+    pub fn write_timestamp(&self, stage: vk::PipelineStageFlags2, pool: vk::QueryPool, query: u32) {
+        unsafe {
+            self.device
+                .as_ref()
+                .cmd_write_timestamp2(self.handle, stage, pool, query)
+        }
+    }
+
     pub fn push_descriptor_set(
         &self, loader: &khr::push_descriptor::Device, bind_point: vk::PipelineBindPoint, layout: vk::PipelineLayout,
         set: u32, writes: &[vk::WriteDescriptorSet],
