@@ -4,7 +4,11 @@ use ash::vk;
 use vir::{ClearValue, Module, PipelineId, ValueId};
 
 use crate::{
+    context::out_ptr,
     error::{Failure, guard_id, guard_result, guard_void},
+    graph::{VirRenderGraph, graph},
+    program::VirProgram,
+    swapchain::VirSwapChain,
     types::{VirAttachment, VirRasterizationState, VirRect2D, VirViewport, blend_preset, bytes, dynamic_state, text},
 };
 
@@ -227,6 +231,27 @@ pub unsafe extern "C" fn vir_module_set_condition(
 
         unsafe { *out_count = merged.len() };
 
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_module_acquire_next_image(m: *mut VirModule, s: *const VirSwapChain) -> u32 {
+    guard_id(|| {
+        let swapchain = unsafe { s.as_ref() }.ok_or_else(|| Failure::new("swapchain is null"))?;
+        Ok(module(m)?.acquire_next_image(&swapchain.0).0)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_module_compile(
+    m: *mut VirModule, g: *mut VirRenderGraph, root: u32, out: *mut *mut VirProgram,
+) -> vk::Result {
+    guard_result(|| {
+        let graph = graph(g)?;
+        let out = out_ptr(out)?;
+        let program = module(m)?.compile(&*graph, ValueId(root))?;
+        *out = Box::into_raw(Box::new(VirProgram(program)));
         Ok(())
     })
 }
