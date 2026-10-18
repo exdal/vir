@@ -20,6 +20,7 @@ pub struct VirBufferInfo {
     pub size: u64,
     pub usage: u32,
     pub location: u32,
+    pub alignment: u64,
     pub name: *const u8,
     pub name_len: usize,
 }
@@ -31,6 +32,9 @@ pub struct VirImageInfo {
     pub height: u32,
     pub format: i32,
     pub usage: u32,
+    pub mip_levels: u32,
+    pub array_layers: u32,
+    pub samples: u32,
     pub name: *const u8,
     pub name_len: usize,
 }
@@ -69,7 +73,9 @@ pub unsafe extern "C" fn vir_persistent_allocator_allocate_buffer(
         let name = unsafe { text(info.name, info.name_len) }?;
 
         let buffer = allocator.allocate_buffer(
-            &BufferInfo::new(info.size, vk::BufferUsageFlags::from_raw(info.usage), location).with_name(name),
+            &BufferInfo::new(info.size, vk::BufferUsageFlags::from_raw(info.usage), location)
+                .with_alignment(info.alignment.max(1))
+                .with_name(name),
         )?;
         *out = Box::into_raw(Box::new(VirBuffer(buffer)));
 
@@ -107,6 +113,10 @@ pub unsafe extern "C" fn vir_persistent_allocator_allocate_image(
         let allocator = persistent(a)?;
         let info = unsafe { info.as_ref() }.ok_or_else(|| Failure::new("image info is null"))?;
         let out = out_ptr(out)?;
+        if info.mip_levels == 0 || info.array_layers == 0 || info.samples == 0 {
+            return Err(Failure::new("mip_levels, array_layers and samples must be at least 1"));
+        }
+
         let extent = vk::Extent2D {
             width: info.width,
             height: info.height,
@@ -119,15 +129,20 @@ pub unsafe extern "C" fn vir_persistent_allocator_allocate_image(
             kind => return Err(Failure::new(format!("unknown image kind {kind}"))),
         }
         .with_usage(vk::ImageUsageFlags::from_raw(info.usage))
+        .with_mips(info.mip_levels)
+        .with_layers(info.array_layers)
+        .with_samples(vk::SampleCountFlags::from_raw(info.samples))
         .with_name(unsafe { text(info.name, info.name_len) }?);
 
+        let is_array = info.array_layers > 1;
+        let view_type = if is_array {
+            vk::ImageViewType::TYPE_2D_ARRAY
+        } else {
+            vk::ImageViewType::TYPE_2D
+        };
+
         let image = allocator.allocate_image(&image_info)?;
-        let view = match allocator.allocate_image_view(
-            image.handle(),
-            format,
-            vk::ImageViewType::TYPE_2D,
-            image.subresource_range(),
-        ) {
+        let view = match allocator.allocate_image_view(image.handle(), format, view_type, image.subresource_range()) {
             Ok(view) => view,
             Err(err) => {
                 allocator.deallocate_image(image);

@@ -21,12 +21,16 @@ pkgs.mkShell {
     pkgs.wayland
     pkgs.shader-slang
     pkgs.llvmPackages.libclang
+    pkgs.dotnet-sdk_10
   ];
 
   SLANG_INCLUDE_DIR = "${pkgs.shader-slang.dev}/include";
   SLANG_LIB_DIR = "${pkgs.shader-slang}/lib";
   LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
   BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include";
+  DOTNET_ROOT = "${pkgs.dotnet-sdk_10}/share/dotnet";
+  DOTNET_CLI_TELEMETRY_OPTOUT = "1";
+  DOTNET_NOLOGO = "1";
 
   shellHook = ''
     export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:${pkgs.wayland}/lib";

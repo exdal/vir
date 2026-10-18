@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>Vir</RootNamespace>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+    <VirRoot>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)../../..'))/</VirRoot>
+    <CargoProfile Condition="'$(Configuration)' == 'Release'">release</CargoProfile>
+    <CargoProfile Condition="'$(Configuration)' != 'Release'">debug</CargoProfile>
+    <CargoArgs Condition="'$(Configuration)' == 'Release'">--release</CargoArgs>
+    <NativeLibrary>$(VirRoot)target/$(CargoProfile)/libvir_ffi.so</NativeLibrary>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Content Include="$(NativeLibrary)" Link="libvir_ffi.so" Visible="false" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <Target Name="BuildNativeLibrary" BeforeTargets="BeforeBuild">
+    <Exec Command="cargo build -p vir-ffi $(CargoArgs) --manifest-path &quot;$(VirRoot)Cargo.toml&quot;" />
+  </Target>
+
+</Project>
