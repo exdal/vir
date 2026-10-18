@@ -3,6 +3,11 @@ resolver = "3"
 members = [
   "vir",
   "vir-examples",
+  "vir-ffi",
+]
+default-members = [
+  "vir",
+  "vir-examples",
 ]
 
 [workspace.dependencies]

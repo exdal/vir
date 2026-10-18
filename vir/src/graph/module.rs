@@ -294,7 +294,7 @@ mod condition_result_sealed {
 
 /// A value shape that can leave both arms of [`Module::set_condition`].
 ///
-/// This is implemented for [`ValueId`], fixed-size arrays of `ValueId` and `Vec<ValueId>`.
+/// This is implemented for [`ValueId`] and fixed-size arrays of `ValueId`, plus `Vec<ValueId>` with the `ffi` feature.
 pub trait ConditionResult: condition_result_sealed::Sealed + Sized {
     #[doc(hidden)]
     fn merge(module: &mut Module, taken: Self, skipped: Self, true_label: LabelId, false_label: LabelId) -> Self;
@@ -316,8 +316,10 @@ impl<const N: usize> ConditionResult for [ValueId; N] {
     }
 }
 
+#[cfg(feature = "ffi")]
 impl condition_result_sealed::Sealed for Vec<ValueId> {}
 
+#[cfg(feature = "ffi")]
 impl ConditionResult for Vec<ValueId> {
     fn merge(module: &mut Module, taken: Self, skipped: Self, true_label: LabelId, false_label: LabelId) -> Self {
         assert_eq!(
@@ -2747,6 +2749,7 @@ impl Module {
         self.end_pass(PassKind::Rendering, |pass| IR::EndRendering { pass })
     }
 
+    #[cfg(feature = "ffi")]
     pub fn end_rendering_into(&mut self, out: &mut [ValueId]) {
         self.end_pass_into(PassKind::Rendering, |pass| IR::EndRendering { pass }, out);
     }
@@ -5211,6 +5214,7 @@ mod tests {
         module.compile(&Unchecked, first_after).unwrap();
     }
 
+    #[cfg(feature = "ffi")]
     #[test]
     fn conditionals_merge_vectors_element_wise() {
         let mut module = Module::default();
@@ -5225,6 +5229,7 @@ mod tests {
         assert!(matches!(module.get(merged[1]), IR::Phi { .. }));
     }
 
+    #[cfg(feature = "ffi")]
     #[test]
     #[should_panic(expected = "the arms of a condition returned 1 and 2 values")]
     fn conditionals_reject_vectors_of_different_lengths() {

@@ -31,8 +31,10 @@ pub struct PipelineId(pub(crate) u32);
 impl PipelineId {
     pub const INVALID: Self = Self(u32::MAX);
 
+    #[cfg(feature = "ffi")]
     pub const fn from_raw(raw: u32) -> Self { Self(raw) }
 
+    #[cfg(feature = "ffi")]
     pub const fn raw(self) -> u32 { self.0 }
 
     pub const fn is_valid(self) -> bool { self.0 != u32::MAX }
