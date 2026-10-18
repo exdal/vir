@@ -294,7 +294,7 @@ mod condition_result_sealed {
 
 /// A value shape that can leave both arms of [`Module::set_condition`].
 ///
-/// This is implemented for [`ValueId`] and fixed-size arrays of `ValueId`.
+/// This is implemented for [`ValueId`], fixed-size arrays of `ValueId` and `Vec<ValueId>`.
 pub trait ConditionResult: condition_result_sealed::Sealed + Sized {
     #[doc(hidden)]
     fn merge(module: &mut Module, taken: Self, skipped: Self, true_label: LabelId, false_label: LabelId) -> Self;
@@ -313,6 +313,26 @@ impl<const N: usize> condition_result_sealed::Sealed for [ValueId; N] {}
 impl<const N: usize> ConditionResult for [ValueId; N] {
     fn merge(module: &mut Module, taken: Self, skipped: Self, true_label: LabelId, false_label: LabelId) -> Self {
         std::array::from_fn(|index| module.phi(&[(taken[index], true_label), (skipped[index], false_label)]))
+    }
+}
+
+impl condition_result_sealed::Sealed for Vec<ValueId> {}
+
+impl ConditionResult for Vec<ValueId> {
+    fn merge(module: &mut Module, taken: Self, skipped: Self, true_label: LabelId, false_label: LabelId) -> Self {
+        assert_eq!(
+            taken.len(),
+            skipped.len(),
+            "the arms of a condition returned {} and {} values",
+            taken.len(),
+            skipped.len()
+        );
+
+        taken
+            .into_iter()
+            .zip(skipped)
+            .map(|(taken, skipped)| module.phi(&[(taken, true_label), (skipped, false_label)]))
+            .collect()
     }
 }
 
@@ -5191,6 +5211,29 @@ mod tests {
         module.compile(&Unchecked, first_after).unwrap();
     }
 
+    #[test]
+    fn conditionals_merge_vectors_element_wise() {
+        let mut module = Module::default();
+        let enabled = module.declare_bool_var("enabled", true);
+        let first = module.constant_u32(1);
+        let second = module.constant_u32(2);
+
+        let merged = module.set_condition(enabled, |_| vec![first, second], |_| vec![second, first]);
+
+        assert_eq!(merged.len(), 2);
+        assert!(matches!(module.get(merged[0]), IR::Phi { .. }));
+        assert!(matches!(module.get(merged[1]), IR::Phi { .. }));
+    }
+
+    #[test]
+    #[should_panic(expected = "the arms of a condition returned 1 and 2 values")]
+    fn conditionals_reject_vectors_of_different_lengths() {
+        let mut module = Module::default();
+        let enabled = module.declare_bool_var("enabled", true);
+        let value = module.constant_u32(1);
+
+        module.set_condition(enabled, |_| vec![value], |_| vec![value, value]);
+    }
     #[test]
     #[should_panic(expected = "a compute pass must declare at least one resource")]
     fn an_empty_pass_is_rejected() { Module::default().begin_compute([]); }
