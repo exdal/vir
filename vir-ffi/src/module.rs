@@ -1,15 +1,26 @@
 use std::ffi::c_void;
 
-use ash::vk;
-use vir::{ClearValue, Module, PipelineId, ValueId};
+use ash::{vk, vk::Handle};
+use vir::{Access, ClearValue, DomainFlag, ImageAttachment, Module, PipelineId, ValueId};
 
 use crate::{
     context::out_ptr,
     error::{Failure, guard_id, guard_result, guard_void},
     graph::{VirRenderGraph, graph},
     program::VirProgram,
+    resource::{VirBuffer, VirImage},
     swapchain::VirSwapChain,
-    types::{VirAttachment, VirRasterizationState, VirRect2D, VirViewport, blend_preset, bytes, dynamic_state, text},
+    types::{
+        VirAttachment,
+        VirDepthState,
+        VirRasterizationState,
+        VirRect2D,
+        VirViewport,
+        blend_preset,
+        bytes,
+        dynamic_state,
+        text,
+    },
 };
 
 #[repr(transparent)]
@@ -252,6 +263,112 @@ pub unsafe extern "C" fn vir_module_compile(
         let out = out_ptr(out)?;
         let program = module(m)?.compile(&*graph, ValueId(root))?;
         *out = Box::into_raw(Box::new(VirProgram(program)));
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_module_import_buffer(m: *mut VirModule, b: *const VirBuffer, access: u64) -> u32 {
+    guard_id(|| {
+        let buffer = unsafe { b.as_ref() }.ok_or_else(|| Failure::new("buffer is null"))?;
+        Ok(module(m)?.import_buffer(&buffer.0, Access::from_bits_retain(access)).0)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_module_import_image(
+    m: *mut VirModule, img: *const VirImage, layout: i32, access: u64,
+) -> u32 {
+    guard_id(|| {
+        let image = unsafe { img.as_ref() }.ok_or_else(|| Failure::new("image is null"))?;
+        let attachment =
+            ImageAttachment::from_image(&image.image, vk::ImageLayout::from_raw(layout)).with_image_view(image.view);
+        Ok(module(m)?
+            .import_attachment(&attachment, Access::from_bits_retain(access))
+            .0)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_module_set_name(m: *mut VirModule, value: u32, name: *const u8, name_len: usize) -> u32 {
+    guard_id(|| {
+        let name = unsafe { text(name, name_len) }?;
+        Ok(module(m)?.set_name(ValueId(value), name).0)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_module_copy_buffer_to_image(m: *mut VirModule, buffer: u32, image: u32) -> u32 {
+    guard_id(|| Ok(module(m)?.copy_buffer_to_image(ValueId(buffer), ValueId(image)).0))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_module_export(m: *mut VirModule, value: u32, access: u64, domain: u32) -> u32 {
+    guard_id(|| {
+        let access = Access::from_bits_retain(access);
+        Ok(module(m)?
+            .export(ValueId(value), access, DomainFlag::from_bits_retain(domain))
+            .0)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_module_set_depth(m: *mut VirModule, depth: VirDepthState) {
+    guard_void(|| {
+        module(m)?.set_depth(depth.into());
+        Ok(())
+    });
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_module_bind_texture(m: *mut VirModule, set: u32, binding: u32, image: u32, sampler: u64) {
+    guard_void(|| {
+        module(m)?.bind_texture(set, binding, ValueId(image), vk::Sampler::from_raw(sampler));
+        Ok(())
+    });
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_module_bind_vertex_buffer(m: *mut VirModule, binding: u32, buffer: u32) {
+    guard_void(|| {
+        module(m)?.bind_vertex_buffer(binding, ValueId(buffer));
+        Ok(())
+    });
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_module_bind_index_buffer(m: *mut VirModule, buffer: u32, index_type: i32) {
+    guard_void(|| {
+        module(m)?.bind_index_buffer(ValueId(buffer), vk::IndexType::from_raw(index_type));
+        Ok(())
+    });
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_module_draw_indexed(m: *mut VirModule, index_count: u32, instance_count: u32) {
+    guard_void(|| {
+        module(m)?.draw_indexed(index_count, instance_count);
+        Ok(())
+    });
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_module_compile_all(
+    m: *mut VirModule, g: *mut VirRenderGraph, roots: *const u32, count: usize, out: *mut *mut VirProgram,
+) -> vk::Result {
+    guard_result(|| {
+        let graph = graph(g)?;
+        let out = out_ptr(out)?;
+        let roots = if count == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(roots, count) }
+        };
+        let roots = roots.iter().map(|&root| ValueId(root)).collect::<Vec<_>>();
+
+        let program = module(m)?.compile_all(&*graph, &roots)?;
+        *out = Box::into_raw(Box::new(VirProgram(program)));
+
         Ok(())
     })
 }

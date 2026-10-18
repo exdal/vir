@@ -107,3 +107,26 @@ pub(crate) unsafe fn text<'a>(ptr: *const u8, len: usize) -> Result<&'a str, Fai
 
     std::str::from_utf8(unsafe { bytes(ptr, len) }).map_err(|err| Failure::new(format!("string is not UTF-8: {err}")))
 }
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VirDepthState {
+    pub test_enable: u32,
+    pub write_enable: u32,
+    pub compare_op: i32,
+}
+
+impl From<VirDepthState> for vir::DepthState {
+    fn from(state: VirDepthState) -> Self {
+        Self {
+            test_enable: state.test_enable != 0,
+            write_enable: state.write_enable != 0,
+            compare_op: vk::CompareOp::from_raw(state.compare_op),
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_access_image_layout(access: u64) -> i32 {
+    vk::ImageLayout::from(Access::from_bits_retain(access)).as_raw()
+}

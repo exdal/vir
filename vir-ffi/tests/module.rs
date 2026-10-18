@@ -1,7 +1,7 @@
 use std::{ffi::c_void, ptr};
 
 use ash::vk;
-use vir::{Access, ClearValue, Image, ImageAttachment, Unchecked, ValueId};
+use vir::{Access, ClearValue, DomainFlag, Image, ImageAttachment, Unchecked, ValueId};
 use vir_ffi::*;
 
 const INVALID: u32 = u32::MAX;
@@ -240,6 +240,79 @@ fn set_condition_rejects_bad_counts_and_unfilled_results() {
         let (result, ..) = condition(module, arm, arm_of_three, 8);
         assert_ne!(result, vk::Result::SUCCESS);
 
+        vir_module_destroy(module);
+    }
+}
+
+#[test]
+fn records_an_indexed_draw_over_imported_resources() {
+    unsafe {
+        let module = vir_module_create();
+        let target = image(module);
+
+        let vertices = VirBuffer(vir::Buffer::default());
+        let indices = VirBuffer(vir::Buffer::default());
+        let vertex_id = vir_module_import_buffer(module, &vertices, Access::HostWrite.bits());
+        let index_id = vir_module_import_buffer(module, &indices, Access::HostWrite.bits());
+        assert_ne!(vertex_id, INVALID);
+        assert_ne!(index_id, INVALID);
+
+        let extent = vk::Extent3D::default().width(8).height(8).depth(1);
+        let texture = VirImage {
+            image: Image::imported(
+                vk::Image::null(),
+                vk::Format::R8G8B8A8_SRGB,
+                extent,
+                vk::SampleCountFlags::TYPE_1,
+            ),
+            view: vk::ImageView::null(),
+        };
+        let layout = vir_access_image_layout(Access::FragmentSampled.bits());
+        assert_eq!(layout, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL.as_raw());
+        let texture_id = vir_module_import_image(module, &texture, layout, Access::FragmentSampled.bits());
+        assert_ne!(texture_id, INVALID);
+
+        let name = "texture";
+        assert_eq!(
+            vir_module_set_name(module, texture_id, name.as_ptr(), name.len()),
+            texture_id
+        );
+
+        begin_pass(module, target);
+        vir_module_set_depth(
+            module,
+            VirDepthState {
+                test_enable: 1,
+                write_enable: 1,
+                compare_op: vk::CompareOp::LESS.as_raw(),
+            },
+        );
+        vir_module_bind_texture(module, 0, 0, texture_id, 0);
+        vir_module_bind_vertex_buffer(module, 0, vertex_id);
+        vir_module_bind_index_buffer(module, index_id, vk::IndexType::UINT32.as_raw());
+        vir_module_draw_indexed(module, 6, 1);
+
+        let mut out = [INVALID];
+        assert_eq!(
+            vir_module_end_rendering(module, out.as_mut_ptr(), 1),
+            vk::Result::SUCCESS
+        );
+
+        let exported = vir_module_export(module, out[0], Access::Present.bits(), DomainFlag::Present.bits());
+        assert_ne!(exported, INVALID);
+
+        vir_module_destroy(module);
+    }
+}
+
+#[test]
+fn null_resources_are_errors() {
+    unsafe {
+        let module = vir_module_create();
+        assert_eq!(vir_module_import_buffer(module, ptr::null(), 0), INVALID);
+        assert!(last_error().contains("buffer is null"));
+        assert_eq!(vir_module_import_image(module, ptr::null(), 0, 0), INVALID);
+        assert!(last_error().contains("image is null"));
         vir_module_destroy(module);
     }
 }

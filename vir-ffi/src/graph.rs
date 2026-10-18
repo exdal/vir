@@ -4,7 +4,7 @@ use ash::vk;
 use vir::{AllocatorKind, GraphicsPipelineInfo, RenderGraph};
 
 use crate::{
-    allocator::VirFrameAllocator,
+    allocator::{VirFrameAllocator, VirPersistentAllocator},
     context::{VirContext, context, out_ptr},
     error::{Failure, guard_result, guard_void},
     program::VirProgram,
@@ -80,6 +80,26 @@ pub unsafe extern "C" fn vir_render_graph_execute(
 pub unsafe extern "C" fn vir_render_graph_wait(g: *mut VirRenderGraph) -> vk::Result {
     guard_result(|| {
         graph(g)?.wait()?;
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_render_graph_execute_blocking(
+    g: *mut VirRenderGraph, c: *mut VirContext, p: *const VirProgram, a: *mut VirPersistentAllocator,
+) -> vk::Result {
+    guard_result(|| {
+        let graph = graph(g)?;
+        let context = context(c)?;
+        let program = unsafe { p.as_ref() }.ok_or_else(|| Failure::new("program is null"))?;
+        let allocator = unsafe { a.as_mut() }.ok_or_else(|| Failure::new("persistent allocator is null"))?;
+
+        graph.execute_blocking(
+            &context.ctx,
+            &program.0,
+            &mut AllocatorKind::Persistent(&mut allocator.0),
+        )?;
+
         Ok(())
     })
 }
