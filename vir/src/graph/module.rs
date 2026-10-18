@@ -2727,6 +2727,10 @@ impl Module {
         self.end_pass(PassKind::Rendering, |pass| IR::EndRendering { pass })
     }
 
+    pub fn end_rendering_into(&mut self, out: &mut [ValueId]) {
+        self.end_pass_into(PassKind::Rendering, |pass| IR::EndRendering { pass }, out);
+    }
+
     fn dispatch_size(&mut self, size: ir::DispatchSize) -> &mut Self {
         self.chain(Some(PassKind::Compute), "dispatch", |pass| IR::Dispatch {
             pass,
@@ -2833,6 +2837,12 @@ impl Module {
     }
 
     fn end_pass<const N: usize>(&mut self, kind: PassKind, end: impl FnOnce(ValueId) -> IR) -> [ValueId; N] {
+        let mut results = [ValueId::INVALID; N];
+        self.end_pass_into(kind, end, &mut results);
+        results
+    }
+
+    fn end_pass_into(&mut self, kind: PassKind, end: impl FnOnce(ValueId) -> IR, out: &mut [ValueId]) {
         let open = self
             .ongoing_pass
             .as_ref()
@@ -2846,20 +2856,21 @@ impl Module {
         );
         assert_eq!(
             open.resources.len(),
-            N,
-            "the {} pass declared {} resources but its result expects {N}",
+            out.len(),
+            "the {} pass declared {} resources but its result expects {}",
             kind.name(),
-            open.resources.len()
+            open.resources.len(),
+            out.len()
         );
 
         let open = self.close_pass().expect("the open pass was checked above");
         let completion = self.emit(end(open.tip));
-        std::array::from_fn(|index| {
-            self.emit(IR::PassResult {
+        for (slot, resource) in out.iter_mut().zip(&open.resources) {
+            *slot = self.emit(IR::PassResult {
                 completion,
-                resource: open.resources[index],
-            })
-        })
+                resource: *resource,
+            });
+        }
     }
 }
 
