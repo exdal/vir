@@ -294,7 +294,7 @@ mod condition_result_sealed {
 
 /// A value shape that can leave both arms of [`Module::set_condition`].
 ///
-/// This is implemented for [`ValueId`] and fixed-size arrays of `ValueId`.
+/// This is implemented for [`ValueId`] and fixed-size arrays of `ValueId`, plus `Vec<ValueId>` with the `ffi` feature.
 pub trait ConditionResult: condition_result_sealed::Sealed + Sized {
     #[doc(hidden)]
     fn merge(module: &mut Module, taken: Self, skipped: Self, true_label: LabelId, false_label: LabelId) -> Self;
@@ -313,6 +313,28 @@ impl<const N: usize> condition_result_sealed::Sealed for [ValueId; N] {}
 impl<const N: usize> ConditionResult for [ValueId; N] {
     fn merge(module: &mut Module, taken: Self, skipped: Self, true_label: LabelId, false_label: LabelId) -> Self {
         std::array::from_fn(|index| module.phi(&[(taken[index], true_label), (skipped[index], false_label)]))
+    }
+}
+
+#[cfg(feature = "ffi")]
+impl condition_result_sealed::Sealed for Vec<ValueId> {}
+
+#[cfg(feature = "ffi")]
+impl ConditionResult for Vec<ValueId> {
+    fn merge(module: &mut Module, taken: Self, skipped: Self, true_label: LabelId, false_label: LabelId) -> Self {
+        assert_eq!(
+            taken.len(),
+            skipped.len(),
+            "the arms of a condition returned {} and {} values",
+            taken.len(),
+            skipped.len()
+        );
+
+        taken
+            .into_iter()
+            .zip(skipped)
+            .map(|(taken, skipped)| module.phi(&[(taken, true_label), (skipped, false_label)]))
+            .collect()
     }
 }
 
@@ -2727,6 +2749,11 @@ impl Module {
         self.end_pass(PassKind::Rendering, |pass| IR::EndRendering { pass })
     }
 
+    #[cfg(feature = "ffi")]
+    pub fn end_rendering_into(&mut self, out: &mut [ValueId]) {
+        self.end_pass_into(PassKind::Rendering, |pass| IR::EndRendering { pass }, out);
+    }
+
     fn dispatch_size(&mut self, size: ir::DispatchSize) -> &mut Self {
         self.chain(Some(PassKind::Compute), "dispatch", |pass| IR::Dispatch {
             pass,
@@ -2833,6 +2860,12 @@ impl Module {
     }
 
     fn end_pass<const N: usize>(&mut self, kind: PassKind, end: impl FnOnce(ValueId) -> IR) -> [ValueId; N] {
+        let mut results = [ValueId::INVALID; N];
+        self.end_pass_into(kind, end, &mut results);
+        results
+    }
+
+    fn end_pass_into(&mut self, kind: PassKind, end: impl FnOnce(ValueId) -> IR, out: &mut [ValueId]) {
         let open = self
             .ongoing_pass
             .as_ref()
@@ -2846,20 +2879,21 @@ impl Module {
         );
         assert_eq!(
             open.resources.len(),
-            N,
-            "the {} pass declared {} resources but its result expects {N}",
+            out.len(),
+            "the {} pass declared {} resources but its result expects {}",
             kind.name(),
-            open.resources.len()
+            open.resources.len(),
+            out.len()
         );
 
         let open = self.close_pass().expect("the open pass was checked above");
         let completion = self.emit(end(open.tip));
-        std::array::from_fn(|index| {
-            self.emit(IR::PassResult {
+        for (slot, resource) in out.iter_mut().zip(&open.resources) {
+            *slot = self.emit(IR::PassResult {
                 completion,
-                resource: open.resources[index],
-            })
-        })
+                resource: *resource,
+            });
+        }
     }
 }
 
@@ -5180,6 +5214,31 @@ mod tests {
         module.compile(&Unchecked, first_after).unwrap();
     }
 
+    #[cfg(feature = "ffi")]
+    #[test]
+    fn conditionals_merge_vectors_element_wise() {
+        let mut module = Module::default();
+        let enabled = module.declare_bool_var("enabled", true);
+        let first = module.constant_u32(1);
+        let second = module.constant_u32(2);
+
+        let merged = module.set_condition(enabled, |_| vec![first, second], |_| vec![second, first]);
+
+        assert_eq!(merged.len(), 2);
+        assert!(matches!(module.get(merged[0]), IR::Phi { .. }));
+        assert!(matches!(module.get(merged[1]), IR::Phi { .. }));
+    }
+
+    #[cfg(feature = "ffi")]
+    #[test]
+    #[should_panic(expected = "the arms of a condition returned 1 and 2 values")]
+    fn conditionals_reject_vectors_of_different_lengths() {
+        let mut module = Module::default();
+        let enabled = module.declare_bool_var("enabled", true);
+        let value = module.constant_u32(1);
+
+        module.set_condition(enabled, |_| vec![value], |_| vec![value, value]);
+    }
     #[test]
     #[should_panic(expected = "a compute pass must declare at least one resource")]
     fn an_empty_pass_is_rejected() { Module::default().begin_compute([]); }

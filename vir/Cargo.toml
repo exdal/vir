@@ -8,3 +8,6 @@ ash = { workspace = true }
 tracing = { workspace = true }
 bitflags = { workspace = true }
 gpu-allocator = { workspace = true }
+
+[features]
+ffi = []
