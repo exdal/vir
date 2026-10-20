@@ -201,7 +201,9 @@ fn token(out: &mut String, color: &str, text: &str, base: &str) {
     out.push_str(base);
 }
 
-fn indent(depth: usize) -> String { "  ".repeat(depth) }
+fn indent(depth: usize) -> String {
+    "  ".repeat(depth)
+}
 
 fn blank_line(out: &mut String) {
     if !out.is_empty() && !out.ends_with("\n\n") {
@@ -247,16 +249,7 @@ mod tests {
 
     use super::super::analysis::Declared;
     use crate::{
-        Access,
-        BlendPreset,
-        BufferInfo,
-        Image,
-        ImageAttachment,
-        ImageInfo,
-        MemoryLocation,
-        Module,
-        PipelineId,
-        Rect2D,
+        Access, BlendPreset, BufferInfo, Image, ImageAttachment, ImageInfo, MemoryLocation, Module, PipelineId, Rect2D,
         Unchecked,
     };
 
@@ -274,7 +267,9 @@ mod tests {
         out
     }
 
-    fn dump_of_one_pass() -> String { dump_of_one_pass_with(false) }
+    fn dump_of_one_pass() -> String {
+        dump_of_one_pass_with(false)
+    }
 
     fn dump_of_one_pass_with(syntax_highlighting: bool) -> String {
         let extent = vk::Extent3D::default().width(64).height(32).depth(1);

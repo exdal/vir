@@ -13,16 +13,7 @@ use std::collections::BTreeMap;
 
 use ash::vk::{self, Handle};
 use vir::{
-    Access,
-    BufferInfo,
-    Descriptor,
-    DescriptorBinding,
-    IR,
-    ImageInfo,
-    MemoryLocation,
-    Module,
-    Program,
-    Unchecked,
+    Access, BufferInfo, Descriptor, DescriptorBinding, IR, ImageInfo, MemoryLocation, Module, Program, Unchecked,
     resource::shader,
 };
 use vir_examples::read_spirv;

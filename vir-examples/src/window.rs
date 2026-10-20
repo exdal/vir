@@ -19,9 +19,13 @@ impl Window {
         })
     }
 
-    pub fn raw_window_handle(&self) -> RawWindowHandle { self.handle.window_handle().unwrap().as_raw() }
+    pub fn raw_window_handle(&self) -> RawWindowHandle {
+        self.handle.window_handle().unwrap().as_raw()
+    }
 
-    pub fn raw_display_handle(&self) -> RawDisplayHandle { self.handle.display_handle().unwrap().as_raw() }
+    pub fn raw_display_handle(&self) -> RawDisplayHandle {
+        self.handle.display_handle().unwrap().as_raw()
+    }
 
     pub fn extent(&self) -> vk::Extent2D {
         let size = self.handle.inner_size();

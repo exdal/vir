@@ -11,11 +11,15 @@ pub struct CommandBuffer {
 }
 
 impl From<&CommandBuffer> for vk::CommandBuffer {
-    fn from(cmd_buf: &CommandBuffer) -> Self { cmd_buf.handle }
+    fn from(cmd_buf: &CommandBuffer) -> Self {
+        cmd_buf.handle
+    }
 }
 
 impl CommandBuffer {
-    pub fn new(device: NonNull<ash::Device>, handle: vk::CommandBuffer) -> Self { Self { device, handle } }
+    pub fn new(device: NonNull<ash::Device>, handle: vk::CommandBuffer) -> Self {
+        Self { device, handle }
+    }
 
     pub fn reset(&self, release: bool) -> Result<(), vk::Result> {
         let flags = if release {
@@ -33,7 +37,9 @@ impl CommandBuffer {
         unsafe { self.device.as_ref().begin_command_buffer(self.handle, &begin_info) }
     }
 
-    pub fn end(&self) -> Result<(), vk::Result> { unsafe { self.device.as_ref().end_command_buffer(self.handle) } }
+    pub fn end(&self) -> Result<(), vk::Result> {
+        unsafe { self.device.as_ref().end_command_buffer(self.handle) }
+    }
 
     pub fn memory_barrier_info(src_access: Access, dst_access: Access) -> vk::MemoryBarrier2<'static> {
         vk::MemoryBarrier2::default()
@@ -116,7 +122,9 @@ impl CommandBuffer {
         }
     }
 
-    pub fn end_rendering(&self) { unsafe { self.device.as_ref().cmd_end_rendering(self.handle) } }
+    pub fn end_rendering(&self) {
+        unsafe { self.device.as_ref().cmd_end_rendering(self.handle) }
+    }
 
     pub fn bind_pipeline(&self, bind_point: vk::PipelineBindPoint, pipeline: vk::Pipeline) {
         unsafe {

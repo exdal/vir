@@ -6,36 +6,10 @@ use std::{
 use ash::vk;
 
 use crate::{
-    Access,
-    AcquiredSwapchain,
-    Buffer,
-    BufferCopy,
-    BufferImageCopy,
-    BufferInfo,
-    ClearValue,
-    ColorBlendAttachmentState,
-    DepthState,
-    DomainFlag,
-    DynamicStateFlags,
-    IR,
-    Image,
-    ImageAttachment,
-    ImageInfo,
-    LabelId,
-    MemoryLocation,
-    PassCallback,
-    PassState,
-    PipelineId,
-    Program,
-    RasterizationState,
-    Rect2D,
-    RenderingState,
-    Specializable,
-    StateChange,
-    SwapChain,
-    Value,
-    ValueId,
-    Viewport,
+    Access, AcquiredSwapchain, Buffer, BufferCopy, BufferImageCopy, BufferInfo, ClearValue, ColorBlendAttachmentState,
+    DepthState, DomainFlag, DynamicStateFlags, IR, Image, ImageAttachment, ImageInfo, LabelId, MemoryLocation,
+    PassCallback, PassState, PipelineId, Program, RasterizationState, Rect2D, RenderingState, Specializable,
+    StateChange, SwapChain, Value, ValueId, Viewport,
     graph::{
         analysis::{PipelineBindings, analyze_descriptors},
         ir::{self, scaled},
@@ -232,7 +206,9 @@ pub(super) struct ImageType {
     pub(super) extent: Option<vk::Extent3D>,
 }
 
-fn name_of(name: &str) -> ir::Name { (!name.is_empty()).then(|| Arc::from(name)) }
+fn name_of(name: &str) -> ir::Name {
+    (!name.is_empty()).then(|| Arc::from(name))
+}
 
 #[derive(Clone, Copy, Default)]
 enum Terminator {
@@ -375,7 +351,9 @@ impl Default for Module {
 }
 
 impl Module {
-    pub(super) fn get(&self, id: ValueId) -> &IR { &self.instructions[id.0 as usize] }
+    pub(super) fn get(&self, id: ValueId) -> &IR {
+        &self.instructions[id.0 as usize]
+    }
 
     fn array_elements(&self, id: ValueId) -> &[ValueId] {
         match self.get(id) {
@@ -384,7 +362,9 @@ impl Module {
         }
     }
 
-    fn block_of(&self, id: ValueId) -> Option<LabelId> { self.instruction_block.get(id.0 as usize).copied().flatten() }
+    fn block_of(&self, id: ValueId) -> Option<LabelId> {
+        self.instruction_block.get(id.0 as usize).copied().flatten()
+    }
 
     pub(super) fn resolve_access(&self, id: ValueId) -> Access {
         match self.get(id) {
@@ -423,7 +403,9 @@ impl Module {
         self.current_block = Some(label);
     }
 
-    fn branch(&mut self, target: LabelId) { self.terminate(Terminator::Branch { target }) }
+    fn branch(&mut self, target: LabelId) {
+        self.terminate(Terminator::Branch { target })
+    }
 
     fn branch_conditional(&mut self, condition: ValueId, merge: LabelId, true_label: LabelId, false_label: LabelId) {
         self.terminate(Terminator::BranchConditional {
@@ -557,7 +539,9 @@ impl Module {
         self.declare_resource_var(ir::VariableKind::ImageAttachment, name, resource)
     }
 
-    pub fn constant_u32(&mut self, value: u32) -> ValueId { self.lower_u32(value) }
+    pub fn constant_u32(&mut self, value: u32) -> ValueId {
+        self.lower_u32(value)
+    }
 
     pub fn declare_bool_var(&mut self, name: &str, default: bool) -> ValueId {
         self.declare_var(ir::VariableKind::Bool, name, Value::Bool(default))
@@ -616,15 +600,25 @@ impl Module {
         id
     }
 
-    fn lower_i32(&mut self, v: i32) -> ValueId { self.lower_constant(ir::Constant::I32(v)) }
+    fn lower_i32(&mut self, v: i32) -> ValueId {
+        self.lower_constant(ir::Constant::I32(v))
+    }
 
-    fn lower_u32(&mut self, v: u32) -> ValueId { self.lower_constant(ir::Constant::U32(v)) }
+    fn lower_u32(&mut self, v: u32) -> ValueId {
+        self.lower_constant(ir::Constant::U32(v))
+    }
 
-    fn lower_u64(&mut self, v: u64) -> ValueId { self.lower_constant(ir::Constant::U64(v)) }
+    fn lower_u64(&mut self, v: u64) -> ValueId {
+        self.lower_constant(ir::Constant::U64(v))
+    }
 
-    fn lower_access(&mut self, access: Access) -> ValueId { self.lower_constant(ir::Constant::Access(access)) }
+    fn lower_access(&mut self, access: Access) -> ValueId {
+        self.lower_constant(ir::Constant::Access(access))
+    }
 
-    fn lower_string(&mut self, string: Arc<str>) -> ValueId { self.lower_constant(ir::Constant::String(string)) }
+    fn lower_string(&mut self, string: Arc<str>) -> ValueId {
+        self.lower_constant(ir::Constant::String(string))
+    }
 
     fn lower_name(&mut self, name: ir::Name) -> ValueId {
         name.map_or(ValueId::INVALID, |name| self.lower_string(name))
@@ -819,7 +813,9 @@ impl Module {
         self.export(attachment, Access::Present, DomainFlag::Present)
     }
 
-    pub fn blit(&mut self, src: ValueId, dst: ValueId) -> ValueId { self.blit_filtered(src, dst, vk::Filter::LINEAR) }
+    pub fn blit(&mut self, src: ValueId, dst: ValueId) -> ValueId {
+        self.blit_filtered(src, dst, vk::Filter::LINEAR)
+    }
 
     pub fn blit_filtered(&mut self, src: ValueId, dst: ValueId, filter: vk::Filter) -> ValueId {
         self.emit(IR::Blit { src, dst, filter })
@@ -2290,11 +2286,15 @@ pub trait Count {
 }
 
 impl Count for u32 {
-    fn lower(self, module: &mut Module) -> ValueId { module.lower_u32(self) }
+    fn lower(self, module: &mut Module) -> ValueId {
+        module.lower_u32(self)
+    }
 }
 
 impl Count for ValueId {
-    fn lower(self, _: &mut Module) -> ValueId { self }
+    fn lower(self, _: &mut Module) -> ValueId {
+        self
+    }
 }
 
 impl Module {
@@ -2309,7 +2309,9 @@ impl Module {
         self
     }
 
-    fn close_pass(&mut self) -> Option<OngoingPass> { self.ongoing_pass.take() }
+    fn close_pass(&mut self) -> Option<OngoingPass> {
+        self.ongoing_pass.take()
+    }
 
     fn expect_no_open_pass(&mut self, when: &str) {
         if let Some(open) = self.close_pass() {
@@ -2363,7 +2365,9 @@ impl Module {
         self
     }
 
-    pub fn push_constants<T: Copy>(&mut self, value: &T) -> &mut Self { self.push_constants_at(0, value) }
+    pub fn push_constants<T: Copy>(&mut self, value: &T) -> &mut Self {
+        self.push_constants_at(0, value)
+    }
 
     pub fn push_constants_at<T: Copy>(&mut self, offset: u32, value: &T) -> &mut Self {
         let bytes = unsafe { std::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) };
@@ -2380,7 +2384,9 @@ impl Module {
         )
     }
 
-    pub fn push_constants_from(&mut self, variable: ValueId) -> &mut Self { self.push_constants_from_at(0, variable) }
+    pub fn push_constants_from(&mut self, variable: ValueId) -> &mut Self {
+        self.push_constants_from_at(0, variable)
+    }
 
     pub fn push_constants_from_at(&mut self, offset: u32, variable: ValueId) -> &mut Self {
         let Some(size) = self.variable_bytes_size(variable) else {
@@ -2566,7 +2572,9 @@ impl Module {
         self.set_state(StateChange::PrimitiveTopology(topology))
     }
 
-    pub fn set_depth(&mut self, depth: DepthState) -> &mut Self { self.set_state(StateChange::Depth(depth)) }
+    pub fn set_depth(&mut self, depth: DepthState) -> &mut Self {
+        self.set_state(StateChange::Depth(depth))
+    }
 
     pub fn set_rasterization(&mut self, rasterization: RasterizationState) -> &mut Self {
         self.set_state(StateChange::Rasterization(rasterization))
@@ -2844,7 +2852,9 @@ impl Module {
     }
 
     /// Dispatches the group counts the device reads out of `buffer` itself.
-    pub fn dispatch_indirect(&mut self, buffer: ValueId) -> &mut Self { self.dispatch_indirect_at(buffer, 0) }
+    pub fn dispatch_indirect(&mut self, buffer: ValueId) -> &mut Self {
+        self.dispatch_indirect_at(buffer, 0)
+    }
 
     pub fn dispatch_indirect_at(&mut self, buffer: ValueId, offset: u64) -> &mut Self {
         self.dispatch_size(ir::DispatchSize::Indirect { buffer, offset })
@@ -2903,14 +2913,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        BlendPreset,
-        Image,
-        PipelineState,
-        ResolvedViewport,
-        SpecValue,
-        Specialization,
-        Unchecked,
-        clear,
+        BlendPreset, Image, PipelineState, ResolvedViewport, SpecValue, Specialization, Unchecked, clear,
         graph::analysis::Declared,
     };
 
@@ -2938,7 +2941,9 @@ mod tests {
         (module, construct)
     }
 
-    fn depth_info() -> ImageInfo { ImageInfo::depth_target(extent_2d(), DEPTH_FORMAT) }
+    fn depth_info() -> ImageInfo {
+        ImageInfo::depth_target(extent_2d(), DEPTH_FORMAT)
+    }
 
     fn access_constant(module: &Module, program: &Program, id: &ValueId) -> Access {
         program
@@ -3006,7 +3011,9 @@ mod tests {
         }
     }
 
-    fn transient_info() -> ImageInfo { ImageInfo::color_target(extent_2d(), FORMAT) }
+    fn transient_info() -> ImageInfo {
+        ImageInfo::color_target(extent_2d(), FORMAT)
+    }
 
     /// An image that declares no usage at all, so what it ends up created with is entirely
     /// what the graph inferred.
@@ -3020,7 +3027,9 @@ mod tests {
 
     /// A sampler handle that stands for one, since a combined image sampler is only well formed
     /// with a real one behind it.
-    fn a_sampler() -> vk::Sampler { vk::Sampler::from_raw(1) }
+    fn a_sampler() -> vk::Sampler {
+        vk::Sampler::from_raw(1)
+    }
 
     fn image_usage(program: &Program, id: ValueId) -> vk::ImageUsageFlags {
         program
@@ -5241,7 +5250,9 @@ mod tests {
     }
     #[test]
     #[should_panic(expected = "a compute pass must declare at least one resource")]
-    fn an_empty_pass_is_rejected() { Module::default().begin_compute([]); }
+    fn an_empty_pass_is_rejected() {
+        Module::default().begin_compute([]);
+    }
 
     #[test]
     #[should_panic(expected = "declared 2 resources but its result expects 1")]

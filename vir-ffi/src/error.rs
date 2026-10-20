@@ -33,7 +33,9 @@ impl From<vk::Result> for Failure {
     }
 }
 
-fn set_last_error(message: String) { LAST_ERROR.with(|last| *last.borrow_mut() = message); }
+fn set_last_error(message: String) {
+    LAST_ERROR.with(|last| *last.borrow_mut() = message);
+}
 
 fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     match payload.downcast::<String>() {
@@ -63,9 +65,13 @@ pub(crate) fn guard_result(f: impl FnOnce() -> Result<(), Failure>) -> vk::Resul
     run(f).map_or_else(|code| code, |()| vk::Result::SUCCESS)
 }
 
-pub(crate) fn guard_id(f: impl FnOnce() -> Result<u32, Failure>) -> u32 { run(f).unwrap_or(u32::MAX) }
+pub(crate) fn guard_id(f: impl FnOnce() -> Result<u32, Failure>) -> u32 {
+    run(f).unwrap_or(u32::MAX)
+}
 
-pub(crate) fn guard_void(f: impl FnOnce() -> Result<(), Failure>) { let _ = run(f); }
+pub(crate) fn guard_void(f: impl FnOnce() -> Result<(), Failure>) {
+    let _ = run(f);
+}
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vir_last_error(buf: *mut u8, len: usize) -> usize {
@@ -87,4 +93,6 @@ pub unsafe extern "C" fn vir_last_error(buf: *mut u8, len: usize) -> usize {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn vir_clear_last_error() { set_last_error(String::new()); }
+pub unsafe extern "C" fn vir_clear_last_error() {
+    set_last_error(String::new());
+}

@@ -84,19 +84,33 @@ impl Context {
         })
     }
 
-    pub fn device(&self) -> &ash::Device { &self.device }
+    pub fn device(&self) -> &ash::Device {
+        &self.device
+    }
 
-    pub fn physical_device(&self) -> &vk::PhysicalDevice { &self.physical_device }
+    pub fn physical_device(&self) -> &vk::PhysicalDevice {
+        &self.physical_device
+    }
 
-    pub fn instance(&self) -> &ash::Instance { &self.instance }
+    pub fn instance(&self) -> &ash::Instance {
+        &self.instance
+    }
 
-    pub fn swapchain_loader(&self) -> &khr::swapchain::Device { &self.swapchain_loader }
+    pub fn swapchain_loader(&self) -> &khr::swapchain::Device {
+        &self.swapchain_loader
+    }
 
-    pub fn surface_loader(&self) -> &khr::surface::Instance { &self.surface_loader }
+    pub fn surface_loader(&self) -> &khr::surface::Instance {
+        &self.surface_loader
+    }
 
-    pub fn debug_utils(&self) -> Option<&ext::debug_utils::Device> { self.debug_utils.as_ref() }
+    pub fn debug_utils(&self) -> Option<&ext::debug_utils::Device> {
+        self.debug_utils.as_ref()
+    }
 
-    pub(crate) fn push_descriptor(&self) -> Option<&PushDescriptor> { self.push_descriptor.as_ref() }
+    pub(crate) fn push_descriptor(&self) -> Option<&PushDescriptor> {
+        self.push_descriptor.as_ref()
+    }
 
     pub fn command_queue_by_domain(&self, domain: DomainFlag) -> Option<&CommandQueue> {
         self.command_queues.iter().find(|queue| queue.domain_flags() == domain)

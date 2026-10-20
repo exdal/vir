@@ -15,67 +15,16 @@ use ash::vk;
 pub use ash::vk::{DispatchIndirectCommand, DrawIndexedIndirectCommand, DrawIndirectCommand};
 pub use context::{Access, CommandBuffer, Context, DomainFlag};
 pub use graph::{
-    ConditionResult,
-    Count,
-    DRAW_INDEXED_INDIRECT_STRIDE,
-    DRAW_INDIRECT_STRIDE,
-    Descriptor,
-    DispatchSize,
-    DrawCount,
-    IR,
-    ImageAttachment,
-    LabelId,
-    Module,
-    PassCallback,
-    PipelineBindings,
-    Program,
-    Recorder,
-    RenderGraph,
-    ResourceSideEffect,
-    SideEffect,
-    SideEffectAccess,
-    Unchecked,
-    Value,
-    ValueId,
+    ConditionResult, Count, DRAW_INDEXED_INDIRECT_STRIDE, DRAW_INDIRECT_STRIDE, Descriptor, DispatchSize, DrawCount,
+    IR, ImageAttachment, LabelId, Module, PassCallback, PipelineBindings, Program, Recorder, RenderGraph,
+    ResourceSideEffect, SideEffect, SideEffectAccess, Unchecked, Value, ValueId,
 };
 pub use resource::{
-    AcquiredSwapchain,
-    BindlessDescriptorSet,
-    BlendPreset,
-    Buffer,
-    BufferCopy,
-    BufferImageCopy,
-    BufferInfo,
-    ColorBlendAttachmentState,
-    ComputePipelineInfo,
-    DepthState,
-    DescriptorBinding,
-    DynamicStateFlags,
-    DynamicValues,
-    GraphicsPipelineInfo,
-    Image,
-    ImageInfo,
-    MemoryLocation,
-    PassState,
-    PipelineId,
-    PipelineLayout,
-    PipelineState,
-    PushConstants,
-    RasterizationState,
-    Rect2D,
-    Reflection,
-    RenderingState,
-    ResolvedViewport,
-    SamplerInfo,
-    SetLayout,
-    SpecConstant,
-    SpecValue,
-    Specializable,
-    Specialization,
-    StateChange,
-    SwapChain,
-    VertexAttribute,
-    VertexLayout,
+    AcquiredSwapchain, BindlessDescriptorSet, BlendPreset, Buffer, BufferCopy, BufferImageCopy, BufferInfo,
+    ColorBlendAttachmentState, ComputePipelineInfo, DepthState, DescriptorBinding, DynamicStateFlags, DynamicValues,
+    GraphicsPipelineInfo, Image, ImageInfo, MemoryLocation, PassState, PipelineId, PipelineLayout, PipelineState,
+    PushConstants, RasterizationState, Rect2D, Reflection, RenderingState, ResolvedViewport, SamplerInfo, SetLayout,
+    SpecConstant, SpecValue, Specializable, Specialization, StateChange, SwapChain, VertexAttribute, VertexLayout,
     Viewport,
 };
 
@@ -92,7 +41,9 @@ impl ClearValue {
     }
 
     #[inline]
-    pub const fn depth(depth: f32) -> Self { Self::depth_stencil(depth, 0) }
+    pub const fn depth(depth: f32) -> Self {
+        Self::depth_stencil(depth, 0)
+    }
 
     #[inline]
     pub const fn depth_stencil(depth: f32, stencil: u32) -> Self {
@@ -116,14 +67,18 @@ impl fmt::Debug for ClearValue {
 
 impl PartialEq for ClearValue {
     #[inline]
-    fn eq(&self, other: &Self) -> bool { self.bytes() == other.bytes() }
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes() == other.bytes()
+    }
 }
 
 impl Eq for ClearValue {}
 
 impl Hash for ClearValue {
     #[inline]
-    fn hash<H: Hasher>(&self, state: &mut H) { self.bytes().hash(state); }
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.bytes().hash(state);
+    }
 }
 
 pub mod clear {

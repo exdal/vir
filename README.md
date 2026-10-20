@@ -5,7 +5,7 @@ Vulkan Intermediate Representation: a render graph for modern Vulkan, built on [
 Record a frame as a list of passes. `vir` lowers it to an SSA-style instruction list, figures out
 which passes depend on which, and inserts the pipeline barriers and layout transitions itself.
 
-> Requires Vulkan 1.3 (dynamic rendering, buffer device address, synchronization2) and a nightly
+> Requires Vulkan 1.3 (dynamic rendering, buffer device address, synchronization2) and a stable
 > Rust toolchain (edition 2024).
 
 ## What it does

@@ -1,5 +1,5 @@
 name: Set up the toolchain
-description: Installs the pinned nightly toolchain, the cargo cache, and optionally the Slang SDK the examples need.
+description: Installs the stable toolchain, the cargo cache, and optionally the Slang SDK the examples need.
 
 inputs:
   cache-key:
@@ -18,16 +18,16 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: Install nightly
+    - name: Install stable
       id: toolchain
       shell: bash
       run: |
         set -euo pipefail
-        rustup toolchain install nightly --profile minimal --component rustfmt,clippy
-        rustup default nightly
+        rustup toolchain install stable --profile minimal --component rustfmt,clippy
+        rustup default stable
         cargo --version
 
-        # Something like 1.98.0-nightly-f28ac764c. It goes in the cache key so a new nightly
+        # Something like 1.99.0-f28ac764c. It goes in the cache key so a new release
         # does not restore artifacts the old one built.
         version=$(rustc --version | sed 's/^rustc //; s/ (\([0-9a-f]*\).*/-\1/')
         echo "rustc $version"

@@ -20,17 +20,8 @@
 
 use ash::vk;
 use vir::{
-    Access,
-    BlendPreset,
-    BufferInfo,
-    ClearValue,
-    ComputePipelineInfo,
-    MemoryLocation,
-    PipelineId,
-    RasterizationState,
-    Rect2D,
-    ValueId,
-    allocator::Allocator,
+    Access, BlendPreset, BufferInfo, ClearValue, ComputePipelineInfo, MemoryLocation, PipelineId, RasterizationState,
+    Rect2D, ValueId, allocator::Allocator,
 };
 use vir_examples::{Example, Frame, Recording, Setup, graphics_pipeline, read_spirv};
 
@@ -260,21 +251,14 @@ impl Example for Compute {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> { vir_examples::run::<Compute>() }
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    vir_examples::run::<Compute>()
+}
 
 #[cfg(test)]
 mod tests {
     use vir::{
-        Access,
-        IR,
-        ImageInfo,
-        Module,
-        Program,
-        Unchecked,
-        VertexAttribute,
-        VertexLayout,
-        graph::ir,
-        resource::shader,
+        Access, IR, ImageInfo, Module, Program, Unchecked, VertexAttribute, VertexLayout, graph::ir, resource::shader,
     };
 
     use super::*;

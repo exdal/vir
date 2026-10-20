@@ -2,37 +2,13 @@ use std::{collections::HashMap, sync::Arc};
 
 use ash::vk;
 use egui::{
-    TextureFilter,
-    TextureOptions,
-    TextureWrapMode,
-    TexturesDelta,
+    TextureFilter, TextureOptions, TextureWrapMode, TexturesDelta,
     epaint::{ClippedPrimitive, ImageData, ImageDelta, Primitive, Vertex as EguiVertex},
 };
 use vir::{
-    Access,
-    AllocatorKind,
-    BlendPreset,
-    Buffer,
-    BufferImageCopy,
-    BufferInfo,
-    Context,
-    DynamicStateFlags,
-    FrameAllocator,
-    GraphicsPipelineInfo,
-    Image,
-    ImageAttachment,
-    ImageInfo,
-    MemoryLocation,
-    Module,
-    PassCallback,
-    PersistentAllocator,
-    PipelineId,
-    Program,
-    RasterizationState,
-    Rect2D,
-    RenderGraph,
-    SamplerInfo,
-    ValueId,
+    Access, AllocatorKind, BlendPreset, Buffer, BufferImageCopy, BufferInfo, Context, DynamicStateFlags,
+    FrameAllocator, GraphicsPipelineInfo, Image, ImageAttachment, ImageInfo, MemoryLocation, Module, PassCallback,
+    PersistentAllocator, PipelineId, Program, RasterizationState, Rect2D, RenderGraph, SamplerInfo, ValueId,
     allocator::Allocator,
 };
 
@@ -99,9 +75,13 @@ pub struct EguiFrame {
 }
 
 impl EguiFrame {
-    pub fn draw_count(&self) -> usize { self.draws.len() }
+    pub fn draw_count(&self) -> usize {
+        self.draws.len()
+    }
 
-    pub fn upload_count(&self) -> usize { self.uploads }
+    pub fn upload_count(&self) -> usize {
+        self.uploads
+    }
 }
 
 /// The slots the compiled pass reads when it runs. What the UI looks like is all of it: the
@@ -569,9 +549,7 @@ impl EguiPass {
 #[cfg(test)]
 mod tests {
     use vir::{
-        DescriptorBinding,
-        VertexAttribute,
-        VertexLayout,
+        DescriptorBinding, VertexAttribute, VertexLayout,
         resource::{pipeline::push_constant_ranges, shader},
     };
 

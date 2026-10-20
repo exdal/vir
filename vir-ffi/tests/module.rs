@@ -171,7 +171,9 @@ unsafe extern "C" fn lazy_arm(_: *mut VirModule, user_data: *mut c_void, _: *mut
     1
 }
 
-unsafe extern "C" fn empty_arm(_: *mut VirModule, _: *mut c_void, _: *mut u32, _: usize) -> usize { 0 }
+unsafe extern "C" fn empty_arm(_: *mut VirModule, _: *mut c_void, _: *mut u32, _: usize) -> usize {
+    0
+}
 
 unsafe extern "C" fn overflowing_arm(_: *mut VirModule, _: *mut c_void, _: *mut u32, capacity: usize) -> usize {
     capacity + 1

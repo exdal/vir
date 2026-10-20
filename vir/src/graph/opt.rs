@@ -15,7 +15,9 @@ struct BlockAddress {
 }
 
 impl BlockAddress {
-    fn span(&self) -> Range<usize> { self.start..self.terminator + 1 }
+    fn span(&self) -> Range<usize> {
+        self.start..self.terminator + 1
+    }
 }
 
 fn blocks(nodes: &[ir::Instr]) -> Vec<BlockAddress> {
@@ -283,7 +285,9 @@ enum BarrierScope {
     Memory,
 }
 
-fn is_barrier(ir: &IR) -> bool { matches!(ir, IR::MemoryBarrier { .. } | IR::ImageBarrier { .. }) }
+fn is_barrier(ir: &IR) -> bool {
+    matches!(ir, IR::MemoryBarrier { .. } | IR::ImageBarrier { .. })
+}
 
 fn is_fixed(ir: &IR) -> bool {
     // moving a barrier above a pass would make the pass wait on the barrier's source
@@ -752,7 +756,9 @@ mod tests {
             .collect()
     }
 
-    fn clear_count(program: &Program) -> usize { positions(program, |ir| matches!(ir, IR::Clear { .. })).len() }
+    fn clear_count(program: &Program) -> usize {
+        positions(program, |ir| matches!(ir, IR::Clear { .. })).len()
+    }
 
     fn imported_depth(module: &mut Module, format: vk::Format) -> ValueId {
         let extent = vk::Extent3D::default().width(64).height(64).depth(1);

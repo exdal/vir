@@ -15,7 +15,9 @@ bitflags! {
 }
 
 impl Default for DynamicStateFlags {
-    fn default() -> Self { Self::Viewport | Self::Scissor }
+    fn default() -> Self {
+        Self::Viewport | Self::Scissor
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -32,7 +34,9 @@ pub enum Rect2D {
 }
 
 impl Rect2D {
-    pub const fn framebuffer() -> Self { Self::Framebuffer }
+    pub const fn framebuffer() -> Self {
+        Self::Framebuffer
+    }
 
     pub const fn absolute(x: i32, y: i32, width: u32, height: u32) -> Self {
         Self::Absolute(vk::Rect2D {
@@ -41,7 +45,9 @@ impl Rect2D {
         })
     }
 
-    pub const fn relative(x: f32, y: f32, width: f32, height: f32) -> Self { Self::Relative { x, y, width, height } }
+    pub const fn relative(x: f32, y: f32, width: f32, height: f32) -> Self {
+        Self::Relative { x, y, width, height }
+    }
 
     pub fn resolve(&self, area: vk::Rect2D) -> vk::Rect2D {
         match *self {
@@ -81,13 +87,17 @@ impl Rect2D {
 }
 
 impl PartialEq for Rect2D {
-    fn eq(&self, other: &Self) -> bool { self.key() == other.key() }
+    fn eq(&self, other: &Self) -> bool {
+        self.key() == other.key()
+    }
 }
 
 impl Eq for Rect2D {}
 
 impl Hash for Rect2D {
-    fn hash<H: Hasher>(&self, state: &mut H) { self.key().hash(state); }
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.key().hash(state);
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -117,7 +127,9 @@ impl From<Rect2D> for Viewport {
 }
 
 impl Viewport {
-    pub fn framebuffer() -> Self { Self::default() }
+    pub fn framebuffer() -> Self {
+        Self::default()
+    }
 
     pub fn with_depth_range(mut self, min_depth: f32, max_depth: f32) -> Self {
         self.min_depth = min_depth;
@@ -143,13 +155,17 @@ impl Viewport {
 }
 
 impl PartialEq for Viewport {
-    fn eq(&self, other: &Self) -> bool { self.key() == other.key() }
+    fn eq(&self, other: &Self) -> bool {
+        self.key() == other.key()
+    }
 }
 
 impl Eq for Viewport {}
 
 impl Hash for Viewport {
-    fn hash<H: Hasher>(&self, state: &mut H) { self.key().hash(state); }
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.key().hash(state);
+    }
 }
 
 /// A [`Viewport`] with the render area substituted in.
@@ -177,13 +193,17 @@ impl ResolvedViewport {
 }
 
 impl PartialEq for ResolvedViewport {
-    fn eq(&self, other: &Self) -> bool { self.key() == other.key() }
+    fn eq(&self, other: &Self) -> bool {
+        self.key() == other.key()
+    }
 }
 
 impl Eq for ResolvedViewport {}
 
 impl Hash for ResolvedViewport {
-    fn hash<H: Hasher>(&self, state: &mut H) { self.key().hash(state); }
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.key().hash(state);
+    }
 }
 
 impl From<ResolvedViewport> for vk::Viewport {
@@ -242,9 +262,13 @@ impl DepthState {
         }
     }
 
-    pub const fn less() -> Self { Self::testing(vk::CompareOp::LESS) }
+    pub const fn less() -> Self {
+        Self::testing(vk::CompareOp::LESS)
+    }
 
-    pub const fn greater() -> Self { Self::testing(vk::CompareOp::GREATER) }
+    pub const fn greater() -> Self {
+        Self::testing(vk::CompareOp::GREATER)
+    }
 
     pub const fn read_only(compare_op: vk::CompareOp) -> Self {
         Self {
@@ -303,13 +327,17 @@ impl RasterizationState {
 }
 
 impl PartialEq for RasterizationState {
-    fn eq(&self, other: &Self) -> bool { self.key() == other.key() }
+    fn eq(&self, other: &Self) -> bool {
+        self.key() == other.key()
+    }
 }
 
 impl Eq for RasterizationState {}
 
 impl Hash for RasterizationState {
-    fn hash<H: Hasher>(&self, state: &mut H) { self.key().hash(state); }
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.key().hash(state);
+    }
 }
 
 impl<'a> From<RasterizationState> for vk::PipelineRasterizationStateCreateInfo<'a> {
@@ -337,7 +365,9 @@ pub struct ColorBlendAttachmentState {
 }
 
 impl Default for ColorBlendAttachmentState {
-    fn default() -> Self { BlendPreset::Off.into() }
+    fn default() -> Self {
+        BlendPreset::Off.into()
+    }
 }
 
 impl From<ColorBlendAttachmentState> for vk::PipelineColorBlendAttachmentState {
@@ -412,7 +442,9 @@ pub struct PushConstants {
 }
 
 impl PushConstants {
-    pub fn is_empty(&self) -> bool { self.data.is_empty() }
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
 
     /// Reserves the eight bytes at `offset` for `buffer`'s device address, which is patched in
     /// when the module runs. Addresses win over whatever else put bytes in that range, so this
@@ -426,9 +458,13 @@ impl PushConstants {
         self.addresses.push((offset, buffer));
     }
 
-    pub fn size(&self) -> u32 { self.data.len() as u32 }
+    pub fn size(&self) -> u32 {
+        self.data.len() as u32
+    }
 
-    pub fn end(&self) -> u32 { self.offset + self.size() }
+    pub fn end(&self) -> u32 {
+        self.offset + self.size()
+    }
 
     pub fn from_variable(&mut self, offset: u32, size: u32, source: ValueId) {
         self.offset = offset;
@@ -518,27 +554,39 @@ pub trait Specializable {
 }
 
 impl Specializable for SpecValue {
-    fn spec_value(self) -> SpecValue { self }
+    fn spec_value(self) -> SpecValue {
+        self
+    }
 }
 
 impl Specializable for bool {
-    fn spec_value(self) -> SpecValue { SpecValue::Bool(self) }
+    fn spec_value(self) -> SpecValue {
+        SpecValue::Bool(self)
+    }
 }
 
 impl Specializable for u32 {
-    fn spec_value(self) -> SpecValue { SpecValue::U32(self) }
+    fn spec_value(self) -> SpecValue {
+        SpecValue::U32(self)
+    }
 }
 
 impl Specializable for i32 {
-    fn spec_value(self) -> SpecValue { SpecValue::I32(self) }
+    fn spec_value(self) -> SpecValue {
+        SpecValue::I32(self)
+    }
 }
 
 impl Specializable for f32 {
-    fn spec_value(self) -> SpecValue { SpecValue::F32(self.to_bits()) }
+    fn spec_value(self) -> SpecValue {
+        SpecValue::F32(self.to_bits())
+    }
 }
 
 impl Specializable for f64 {
-    fn spec_value(self) -> SpecValue { SpecValue::F64(self.to_bits()) }
+    fn spec_value(self) -> SpecValue {
+        SpecValue::F64(self.to_bits())
+    }
 }
 
 /// The specialization constants in force, kept sorted by constant id.
@@ -549,7 +597,9 @@ impl Specializable for f64 {
 pub struct Specialization(Vec<(u32, SpecValue)>);
 
 impl Specialization {
-    pub fn is_empty(&self) -> bool { self.0.is_empty() }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 
     pub fn get(&self, id: u32) -> Option<SpecValue> {
         let at = self.0.binary_search_by_key(&id, |(constant, _)| *constant).ok()?;
@@ -563,7 +613,9 @@ impl Specialization {
         }
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (u32, SpecValue)> + '_ { self.0.iter().copied() }
+    pub fn iter(&self) -> impl Iterator<Item = (u32, SpecValue)> + '_ {
+        self.0.iter().copied()
+    }
 }
 
 impl FromIterator<(u32, SpecValue)> for Specialization {
@@ -754,7 +806,9 @@ pub struct PipelineState {
 }
 
 impl Default for PipelineState {
-    fn default() -> Self { PassState::default().resolve(vk::Rect2D::default()).0 }
+    fn default() -> Self {
+        PassState::default().resolve(vk::Rect2D::default()).0
+    }
 }
 
 impl PipelineState {

@@ -58,7 +58,9 @@ impl Ranges {
         self.live -= 1;
     }
 
-    pub(super) fn is_empty(&self) -> bool { self.live == 0 }
+    pub(super) fn is_empty(&self) -> bool {
+        self.live == 0
+    }
 }
 
 pub(super) fn align_up(value: u64, alignment: u64) -> Option<u64> {

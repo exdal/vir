@@ -6,22 +6,8 @@
 
 use ash::vk;
 use vir::{
-    Access,
-    AllocatorKind,
-    BlendPreset,
-    BufferInfo,
-    ClearValue,
-    DomainFlag,
-    Image,
-    ImageAttachment,
-    ImageInfo,
-    PersistentAllocator,
-    PipelineId,
-    RasterizationState,
-    Rect2D,
-    RenderGraph,
-    SamplerInfo,
-    ValueId,
+    Access, AllocatorKind, BlendPreset, BufferInfo, ClearValue, DomainFlag, Image, ImageAttachment, ImageInfo,
+    PersistentAllocator, PipelineId, RasterizationState, Rect2D, RenderGraph, SamplerInfo, ValueId,
     allocator::Allocator,
 };
 use vir_examples::{Example, Frame, Recording, Setup, graphics_pipeline};
@@ -221,7 +207,9 @@ impl Example for Texture {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> { vir_examples::run::<Texture>() }
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    vir_examples::run::<Texture>()
+}
 
 #[cfg(test)]
 mod tests {

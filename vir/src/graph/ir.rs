@@ -8,28 +8,9 @@ use ash::vk;
 use bitflags::Flags;
 
 use crate::{
-    Access,
-    BlendPreset,
-    Buffer,
-    BufferCopy,
-    BufferImageCopy,
-    ClearValue,
-    ColorBlendAttachmentState,
-    DomainFlag,
-    DynamicValues,
-    Image,
-    MemoryLocation,
-    PipelineId,
-    PipelineState,
-    PushConstants,
-    RasterizationState,
-    Rect2D,
-    ResolvedViewport,
-    Specialization,
-    StateChange,
-    ValueId,
-    Viewport,
-    graph::value::LabelId,
+    Access, BlendPreset, Buffer, BufferCopy, BufferImageCopy, ClearValue, ColorBlendAttachmentState, DomainFlag,
+    DynamicValues, Image, MemoryLocation, PipelineId, PipelineState, PushConstants, RasterizationState, Rect2D,
+    ResolvedViewport, Specialization, StateChange, ValueId, Viewport, graph::value::LabelId,
 };
 
 pub type Instr = (ValueId, IR);
@@ -67,7 +48,9 @@ impl fmt::Display for SourceLocation {
     }
 
     #[cfg(not(debug_assertions))]
-    fn fmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result { Ok(()) }
+    fn fmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
@@ -151,7 +134,9 @@ impl Descriptor {
         }
     }
 
-    pub fn resource(&self) -> Option<ValueId> { self.image().or_else(|| self.buffer()) }
+    pub fn resource(&self) -> Option<ValueId> {
+        self.image().or_else(|| self.buffer())
+    }
 
     pub fn sampler(&self) -> Option<vk::Sampler> {
         match self {
@@ -276,7 +261,9 @@ impl DispatchSize {
         }
     }
 
-    pub fn scale(scale: [u32; 3]) -> [f32; 3] { scale.map(f32::from_bits) }
+    pub fn scale(scale: [u32; 3]) -> [f32; 3] {
+        scale.map(f32::from_bits)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
@@ -645,7 +632,9 @@ impl<'a> ResourceIndex<'a> {
         Self { values, resolutions }
     }
 
-    pub fn get(&self, id: ValueId) -> Option<&'a IR> { self.values.get(&id).copied() }
+    pub fn get(&self, id: ValueId) -> Option<&'a IR> {
+        self.values.get(&id).copied()
+    }
 
     pub fn resolve(&self, id: ValueId) -> Option<(ResourceResolution, &'a IR)> {
         let resolution = *self.resolutions.get(&id)?;
@@ -694,11 +683,17 @@ bitflags::bitflags! {
 }
 
 impl SideEffect {
-    pub fn reads(self) -> bool { self.contains(SideEffect::Read) }
+    pub fn reads(self) -> bool {
+        self.contains(SideEffect::Read)
+    }
 
-    pub fn writes(self) -> bool { self.contains(SideEffect::Write) }
+    pub fn writes(self) -> bool {
+        self.contains(SideEffect::Write)
+    }
 
-    pub fn is_observable(self) -> bool { self.intersects(SideEffect::Observable) }
+    pub fn is_observable(self) -> bool {
+        self.intersects(SideEffect::Observable)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
@@ -776,15 +771,25 @@ impl IR {
         }
     }
 
-    pub fn is_pure(&self) -> bool { self.side_effects().is_empty() }
+    pub fn is_pure(&self) -> bool {
+        self.side_effects().is_empty()
+    }
 
-    pub fn is_removable_when_unused(&self) -> bool { !self.side_effects().is_observable() }
+    pub fn is_removable_when_unused(&self) -> bool {
+        !self.side_effects().is_observable()
+    }
 
-    pub fn is_terminator(&self) -> bool { self.side_effects().contains(SideEffect::Terminator) }
+    pub fn is_terminator(&self) -> bool {
+        self.side_effects().contains(SideEffect::Terminator)
+    }
 
-    pub fn opens_region(&self) -> bool { matches!(self, IR::BeginRendering { .. } | IR::BeginCompute { .. }) }
+    pub fn opens_region(&self) -> bool {
+        matches!(self, IR::BeginRendering { .. } | IR::BeginCompute { .. })
+    }
 
-    pub fn closes_region(&self) -> bool { matches!(self, IR::EndRendering { .. } | IR::EndCompute { .. }) }
+    pub fn closes_region(&self) -> bool {
+        matches!(self, IR::EndRendering { .. } | IR::EndCompute { .. })
+    }
 
     pub fn visit_operands(&self, mut visit: impl FnMut(ValueId)) {
         match self {
@@ -1099,7 +1104,9 @@ pub struct Symbols<'a> {
 }
 
 impl<'a> Symbols<'a> {
-    pub fn new(instructions: &'a [Instr]) -> Self { Self::with_bound(instructions, std::iter::empty()) }
+    pub fn new(instructions: &'a [Instr]) -> Self {
+        Self::with_bound(instructions, std::iter::empty())
+    }
 
     pub fn with_bound(instructions: &'a [Instr], bound: impl IntoIterator<Item = ValueId>) -> Self {
         Self::with_bound_and_constants(instructions, bound, true)
@@ -1121,9 +1128,13 @@ impl<'a> Symbols<'a> {
 
     /// Whether the resource constructed here is one a slot fills in, rather than one the graph
     /// allocates or one whose handle was written into it.
-    fn is_bound(&self, id: ValueId) -> bool { self.bound.contains(&id) }
+    fn is_bound(&self, id: ValueId) -> bool {
+        self.bound.contains(&id)
+    }
 
-    fn get(&self, id: ValueId) -> Option<&'a IR> { self.resources.get(id) }
+    fn get(&self, id: ValueId) -> Option<&'a IR> {
+        self.resources.get(id)
+    }
 
     fn constant(&self, id: ValueId) -> Option<&'a Constant> {
         match self.get(id)? {
@@ -1157,7 +1168,9 @@ impl<'a> Symbols<'a> {
         matches!(self.constant(id), Some(Constant::U32(constant)) if *constant == value)
     }
 
-    fn resource(&self, id: ValueId) -> Option<&'a IR> { self.resolve(id).map(|(ir, _)| ir) }
+    fn resource(&self, id: ValueId) -> Option<&'a IR> {
+        self.resolve(id).map(|(ir, _)| ir)
+    }
 
     fn resolve(&self, id: ValueId) -> Option<(&'a IR, bool)> {
         let (resolution, ir) = self.resources.resolve(id)?;
@@ -1189,7 +1202,9 @@ impl<'a> Symbols<'a> {
         }
     }
 
-    fn operand(&self, id: ValueId) -> Operand<'_> { Operand { program: self, id } }
+    fn operand(&self, id: ValueId) -> Operand<'_> {
+        Operand { program: self, id }
+    }
 }
 
 pub struct Operand<'a> {
@@ -1228,7 +1243,9 @@ pub struct Printer<'a> {
 }
 
 impl fmt::Display for Printer<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { self.ir.fmt_with(f, self.program, self.id) }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.ir.fmt_with(f, self.program, self.id)
+    }
 }
 
 fn fmt_flags<F: Flags>(value: F) -> String {
@@ -1261,9 +1278,13 @@ fn fmt_usage(usage: vk::ImageUsageFlags) -> String {
     }
 }
 
-fn fmt_layout(layout: vk::ImageLayout) -> String { format!("{layout:?}").trim_end_matches("_OPTIMAL").to_string() }
+fn fmt_layout(layout: vk::ImageLayout) -> String {
+    format!("{layout:?}").trim_end_matches("_OPTIMAL").to_string()
+}
 
-fn fmt_samples(samples: vk::SampleCountFlags) -> String { samples.as_raw().to_string() }
+fn fmt_samples(samples: vk::SampleCountFlags) -> String {
+    samples.as_raw().to_string()
+}
 
 fn fmt_name(program: &Symbols<'_>, name: &ValueId) -> String {
     match name.is_valid() {
@@ -1965,7 +1986,9 @@ fn fmt_pipeline(pipeline: &PipelineId) -> String {
 }
 
 impl fmt::Display for IR {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { self.fmt_with(f, &Symbols::default(), ValueId(0)) }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.fmt_with(f, &Symbols::default(), ValueId(0))
+    }
 }
 
 #[cfg(test)]
@@ -1974,7 +1997,9 @@ mod tests {
 
     use super::*;
 
-    fn value(id: u32) -> ValueId { ValueId(id) }
+    fn value(id: u32) -> ValueId {
+        ValueId(id)
+    }
 
     fn named_access(id: ValueId) -> Access {
         match id.0 {

@@ -11,15 +11,8 @@ use crate::{
     resource::{VirBuffer, VirImage},
     swapchain::VirSwapChain,
     types::{
-        VirAttachment,
-        VirDepthState,
-        VirRasterizationState,
-        VirRect2D,
-        VirViewport,
-        blend_preset,
-        bytes,
-        dynamic_state,
-        text,
+        VirAttachment, VirDepthState, VirRasterizationState, VirRect2D, VirViewport, blend_preset, bytes,
+        dynamic_state, text,
     },
 };
 

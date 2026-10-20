@@ -3,11 +3,7 @@ use std::collections::BTreeMap;
 use ash::vk::{self, Handle};
 
 use crate::{
-    DescriptorBinding,
-    IR,
-    PipelineId,
-    Program,
-    ValueId,
+    DescriptorBinding, IR, PipelineId, Program, ValueId,
     graph::ir::{Descriptor, ResourceIndex},
 };
 
@@ -26,9 +22,13 @@ pub trait PipelineBindings {
 pub struct Unchecked;
 
 impl PipelineBindings for Unchecked {
-    fn bindings(&self, _: PipelineId) -> Option<&[DescriptorBinding]> { None }
+    fn bindings(&self, _: PipelineId) -> Option<&[DescriptorBinding]> {
+        None
+    }
 
-    fn bindless_set(&self, _: PipelineId) -> Option<u32> { None }
+    fn bindless_set(&self, _: PipelineId) -> Option<u32> {
+        None
+    }
 }
 
 /// Pipeline bindings written out by tests rather than reflected from shaders.
@@ -76,9 +76,13 @@ impl Declared {
 
 #[cfg(test)]
 impl PipelineBindings for Declared {
-    fn bindings(&self, _: PipelineId) -> Option<&[DescriptorBinding]> { Some(&self.bindings) }
+    fn bindings(&self, _: PipelineId) -> Option<&[DescriptorBinding]> {
+        Some(&self.bindings)
+    }
 
-    fn bindless_set(&self, _: PipelineId) -> Option<u32> { self.bindless }
+    fn bindless_set(&self, _: PipelineId) -> Option<u32> {
+        self.bindless
+    }
 }
 
 #[derive(Default)]
@@ -302,7 +306,9 @@ mod tests {
 
     const FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
 
-    fn a_sampler() -> vk::Sampler { vk::Sampler::from_raw(1) }
+    fn a_sampler() -> vk::Sampler {
+        vk::Sampler::from_raw(1)
+    }
 
     fn target(module: &mut Module) -> ValueId {
         module.transient_image(&ImageInfo::color_target(
@@ -351,7 +357,9 @@ mod tests {
             self.bindings.get(&pipeline).map(Vec::as_slice)
         }
 
-        fn bindless_set(&self, _: PipelineId) -> Option<u32> { None }
+        fn bindless_set(&self, _: PipelineId) -> Option<u32> {
+            None
+        }
     }
 
     /// A pass that writes `writes` and then draws once.

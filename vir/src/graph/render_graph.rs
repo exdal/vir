@@ -10,41 +10,11 @@ use std::{
 use ash::vk::{self, Handle};
 
 use crate::{
-    Access,
-    AcquiredSwapchain,
-    AllocatorKind,
-    Buffer,
-    BufferImageCopy,
-    BufferInfo,
-    ClearValue,
-    CommandBuffer,
-    ComputePipelineInfo,
-    Context,
-    DRAW_INDEXED_INDIRECT_STRIDE,
-    DRAW_INDIRECT_STRIDE,
-    DescriptorBinding,
-    DomainFlag,
-    DynamicValues,
-    GraphicsPipelineInfo,
-    IR,
-    ImageAttachment,
-    ImageInfo,
-    MemoryLocation,
-    PassCallback,
-    PipelineBindings,
-    PipelineId,
-    PipelineLayout,
-    PipelineState,
-    Program,
-    PushConstants,
-    Rect2D,
-    ResolvedViewport,
-    SpecValue,
-    Specialization,
-    Value,
-    ValueId,
-    VertexLayout,
-    Viewport,
+    Access, AcquiredSwapchain, AllocatorKind, Buffer, BufferImageCopy, BufferInfo, ClearValue, CommandBuffer,
+    ComputePipelineInfo, Context, DRAW_INDEXED_INDIRECT_STRIDE, DRAW_INDIRECT_STRIDE, DescriptorBinding, DomainFlag,
+    DynamicValues, GraphicsPipelineInfo, IR, ImageAttachment, ImageInfo, MemoryLocation, PassCallback,
+    PipelineBindings, PipelineId, PipelineLayout, PipelineState, Program, PushConstants, Rect2D, ResolvedViewport,
+    SpecValue, Specialization, Value, ValueId, VertexLayout, Viewport,
     context::PushDescriptor,
     core::ScopedStack,
     graph::{
@@ -55,10 +25,7 @@ use crate::{
         self,
         descriptor::DescriptorArena,
         pipeline::{
-            ComputePipelineRequest,
-            PipelineRequest,
-            create_compute_pipelines,
-            create_pipelines,
+            ComputePipelineRequest, PipelineRequest, create_compute_pipelines, create_pipelines,
             validate_descriptor_bindings,
         },
         shader::{self, Reflection},
@@ -95,7 +62,9 @@ impl Batch {
         Ok(self.cmd_buf)
     }
 
-    fn cmd_buf(&self) -> &CommandBuffer { &self.cmd_buf }
+    fn cmd_buf(&self) -> &CommandBuffer {
+        &self.cmd_buf
+    }
 }
 
 #[derive(Default)]
@@ -105,7 +74,9 @@ struct PendingBarriers {
 }
 
 impl PendingBarriers {
-    fn is_empty(&self) -> bool { self.memory.is_empty() && self.images.is_empty() }
+    fn is_empty(&self) -> bool {
+        self.memory.is_empty() && self.images.is_empty()
+    }
 
     fn clear(&mut self) {
         self.memory.clear();
@@ -545,7 +516,9 @@ pub struct Recorder<'a> {
 }
 
 impl Recorder<'_> {
-    pub fn render_area(&self) -> vk::Rect2D { self.graph.render_area }
+    pub fn render_area(&self) -> vk::Rect2D {
+        self.graph.render_area
+    }
 
     pub fn set_viewport(&mut self, index: u32, viewport: impl Into<Viewport>) -> &mut Self {
         let resolved = viewport.into().resolve(self.graph.render_area);
@@ -565,7 +538,9 @@ impl Recorder<'_> {
         })
     }
 
-    pub fn push_constants<T: Copy>(&mut self, value: &T) -> &mut Self { self.push_constants_at(0, value) }
+    pub fn push_constants<T: Copy>(&mut self, value: &T) -> &mut Self {
+        self.push_constants_at(0, value)
+    }
 
     pub fn push_constants_at<T: Copy>(&mut self, offset: u32, value: &T) -> &mut Self {
         let bytes = unsafe { std::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) };
@@ -705,9 +680,13 @@ impl Recorder<'_> {
         })
     }
 
-    pub fn buffer(&self, id: ValueId) -> Buffer { self.graph.get::<Buffer>(&id) }
+    pub fn buffer(&self, id: ValueId) -> Buffer {
+        self.graph.get::<Buffer>(&id)
+    }
 
-    pub fn image(&self, id: ValueId) -> ImageAttachment { self.graph.get::<ImageAttachment>(&id) }
+    pub fn image(&self, id: ValueId) -> ImageAttachment {
+        self.graph.get::<ImageAttachment>(&id)
+    }
 
     /// Binds an image payload. Shader reflection selects sampled image, storage image, or input attachment.
     pub fn bind_image(&mut self, set: u32, binding: u32, image: &ImageAttachment) -> &mut Self {
@@ -1152,9 +1131,13 @@ impl RenderGraph {
         Ok(())
     }
 
-    fn set_value(&mut self, value_id: &ValueId, value: Value) { set_runtime_value(&mut self.values, *value_id, value); }
+    fn set_value(&mut self, value_id: &ValueId, value: Value) {
+        set_runtime_value(&mut self.values, *value_id, value);
+    }
 
-    fn get<T: FromValue>(&self, id: &ValueId) -> T { T::from_value(self.get_value(&self.resolve_id(id))) }
+    fn get<T: FromValue>(&self, id: &ValueId) -> T {
+        T::from_value(self.get_value(&self.resolve_id(id)))
+    }
 
     fn resource_elements(&self, resource: &ValueId) -> Vec<ValueId> {
         let mut pending = vec![*resource];
@@ -1168,11 +1151,17 @@ impl RenderGraph {
         result
     }
 
-    fn get_value(&self, value_id: &ValueId) -> &Value { self.values.get(value_id.0 as usize).unwrap() }
+    fn get_value(&self, value_id: &ValueId) -> &Value {
+        self.values.get(value_id.0 as usize).unwrap()
+    }
 
-    fn resolve_id(&self, value_id: &ValueId) -> ValueId { canonical_value_id(&self.values, *value_id) }
+    fn resolve_id(&self, value_id: &ValueId) -> ValueId {
+        canonical_value_id(&self.values, *value_id)
+    }
 
-    fn device(&self) -> &ash::Device { unsafe { self.device.as_ref() } }
+    fn device(&self) -> &ash::Device {
+        unsafe { self.device.as_ref() }
+    }
 
     fn ensure_batch(&mut self, ctx: &Context, allocator: &mut AllocatorKind) -> Result<(), vk::Result> {
         if self.current_batch.is_some() {

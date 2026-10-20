@@ -57,25 +57,47 @@ impl ImageAttachment {
         self
     }
 
-    pub fn image(&self) -> &Image { &self.image }
+    pub fn image(&self) -> &Image {
+        &self.image
+    }
 
-    pub fn image_view(&self) -> vk::ImageView { self.image_view }
+    pub fn image_view(&self) -> vk::ImageView {
+        self.image_view
+    }
 
-    pub fn format(&self) -> vk::Format { self.format }
+    pub fn format(&self) -> vk::Format {
+        self.format
+    }
 
-    pub fn extent(&self) -> vk::Extent3D { self.extent }
+    pub fn extent(&self) -> vk::Extent3D {
+        self.extent
+    }
 
-    pub fn samples(&self) -> vk::SampleCountFlags { self.samples }
+    pub fn samples(&self) -> vk::SampleCountFlags {
+        self.samples
+    }
 
-    pub fn layout(&self) -> vk::ImageLayout { self.layout }
+    pub fn layout(&self) -> vk::ImageLayout {
+        self.layout
+    }
 
-    pub fn base_level(&self) -> u32 { self.subresource_range.base_mip_level }
+    pub fn base_level(&self) -> u32 {
+        self.subresource_range.base_mip_level
+    }
 
-    pub fn level_count(&self) -> u32 { self.subresource_range.level_count }
+    pub fn level_count(&self) -> u32 {
+        self.subresource_range.level_count
+    }
 
-    pub fn base_layer(&self) -> u32 { self.subresource_range.base_array_layer }
+    pub fn base_layer(&self) -> u32 {
+        self.subresource_range.base_array_layer
+    }
 
-    pub fn layer_count(&self) -> u32 { self.subresource_range.layer_count }
+    pub fn layer_count(&self) -> u32 {
+        self.subresource_range.layer_count
+    }
 
-    pub fn subresource_range(&self) -> vk::ImageSubresourceRange { self.subresource_range }
+    pub fn subresource_range(&self) -> vk::ImageSubresourceRange {
+        self.subresource_range
+    }
 }

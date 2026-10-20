@@ -10,26 +10,38 @@ pub struct ValueId(pub u32);
 impl ValueId {
     pub const INVALID: Self = Self(u32::MAX);
 
-    pub const fn is_valid(self) -> bool { self.0 != u32::MAX }
+    pub const fn is_valid(self) -> bool {
+        self.0 != u32::MAX
+    }
 
-    pub const fn is_invalid(self) -> bool { self.0 == u32::MAX }
+    pub const fn is_invalid(self) -> bool {
+        self.0 == u32::MAX
+    }
 }
 
 impl fmt::Display for ValueId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "%{}", self.0) }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "%{}", self.0)
+    }
 }
 impl fmt::Debug for ValueId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { fmt::Display::fmt(self, f) }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LabelId(pub u32);
 
 impl fmt::Display for LabelId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "label {}", self.0) }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "label {}", self.0)
+    }
 }
 impl fmt::Debug for LabelId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { fmt::Display::fmt(self, f) }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -74,52 +86,84 @@ impl Value {
 }
 
 impl From<bool> for Value {
-    fn from(v: bool) -> Self { Value::Bool(v) }
+    fn from(v: bool) -> Self {
+        Value::Bool(v)
+    }
 }
 impl From<i32> for Value {
-    fn from(v: i32) -> Self { Value::I32(v) }
+    fn from(v: i32) -> Self {
+        Value::I32(v)
+    }
 }
 impl From<u32> for Value {
-    fn from(v: u32) -> Self { Value::U32(v) }
+    fn from(v: u32) -> Self {
+        Value::U32(v)
+    }
 }
 impl From<u64> for Value {
-    fn from(v: u64) -> Self { Value::U64(v) }
+    fn from(v: u64) -> Self {
+        Value::U64(v)
+    }
 }
 impl From<usize> for Value {
-    fn from(v: usize) -> Self { Value::Size(v) }
+    fn from(v: usize) -> Self {
+        Value::Size(v)
+    }
 }
 impl From<vk::Extent2D> for Value {
-    fn from(v: vk::Extent2D) -> Self { Value::Extent2D(v) }
+    fn from(v: vk::Extent2D) -> Self {
+        Value::Extent2D(v)
+    }
 }
 impl From<vk::Extent3D> for Value {
-    fn from(v: vk::Extent3D) -> Self { Value::Extent3D(v) }
+    fn from(v: vk::Extent3D) -> Self {
+        Value::Extent3D(v)
+    }
 }
 impl From<Arc<str>> for Value {
-    fn from(v: Arc<str>) -> Self { Value::String(v) }
+    fn from(v: Arc<str>) -> Self {
+        Value::String(v)
+    }
 }
 impl From<ClearValue> for Value {
-    fn from(v: ClearValue) -> Self { Value::ClearValue(v) }
+    fn from(v: ClearValue) -> Self {
+        Value::ClearValue(v)
+    }
 }
 impl From<&[u8]> for Value {
-    fn from(v: &[u8]) -> Self { Value::Bytes(Arc::from(v)) }
+    fn from(v: &[u8]) -> Self {
+        Value::Bytes(Arc::from(v))
+    }
 }
 impl From<AcquiredSwapchain> for Value {
-    fn from(v: AcquiredSwapchain) -> Self { Value::Swapchain(v) }
+    fn from(v: AcquiredSwapchain) -> Self {
+        Value::Swapchain(v)
+    }
 }
 impl From<Buffer> for Value {
-    fn from(v: Buffer) -> Self { Value::Buffer(v) }
+    fn from(v: Buffer) -> Self {
+        Value::Buffer(v)
+    }
 }
 impl From<&Buffer> for Value {
-    fn from(v: &Buffer) -> Self { Value::Buffer(*v) }
+    fn from(v: &Buffer) -> Self {
+        Value::Buffer(*v)
+    }
 }
 impl From<ImageAttachment> for Value {
-    fn from(v: ImageAttachment) -> Self { Value::ImageAttachment(v) }
+    fn from(v: ImageAttachment) -> Self {
+        Value::ImageAttachment(v)
+    }
 }
 impl From<&ImageAttachment> for Value {
-    fn from(v: &ImageAttachment) -> Self { Value::ImageAttachment(v.clone()) }
+    fn from(v: &ImageAttachment) -> Self {
+        Value::ImageAttachment(v.clone())
+    }
 }
 impl From<PassCallback> for Value {
-    fn from(v: PassCallback) -> Self { Value::Callback(v) }
+    fn from(v: PassCallback) -> Self {
+        Value::Callback(v)
+    }
 }
 
 pub trait FromValue {

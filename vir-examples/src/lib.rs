@@ -28,20 +28,8 @@ use ash::{Entry, ext, khr, vk};
 pub use egui;
 pub use vir;
 use vir::{
-    AllocatorKind,
-    Context,
-    FrameAllocator,
-    GraphicsPipelineInfo,
-    Image,
-    ImageAttachment,
-    Module,
-    PersistentAllocator,
-    PipelineId,
-    Program,
-    RenderGraph,
-    SuperFrameAllocator,
-    SwapChain,
-    ValueId,
+    AllocatorKind, Context, FrameAllocator, GraphicsPipelineInfo, Image, ImageAttachment, Module, PersistentAllocator,
+    PipelineId, Program, RenderGraph, SuperFrameAllocator, SwapChain, ValueId,
 };
 pub use winit;
 use winit::{
@@ -150,7 +138,9 @@ pub trait Example: Sized {
     fn record(&mut self, recording: &mut Recording) -> Result<ValueId, vk::Result>;
 
     /// Writes this frame into the slots [`Example::record`] declared.
-    fn update(&mut self, _frame: &mut Frame) -> Result<(), vk::Result> { Ok(()) }
+    fn update(&mut self, _frame: &mut Frame) -> Result<(), vk::Result> {
+        Ok(())
+    }
 
     /// The panel the harness draws over whatever the example rendered.
     fn ui(&mut self, _ctx: &egui::Context) {}
@@ -558,5 +548,7 @@ impl<E: Example> ApplicationHandler for Host<E> {
         }
     }
 
-    fn exiting(&mut self, _: &ActiveEventLoop) { self.app = None; }
+    fn exiting(&mut self, _: &ActiveEventLoop) {
+        self.app = None;
+    }
 }

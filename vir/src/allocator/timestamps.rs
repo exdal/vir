@@ -102,9 +102,13 @@ impl TimestampPool {
             .collect();
     }
 
-    pub(crate) fn completed(&self) -> &[PassTiming] { &self.completed }
+    pub(crate) fn completed(&self) -> &[PassTiming] {
+        &self.completed
+    }
 }
 
 impl Drop for TimestampPool {
-    fn drop(&mut self) { unsafe { self.device.as_ref().destroy_query_pool(self.pool, None) } }
+    fn drop(&mut self) {
+        unsafe { self.device.as_ref().destroy_query_pool(self.pool, None) }
+    }
 }

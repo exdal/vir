@@ -4,23 +4,9 @@ use std::collections::BTreeMap;
 
 use ash::vk::{self, Handle};
 pub use state::{
-    BlendPreset,
-    ColorBlendAttachmentState,
-    DepthState,
-    DynamicStateFlags,
-    DynamicValues,
-    PassState,
-    PipelineState,
-    PushConstants,
-    RasterizationState,
-    Rect2D,
-    RenderingState,
-    ResolvedViewport,
-    SpecValue,
-    Specializable,
-    Specialization,
-    StateChange,
-    Viewport,
+    BlendPreset, ColorBlendAttachmentState, DepthState, DynamicStateFlags, DynamicValues, PassState, PipelineState,
+    PushConstants, RasterizationState, Rect2D, RenderingState, ResolvedViewport, SpecValue, Specializable,
+    Specialization, StateChange, Viewport,
 };
 
 use crate::resource::shader::Reflection;
@@ -32,18 +18,28 @@ impl PipelineId {
     pub const INVALID: Self = Self(u32::MAX);
 
     #[cfg(feature = "ffi")]
-    pub const fn from_raw(raw: u32) -> Self { Self(raw) }
+    pub const fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
 
     #[cfg(feature = "ffi")]
-    pub const fn raw(self) -> u32 { self.0 }
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
 
-    pub const fn is_valid(self) -> bool { self.0 != u32::MAX }
+    pub const fn is_valid(self) -> bool {
+        self.0 != u32::MAX
+    }
 
-    pub const fn is_invalid(self) -> bool { self.0 == u32::MAX }
+    pub const fn is_invalid(self) -> bool {
+        self.0 == u32::MAX
+    }
 }
 
 impl std::fmt::Display for PipelineId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "#{}", self.0) }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "#{}", self.0)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -89,7 +85,9 @@ impl VertexLayout {
         }
     }
 
-    pub fn is_empty(&self) -> bool { self.attributes.is_empty() }
+    pub fn is_empty(&self) -> bool {
+        self.attributes.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -99,7 +97,9 @@ pub struct GraphicsPipelineInfo {
 }
 
 impl GraphicsPipelineInfo {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     pub fn with_shader(mut self, spirv: &[u32]) -> Self {
         self.shaders.push(spirv.to_vec());
@@ -844,7 +844,9 @@ mod tests {
         }
     }
 
-    fn entry(entry: &vk::SpecializationMapEntry) -> (u32, u32, usize) { (entry.constant_id, entry.offset, entry.size) }
+    fn entry(entry: &vk::SpecializationMapEntry) -> (u32, u32, usize) {
+        (entry.constant_id, entry.offset, entry.size)
+    }
 
     #[test]
     fn a_constant_two_stages_declare_is_written_once_and_named_by_both() {

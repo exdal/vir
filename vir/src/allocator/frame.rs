@@ -3,8 +3,7 @@ use std::{cell::RefCell, collections::HashMap, ops::Add, ptr::NonNull, rc::Rc};
 use ash::vk::{self, Handle};
 
 use super::{
-    Allocator,
-    MemoryAllocator,
+    Allocator, MemoryAllocator,
     buffer_pool::align_up,
     image_cache::FrameImageCache,
     persistent::{PersistentAllocator, allocation_alignment},
@@ -64,9 +63,13 @@ impl FrameAllocator {
 
     /// GPU time of each named pass the last time this frame was used, empty unless
     /// [`SuperFrameAllocator::enable_timestamps`] succeeded.
-    pub fn completed_timings(&self) -> &[PassTiming] { self.timestamps.as_ref().map_or(&[], TimestampPool::completed) }
+    pub fn completed_timings(&self) -> &[PassTiming] {
+        self.timestamps.as_ref().map_or(&[], TimestampPool::completed)
+    }
 
-    pub(crate) fn timestamps_mut(&mut self) -> Option<&mut TimestampPool> { self.timestamps.as_mut() }
+    pub(crate) fn timestamps_mut(&mut self) -> Option<&mut TimestampPool> {
+        self.timestamps.as_mut()
+    }
 
     pub fn add_timeline_wait(&mut self, semaphore: vk::Semaphore, value: u64) {
         self.timeline_waits.push((semaphore, value));

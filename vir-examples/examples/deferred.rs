@@ -18,31 +18,13 @@ use std::{error::Error, path::Path};
 
 use ash::vk;
 use glam::{
-    Mat3,
-    Mat4,
-    Vec3,
+    Mat3, Mat4, Vec3,
     camera::rh::{proj::vulkan::perspective, view::look_at_mat4},
 };
 use vir::{
-    Access,
-    AllocatorKind,
-    BlendPreset,
-    BufferInfo,
-    ClearValue,
-    DepthState,
-    DomainFlag,
-    Image,
-    ImageAttachment,
-    ImageInfo,
-    MemoryLocation,
-    PersistentAllocator,
-    PipelineId,
-    RasterizationState,
-    Rect2D,
-    RenderGraph,
-    SamplerInfo,
-    ValueId,
-    allocator::Allocator,
+    Access, AllocatorKind, BlendPreset, BufferInfo, ClearValue, DepthState, DomainFlag, Image, ImageAttachment,
+    ImageInfo, MemoryLocation, PersistentAllocator, PipelineId, RasterizationState, Rect2D, RenderGraph, SamplerInfo,
+    ValueId, allocator::Allocator,
 };
 use vir_examples::{Example, Frame, Recording, Setup, graphics_pipeline};
 
@@ -196,7 +178,9 @@ impl GBuffer {
         ImageAttachment::from_image(&self.depth, vk::ImageLayout::UNDEFINED).with_image_view(self.depth_view)
     }
 
-    fn targets(&self) -> [&GTarget; 3] { [&self.albedo, &self.normal, &self.position] }
+    fn targets(&self) -> [&GTarget; 3] {
+        [&self.albedo, &self.normal, &self.position]
+    }
 }
 
 /// Where the camera sits and how far out it has to be to see everything.
@@ -760,7 +744,9 @@ impl Example for Deferred {
 }
 
 /// Slang reads a matrix row by row, and glam stores one column by column.
-fn row_major(matrix: Mat4) -> [[f32; 4]; 4] { matrix.transpose().to_cols_array_2d() }
+fn row_major(matrix: Mat4) -> [[f32; 4]; 4] {
+    matrix.transpose().to_cols_array_2d()
+}
 
 /// Where the geometry comes from.
 mod scene {
@@ -770,9 +756,13 @@ mod scene {
     /// buffers inside it, so embedding the one file is the whole asset.
     const HELMET_GLB: &[u8] = include_bytes!("../assets/DamagedHelmet.glb");
 
-    pub fn helmet() -> Result<SceneData, Box<dyn Error>> { flatten(gltf::import_slice(HELMET_GLB)?) }
+    pub fn helmet() -> Result<SceneData, Box<dyn Error>> {
+        flatten(gltf::import_slice(HELMET_GLB)?)
+    }
 
-    pub fn load_gltf(path: &Path) -> Result<SceneData, Box<dyn Error>> { flatten(gltf::import(path)?) }
+    pub fn load_gltf(path: &Path) -> Result<SceneData, Box<dyn Error>> {
+        flatten(gltf::import(path)?)
+    }
 
     /// Flattens a glTF scene into world-space meshes.
     ///
@@ -952,14 +942,14 @@ mod scene {
     }
 }
 
-fn main() -> Result<(), Box<dyn Error>> { vir_examples::run::<Deferred>() }
+fn main() -> Result<(), Box<dyn Error>> {
+    vir_examples::run::<Deferred>()
+}
 
 #[cfg(test)]
 mod tests {
     use vir::{
-        DescriptorBinding,
-        VertexAttribute,
-        VertexLayout,
+        DescriptorBinding, VertexAttribute, VertexLayout,
         resource::{pipeline::push_constant_ranges, shader},
     };
     use vir_examples::read_spirv;

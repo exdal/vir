@@ -33,10 +33,14 @@ impl BufferInfo {
         }
     }
 
-    pub fn vertex(size: u64) -> Self { Self::new(size, vk::BufferUsageFlags::VERTEX_BUFFER, MemoryLocation::CpuToGpu) }
+    pub fn vertex(size: u64) -> Self {
+        Self::new(size, vk::BufferUsageFlags::VERTEX_BUFFER, MemoryLocation::CpuToGpu)
+    }
 
     /// A host-visible buffer to stage a copy into device-local memory out of.
-    pub fn staging(size: u64) -> Self { Self::new(size, vk::BufferUsageFlags::TRANSFER_SRC, MemoryLocation::CpuToGpu) }
+    pub fn staging(size: u64) -> Self {
+        Self::new(size, vk::BufferUsageFlags::TRANSFER_SRC, MemoryLocation::CpuToGpu)
+    }
 
     pub fn with_usage(mut self, usage: vk::BufferUsageFlags) -> Self {
         self.usage |= usage;
@@ -120,12 +124,18 @@ impl Buffer {
         })
     }
 
-    pub fn handle(&self) -> vk::Buffer { self.handle }
+    pub fn handle(&self) -> vk::Buffer {
+        self.handle
+    }
 
     /// Byte offset of this logical buffer within its Vulkan backing buffer.
-    pub fn offset(&self) -> u64 { self.offset }
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
 
-    pub fn size(&self) -> u64 { self.size }
+    pub fn size(&self) -> u64 {
+        self.size
+    }
 
     pub(crate) fn checked_offset(&self, relative: u64) -> Result<u64, vk::Result> {
         if relative > self.size {
@@ -136,13 +146,21 @@ impl Buffer {
             .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)
     }
 
-    pub fn device_address(&self) -> vk::DeviceAddress { self.device_address }
+    pub fn device_address(&self) -> vk::DeviceAddress {
+        self.device_address
+    }
 
-    pub fn is_null(&self) -> bool { self.handle.is_null() }
+    pub fn is_null(&self) -> bool {
+        self.handle.is_null()
+    }
 
-    pub fn is_mapped(&self) -> bool { self.mapped.is_some() }
+    pub fn is_mapped(&self) -> bool {
+        self.mapped.is_some()
+    }
 
-    pub(crate) fn allocation_id(&self) -> u64 { self.allocation_id }
+    pub(crate) fn allocation_id(&self) -> u64 {
+        self.allocation_id
+    }
 
     pub fn mapped_slice_mut(&mut self) -> Option<&mut [u8]> {
         let ptr = self.mapped?;
@@ -174,7 +192,9 @@ impl Buffer {
 }
 
 impl From<&Buffer> for vk::Buffer {
-    fn from(buffer: &Buffer) -> Self { buffer.handle }
+    fn from(buffer: &Buffer) -> Self {
+        buffer.handle
+    }
 }
 
 impl PartialEq for Buffer {
@@ -187,7 +207,9 @@ impl PartialEq for Buffer {
 impl Eq for Buffer {}
 
 impl Hash for Buffer {
-    fn hash<H: Hasher>(&self, state: &mut H) { (self.handle, self.offset, self.size, self.allocation_id).hash(state); }
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (self.handle, self.offset, self.size, self.allocation_id).hash(state);
+    }
 }
 
 #[cfg(test)]

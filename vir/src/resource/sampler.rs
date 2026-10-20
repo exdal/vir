@@ -12,13 +12,19 @@ pub struct SamplerInfo {
 }
 
 impl Default for SamplerInfo {
-    fn default() -> Self { Self::linear() }
+    fn default() -> Self {
+        Self::linear()
+    }
 }
 
 impl SamplerInfo {
-    pub fn linear() -> Self { Self::filtered(vk::Filter::LINEAR) }
+    pub fn linear() -> Self {
+        Self::filtered(vk::Filter::LINEAR)
+    }
 
-    pub fn nearest() -> Self { Self::filtered(vk::Filter::NEAREST) }
+    pub fn nearest() -> Self {
+        Self::filtered(vk::Filter::NEAREST)
+    }
 
     fn filtered(filter: vk::Filter) -> Self {
         Self {

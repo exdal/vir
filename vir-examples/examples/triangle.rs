@@ -173,7 +173,9 @@ impl Example for Triangle {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> { vir_examples::run::<Triangle>() }
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    vir_examples::run::<Triangle>()
+}
 
 #[cfg(test)]
 mod tests {

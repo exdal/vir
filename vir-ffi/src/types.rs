@@ -90,7 +90,9 @@ pub(crate) fn blend_preset(preset: u32) -> Result<BlendPreset, Failure> {
     }
 }
 
-pub(crate) fn dynamic_state(flags: u32) -> DynamicStateFlags { DynamicStateFlags::from_bits_retain(flags) }
+pub(crate) fn dynamic_state(flags: u32) -> DynamicStateFlags {
+    DynamicStateFlags::from_bits_retain(flags)
+}
 
 pub(crate) unsafe fn bytes<'a>(ptr: *const u8, len: usize) -> &'a [u8] {
     if len == 0 {

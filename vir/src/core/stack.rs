@@ -13,7 +13,9 @@ struct ThreadStack {
 }
 
 impl ThreadStack {
-    fn layout() -> Layout { Layout::from_size_align(STACK_SIZE, STACK_ALIGN).unwrap() }
+    fn layout() -> Layout {
+        Layout::from_size_align(STACK_SIZE, STACK_ALIGN).unwrap()
+    }
 
     fn new() -> Self {
         let layout = Self::layout();
@@ -35,7 +37,9 @@ impl ThreadStack {
 }
 
 impl Drop for ThreadStack {
-    fn drop(&mut self) { unsafe { dealloc(self.data.as_ptr(), Self::layout()) } }
+    fn drop(&mut self) {
+        unsafe { dealloc(self.data.as_ptr(), Self::layout()) }
+    }
 }
 
 thread_local! {
@@ -52,7 +56,9 @@ impl ScopedStack {
         Self { saved }
     }
 
-    pub fn alloc<T>(&self) -> *mut T { STACK.with(|s| s.alloc(size_of::<T>(), align_of::<T>()) as *mut T) }
+    pub fn alloc<T>(&self) -> *mut T {
+        STACK.with(|s| s.alloc(size_of::<T>(), align_of::<T>()) as *mut T)
+    }
 
     #[expect(clippy::mut_from_ref)]
     pub fn alloc_slice<T>(&self, count: usize) -> &mut [T] {
@@ -74,9 +80,13 @@ impl ScopedStack {
 }
 
 impl Default for ScopedStack {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Drop for ScopedStack {
-    fn drop(&mut self) { STACK.with(|s| s.ptr.set(self.saved)); }
+    fn drop(&mut self) {
+        STACK.with(|s| s.ptr.set(self.saved));
+    }
 }

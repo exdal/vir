@@ -102,9 +102,13 @@ bitflags! {
 }
 
 impl Access {
-    pub fn writes(self) -> bool { self.intersects(Access::Writes) }
+    pub fn writes(self) -> bool {
+        self.intersects(Access::Writes)
+    }
 
-    pub fn reads(self) -> bool { !self.difference(Access::Writes | Access::None).is_empty() }
+    pub fn reads(self) -> bool {
+        !self.difference(Access::Writes | Access::None).is_empty()
+    }
 
     pub fn sampled_by(stages: vk::ShaderStageFlags) -> Access {
         let mapped = [

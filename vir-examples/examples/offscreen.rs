@@ -199,7 +199,9 @@ fn extent3d(extent: vk::Extent2D, depth: u32) -> vk::Extent3D {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> { vir_examples::run::<Offscreen>() }
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    vir_examples::run::<Offscreen>()
+}
 
 #[cfg(test)]
 mod tests {

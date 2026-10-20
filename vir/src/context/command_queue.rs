@@ -16,7 +16,9 @@ bitflags! {
 }
 
 impl Default for DomainFlag {
-    fn default() -> Self { Self::None }
+    fn default() -> Self {
+        Self::None
+    }
 }
 
 pub struct CommandQueue {
@@ -43,13 +45,21 @@ impl CommandQueue {
         }
     }
 
-    pub fn inner(&self) -> vk::Queue { self.inner }
+    pub fn inner(&self) -> vk::Queue {
+        self.inner
+    }
 
-    pub fn family_index(&self) -> u32 { self.family_index }
+    pub fn family_index(&self) -> u32 {
+        self.family_index
+    }
 
-    pub fn domain_flags(&self) -> DomainFlag { self.domain_flags }
+    pub fn domain_flags(&self) -> DomainFlag {
+        self.domain_flags
+    }
 
-    pub fn semaphore(&self) -> &vk::Semaphore { &self.timeline }
+    pub fn semaphore(&self) -> &vk::Semaphore {
+        &self.timeline
+    }
 
     pub fn next_timeline_value(&self) -> u64 {
         let value = self.timeline_value.get() + 1;

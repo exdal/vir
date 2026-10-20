@@ -203,21 +203,37 @@ impl Image {
         }
     }
 
-    pub fn handle(&self) -> vk::Image { self.handle }
+    pub fn handle(&self) -> vk::Image {
+        self.handle
+    }
 
-    pub fn extent(&self) -> vk::Extent3D { self.extent }
+    pub fn extent(&self) -> vk::Extent3D {
+        self.extent
+    }
 
-    pub fn format(&self) -> vk::Format { self.format }
+    pub fn format(&self) -> vk::Format {
+        self.format
+    }
 
-    pub fn samples(&self) -> vk::SampleCountFlags { self.samples }
+    pub fn samples(&self) -> vk::SampleCountFlags {
+        self.samples
+    }
 
-    pub fn mip_levels(&self) -> u32 { self.mip_levels }
+    pub fn mip_levels(&self) -> u32 {
+        self.mip_levels
+    }
 
-    pub fn array_layers(&self) -> u32 { self.array_layers }
+    pub fn array_layers(&self) -> u32 {
+        self.array_layers
+    }
 
-    pub fn usage(&self) -> vk::ImageUsageFlags { self.usage }
+    pub fn usage(&self) -> vk::ImageUsageFlags {
+        self.usage
+    }
 
-    pub fn is_null(&self) -> bool { self.handle.is_null() }
+    pub fn is_null(&self) -> bool {
+        self.handle.is_null()
+    }
 
     pub fn subresource_range(&self) -> vk::ImageSubresourceRange {
         vk::ImageSubresourceRange::default()
@@ -239,15 +255,21 @@ pub fn aspect_mask(format: vk::Format) -> vk::ImageAspectFlags {
 }
 
 impl From<&Image> for vk::Image {
-    fn from(image: &Image) -> Self { image.handle }
+    fn from(image: &Image) -> Self {
+        image.handle
+    }
 }
 
 impl PartialEq for Image {
-    fn eq(&self, other: &Self) -> bool { self.handle == other.handle }
+    fn eq(&self, other: &Self) -> bool {
+        self.handle == other.handle
+    }
 }
 
 impl Eq for Image {}
 
 impl Hash for Image {
-    fn hash<H: Hasher>(&self, state: &mut H) { self.handle.hash(state); }
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.handle.hash(state);
+    }
 }

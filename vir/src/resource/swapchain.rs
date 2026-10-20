@@ -28,7 +28,9 @@ impl From<&SwapChain> for AcquiredSwapchain {
 }
 
 impl SwapChain {
-    pub fn format(&self) -> vk::Format { self.attachments.first().map_or(vk::Format::UNDEFINED, |a| a.format()) }
+    pub fn format(&self) -> vk::Format {
+        self.attachments.first().map_or(vk::Format::UNDEFINED, |a| a.format())
+    }
 
     pub fn samples(&self) -> vk::SampleCountFlags {
         self.attachments

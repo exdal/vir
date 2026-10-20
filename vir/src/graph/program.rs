@@ -1,10 +1,7 @@
 use std::collections::HashMap;
 
 use crate::{
-    IR,
-    LabelId,
-    Value,
-    ValueId,
+    IR, LabelId, Value, ValueId,
     graph::{
         dump,
         ir::{Instr, Name, VariableKind},
@@ -65,13 +62,21 @@ impl Program {
             .filter_map(|(resource, slot)| Some((*resource, self.variables.get(*slot as usize)?)))
     }
 
-    pub fn instructions(&self) -> &[Instr] { &self.instructions }
+    pub fn instructions(&self) -> &[Instr] {
+        &self.instructions
+    }
 
-    pub(crate) fn label_index(&self, label: LabelId) -> Option<usize> { self.labels.get(&label).copied() }
+    pub(crate) fn label_index(&self, label: LabelId) -> Option<usize> {
+        self.labels.get(&label).copied()
+    }
 
-    pub fn variables(&self) -> &[Variable] { &self.variables }
+    pub fn variables(&self) -> &[Variable] {
+        &self.variables
+    }
 
-    pub(crate) fn variable(&self, slot: u32) -> Option<&Variable> { self.variables.get(slot as usize) }
+    pub(crate) fn variable(&self, slot: u32) -> Option<&Variable> {
+        self.variables.get(slot as usize)
+    }
 
     pub fn set(&mut self, variable: ValueId, value: impl Into<Value>) {
         let value = value.into();
@@ -131,7 +136,9 @@ impl Program {
         self.set(variable, bytes);
     }
 
-    pub fn dump(&self) -> String { dump::dump(&self.instructions, self.bound.keys().copied()) }
+    pub fn dump(&self) -> String {
+        dump::dump(&self.instructions, self.bound.keys().copied())
+    }
 
     /// The dump with ANSI syntax highlighting, for printing into a terminal.
     pub fn dump_with(&self, syntax_highlighting: bool) -> String {

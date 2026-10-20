@@ -10,19 +10,8 @@
 
 use ash::vk;
 use vir::{
-    Access,
-    BlendPreset,
-    Buffer,
-    BufferInfo,
-    ClearValue,
-    MemoryLocation,
-    PersistentAllocator,
-    PipelineId,
-    RasterizationState,
-    Rect2D,
-    RenderGraph,
-    ValueId,
-    allocator::Allocator,
+    Access, BlendPreset, Buffer, BufferInfo, ClearValue, MemoryLocation, PersistentAllocator, PipelineId,
+    RasterizationState, Rect2D, RenderGraph, ValueId, allocator::Allocator,
 };
 use vir_examples::{Example, Frame, Recording, Setup, graphics_pipeline};
 
@@ -108,7 +97,9 @@ struct UiState {
 }
 
 impl Default for UiState {
-    fn default() -> Self { Self { spin: true, tint: 0.0 } }
+    fn default() -> Self {
+        Self { spin: true, tint: 0.0 }
+    }
 }
 
 impl Example for VertexBuffer {
@@ -224,13 +215,14 @@ impl Example for VertexBuffer {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> { vir_examples::run::<VertexBuffer>() }
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    vir_examples::run::<VertexBuffer>()
+}
 
 #[cfg(test)]
 mod tests {
     use vir::{
-        VertexAttribute,
-        VertexLayout,
+        VertexAttribute, VertexLayout,
         resource::{pipeline::push_constant_ranges, shader},
     };
     use vir_examples::read_spirv;

@@ -32,7 +32,9 @@ impl Default for Egui {
 impl Example for Egui {
     const TITLE: &'static str = "vir: egui";
 
-    fn new(_setup: &mut Setup) -> Result<Self, vk::Result> { Ok(Self::default()) }
+    fn new(_setup: &mut Setup) -> Result<Self, vk::Result> {
+        Ok(Self::default())
+    }
 
     fn ui(&mut self, ctx: &egui::Context) {
         egui::Window::new(Self::TITLE)
@@ -87,4 +89,6 @@ impl Example for Egui {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> { vir_examples::run::<Egui>() }
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    vir_examples::run::<Egui>()
+}

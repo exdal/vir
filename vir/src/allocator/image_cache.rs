@@ -102,7 +102,9 @@ mod tests {
         ImageInfo::color_target(vk::Extent2D { width: 64, height: 64 }, vk::Format::R8G8B8A8_UNORM)
     }
 
-    fn fake(id: u64, info: &ImageInfo) -> Image { Image::new(vk::Image::from_raw(id), info) }
+    fn fake(id: u64, info: &ImageInfo) -> Image {
+        Image::new(vk::Image::from_raw(id), info)
+    }
 
     #[test]
     fn identical_images_are_distinct_within_a_frame_and_reused_after_retirement() {
