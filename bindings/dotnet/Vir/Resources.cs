@@ -561,6 +561,35 @@ public readonly record struct ImageInfo
     internal uint Kind => (uint)this.kind;
 }
 
+public readonly record struct TransientImageInfo(
+    uint Width,
+    uint Height,
+    Format Format,
+    ImageUsage Usage = 0,
+    string Name = ""
+)
+{
+    public uint Depth { get; init; } = 1;
+
+    public uint MipLevels { get; init; } = 1;
+
+    public uint ArrayLayers { get; init; } = 1;
+
+    public SampleCount Samples { get; init; } = SampleCount.One;
+
+    public TransientImageInfo WithUsage(ImageUsage usage) => this with { Usage = this.Usage | usage };
+
+    public TransientImageInfo WithName(string name) => this with { Name = name };
+
+    public TransientImageInfo WithDepth(uint depth) => this with { Depth = depth };
+
+    public TransientImageInfo WithMips(uint mipLevels) => this with { MipLevels = mipLevels };
+
+    public TransientImageInfo WithLayers(uint arrayLayers) => this with { ArrayLayers = arrayLayers };
+
+    public TransientImageInfo WithSamples(SampleCount samples) => this with { Samples = samples };
+}
+
 public sealed unsafe class GpuBuffer
 {
     private nint handle;

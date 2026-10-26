@@ -43,6 +43,15 @@ public sealed unsafe class RenderGraph : IDisposable
         return new PipelineId(pipeline);
     }
 
+    public PipelineId DeclareComputePipeline(ReadOnlySpan<byte> spirv)
+    {
+        uint pipeline;
+        fixed (byte* ptr = spirv)
+            VirException.ThrowIfFailed(PInvoke.RenderGraphDeclareComputePipeline(this.Handle, ptr, (nuint)spirv.Length, &pipeline));
+
+        return new PipelineId(pipeline);
+    }
+
     public bool Execute(Context context, Program program, FrameAllocator frame)
     {
         var result = PInvoke.RenderGraphExecute(this.Handle, context.Handle, program.Handle, frame.Handle);

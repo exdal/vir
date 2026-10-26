@@ -49,6 +49,60 @@ pub struct VirSamplerInfo {
     pub address_mode_w: i32,
 }
 
+#[repr(C)]
+pub struct VirTransientImageInfo {
+    pub width: u32,
+    pub height: u32,
+    pub depth: u32,
+    pub format: i32,
+    pub usage: u32,
+    pub mip_levels: u32,
+    pub array_layers: u32,
+    pub samples: u32,
+    pub name: *const u8,
+    pub name_len: usize,
+}
+
+pub(crate) unsafe fn buffer_info(info: &VirBufferInfo) -> Result<BufferInfo, Failure> {
+    let location = match info.location {
+        0 => MemoryLocation::Unknown,
+        1 => MemoryLocation::GpuOnly,
+        2 => MemoryLocation::CpuToGpu,
+        3 => MemoryLocation::GpuToCpu,
+        location => return Err(Failure::new(format!("unknown memory location {location}"))),
+    };
+    let name = unsafe { text(info.name, info.name_len) }?;
+
+    Ok(
+        BufferInfo::new(info.size, vk::BufferUsageFlags::from_raw(info.usage), location)
+            .with_alignment(info.alignment.max(1))
+            .with_name(name),
+    )
+}
+
+pub(crate) unsafe fn transient_image_info(info: &VirTransientImageInfo) -> Result<ImageInfo, Failure> {
+    if info.mip_levels == 0 || info.array_layers == 0 || info.samples == 0 {
+        return Err(Failure::new("mip_levels, array_layers and samples must be at least 1"));
+    }
+
+    let name = unsafe { text(info.name, info.name_len) }?;
+
+    Ok(ImageInfo {
+        format: vk::Format::from_raw(info.format),
+        ..Default::default()
+    }
+    .with_extent3d(vk::Extent3D {
+        width: info.width,
+        height: info.height,
+        depth: info.depth,
+    })
+    .with_usage(vk::ImageUsageFlags::from_raw(info.usage))
+    .with_mips(info.mip_levels)
+    .with_layers(info.array_layers)
+    .with_samples(vk::SampleCountFlags::from_raw(info.samples))
+    .with_name(name))
+}
+
 fn persistent<'a>(a: *mut VirPersistentAllocator) -> Result<&'a mut vir::PersistentAllocator, Failure> {
     unsafe { a.as_mut() }
         .map(|allocator| &mut allocator.0)
@@ -63,20 +117,7 @@ pub unsafe extern "C" fn vir_persistent_allocator_allocate_buffer(
         let allocator = persistent(a)?;
         let info = unsafe { info.as_ref() }.ok_or_else(|| Failure::new("buffer info is null"))?;
         let out = out_ptr(out)?;
-        let location = match info.location {
-            0 => MemoryLocation::Unknown,
-            1 => MemoryLocation::GpuOnly,
-            2 => MemoryLocation::CpuToGpu,
-            3 => MemoryLocation::GpuToCpu,
-            location => return Err(Failure::new(format!("unknown memory location {location}"))),
-        };
-        let name = unsafe { text(info.name, info.name_len) }?;
-
-        let buffer = allocator.allocate_buffer(
-            &BufferInfo::new(info.size, vk::BufferUsageFlags::from_raw(info.usage), location)
-                .with_alignment(info.alignment.max(1))
-                .with_name(name),
-        )?;
+        let buffer = allocator.allocate_buffer(&unsafe { buffer_info(info) }?)?;
         *out = Box::into_raw(Box::new(VirBuffer(buffer)));
 
         Ok(())

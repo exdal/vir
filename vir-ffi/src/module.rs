@@ -1,14 +1,14 @@
 use std::ffi::c_void;
 
 use ash::{vk, vk::Handle};
-use vir::{Access, ClearValue, DomainFlag, ImageAttachment, Module, PipelineId, ValueId};
+use vir::{Access, ClearValue, DomainFlag, ImageAttachment, Module, PipelineId, SpecValue, ValueId};
 
 use crate::{
     context::out_ptr,
     error::{Failure, guard_id, guard_result, guard_void},
     graph::{VirRenderGraph, graph},
     program::VirProgram,
-    resource::{VirBuffer, VirImage},
+    resource::{VirBuffer, VirBufferInfo, VirImage, VirTransientImageInfo, buffer_info, transient_image_info},
     swapchain::VirSwapChain,
     types::{
         VirAttachment, VirDepthState, VirRasterizationState, VirRect2D, VirViewport, blend_preset, bytes,
@@ -363,5 +363,156 @@ pub unsafe extern "C" fn vir_module_compile_all(
         *out = Box::into_raw(Box::new(VirProgram(program)));
 
         Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_module_begin_compute(m: *mut VirModule, attachments: *const VirAttachment, count: usize) {
+    guard_void(|| {
+        let module = module(m)?;
+        let attachments = if count == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(attachments, count) }
+        };
+        module.begin_compute(attachments.iter().map(|&attachment| attachment.into()));
+        Ok(())
+    });
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_module_end_compute(m: *mut VirModule, out: *mut u32, count: usize) -> vk::Result {
+    guard_result(|| {
+        let module = module(m)?;
+        let mut ids = vec![ValueId::INVALID; count];
+        module.end_compute_into(&mut ids);
+        if count != 0 {
+            let out = unsafe { std::slice::from_raw_parts_mut(out, count) };
+            for (slot, id) in out.iter_mut().zip(&ids) {
+                *slot = id.0;
+            }
+        }
+
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_module_bind_compute_pipeline(m: *mut VirModule, pipeline: u32) {
+    guard_void(|| {
+        module(m)?.bind_compute_pipeline(PipelineId::from_raw(pipeline));
+        Ok(())
+    });
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_module_dispatch(m: *mut VirModule, x: u32, y: u32, z: u32) {
+    guard_void(|| {
+        module(m)?.dispatch(x, y, z);
+        Ok(())
+    });
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_module_dispatch_invocations(m: *mut VirModule, x: u32, y: u32, z: u32) {
+    guard_void(|| {
+        module(m)?.dispatch_invocations(x, y, z);
+        Ok(())
+    });
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_module_dispatch_invocations_per_pixel_scaled(
+    m: *mut VirModule, image: u32, scale_x: f32, scale_y: f32, scale_z: f32,
+) {
+    guard_void(|| {
+        module(m)?.dispatch_invocations_per_pixel_scaled(ValueId(image), [scale_x, scale_y, scale_z]);
+        Ok(())
+    });
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_module_dispatch_invocations_per_element_scaled(
+    m: *mut VirModule, buffer: u32, element_size: u64, scale: f32,
+) {
+    guard_void(|| {
+        module(m)?.dispatch_invocations_per_element_scaled(ValueId(buffer), element_size, scale);
+        Ok(())
+    });
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_module_dispatch_indirect_at(m: *mut VirModule, buffer: u32, offset: u64) {
+    guard_void(|| {
+        module(m)?.dispatch_indirect_at(ValueId(buffer), offset);
+        Ok(())
+    });
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_module_bind_image(m: *mut VirModule, set: u32, binding: u32, image: u32) {
+    guard_void(|| {
+        module(m)?.bind_image(set, binding, ValueId(image));
+        Ok(())
+    });
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_module_bind_buffer_range(
+    m: *mut VirModule, set: u32, binding: u32, buffer: u32, offset: u64, range: u64,
+) {
+    guard_void(|| {
+        module(m)?.bind_buffer_range(set, binding, ValueId(buffer), offset, range);
+        Ok(())
+    });
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_module_bind_sampler(m: *mut VirModule, set: u32, binding: u32, sampler: u64) {
+    guard_void(|| {
+        module(m)?.bind_sampler(set, binding, vk::Sampler::from_raw(sampler));
+        Ok(())
+    });
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_module_push_constant_address(m: *mut VirModule, offset: u32, buffer: u32) {
+    guard_void(|| {
+        module(m)?.push_constant_address(offset, ValueId(buffer));
+        Ok(())
+    });
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_module_specialize_constant(m: *mut VirModule, id: u32, kind: u32, bits: u64) {
+    guard_void(|| {
+        let value = match kind {
+            0 => SpecValue::Bool(bits != 0),
+            1 => SpecValue::U32(bits as u32),
+            2 => SpecValue::I32(bits as u32 as i32),
+            3 => SpecValue::F32(bits as u32),
+            4 => SpecValue::F64(bits),
+            kind => return Err(Failure::new(format!("unknown specialization constant kind {kind}"))),
+        };
+        module(m)?.specialize_constant(id, value);
+        Ok(())
+    });
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_module_transient_image(m: *mut VirModule, info: *const VirTransientImageInfo) -> u32 {
+    guard_id(|| {
+        let info = unsafe { info.as_ref() }.ok_or_else(|| Failure::new("image info is null"))?;
+        let info = unsafe { transient_image_info(info) }?;
+        Ok(module(m)?.transient_image(&info).0)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_module_transient_buffer(m: *mut VirModule, info: *const VirBufferInfo) -> u32 {
+    guard_id(|| {
+        let info = unsafe { info.as_ref() }.ok_or_else(|| Failure::new("buffer info is null"))?;
+        let info = unsafe { buffer_info(info) }?;
+        Ok(module(m)?.transient_buffer(&info).0)
     })
 }

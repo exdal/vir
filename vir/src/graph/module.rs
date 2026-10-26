@@ -2869,6 +2869,11 @@ impl Module {
         self.end_pass(PassKind::Compute, |pass| IR::EndCompute { pass })
     }
 
+    #[cfg(feature = "ffi")]
+    pub fn end_compute_into(&mut self, out: &mut [ValueId]) {
+        self.end_pass_into(PassKind::Compute, |pass| IR::EndCompute { pass }, out);
+    }
+
     fn end_pass<const N: usize>(&mut self, kind: PassKind, end: impl FnOnce(ValueId) -> IR) -> [ValueId; N] {
         let mut results = [ValueId::INVALID; N];
         self.end_pass_into(kind, end, &mut results);

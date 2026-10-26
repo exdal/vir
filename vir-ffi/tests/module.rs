@@ -355,3 +355,166 @@ fn program_set_bytes_with_wrong_size_is_an_error() {
         vir_module_destroy(module);
     }
 }
+
+fn transient_buffer(module: *mut VirModule) -> u32 {
+    let info = VirBufferInfo {
+        size: 256,
+        usage: vk::BufferUsageFlags::STORAGE_BUFFER.as_raw(),
+        location: 1,
+        alignment: 1,
+        name: ptr::null(),
+        name_len: 0,
+    };
+    unsafe { vir_module_transient_buffer(module, &info) }
+}
+
+unsafe fn begin_compute(module: *mut VirModule, values: &[u32]) {
+    let attachments = values
+        .iter()
+        .map(|&value| VirAttachment {
+            value,
+            access: Access::ComputeWrite.bits(),
+        })
+        .collect::<Vec<_>>();
+    unsafe { vir_module_begin_compute(module, attachments.as_ptr(), attachments.len()) };
+}
+
+#[test]
+fn records_a_compute_pass() {
+    unsafe {
+        let module = vir_module_create();
+        let target = image(module);
+        let buffer = transient_buffer(module);
+        assert_ne!(buffer, INVALID);
+
+        begin_compute(module, &[target, buffer]);
+        vir_module_bind_compute_pipeline(module, 0);
+        vir_module_bind_image(module, 0, 0, target);
+        vir_module_bind_buffer_range(module, 0, 1, buffer, 16, 64);
+        vir_module_bind_sampler(module, 0, 2, 0);
+        vir_module_push_constant_address(module, 0, buffer);
+        for (kind, bits) in [
+            (0, 1),
+            (1, 7),
+            (2, (-3i32) as u32 as u64),
+            (3, 1.5f32.to_bits() as u64),
+            (4, 2.5f64.to_bits()),
+        ] {
+            vir_module_specialize_constant(module, 0, kind, bits);
+            assert!(last_error().is_empty());
+        }
+
+        vir_module_dispatch_invocations_per_pixel_scaled(module, target, 1.0, 0.5, 1.0);
+        assert!(last_error().is_empty());
+
+        let mut out = [INVALID; 2];
+        assert_eq!(vir_module_end_compute(module, out.as_mut_ptr(), 2), vk::Result::SUCCESS);
+        assert_ne!(out[0], INVALID);
+        assert_ne!(out[1], INVALID);
+        assert_ne!(out[0], out[1]);
+
+        vir_module_destroy(module);
+    }
+}
+
+#[test]
+fn records_every_dispatch_form() {
+    unsafe {
+        let module = vir_module_create();
+        let buffer = transient_buffer(module);
+        begin_compute(module, &[buffer]);
+        vir_module_dispatch(module, 1, 2, 3);
+        vir_module_dispatch_invocations(module, 64, 64, 1);
+        vir_module_dispatch_invocations_per_element_scaled(module, buffer, 16, 1.0);
+        vir_module_dispatch_indirect_at(module, buffer, 0);
+        assert!(last_error().is_empty());
+
+        let mut out = [INVALID];
+        assert_eq!(vir_module_end_compute(module, out.as_mut_ptr(), 1), vk::Result::SUCCESS);
+
+        vir_module_destroy(module);
+    }
+}
+
+#[test]
+fn end_compute_with_wrong_count_is_an_error() {
+    unsafe {
+        let module = vir_module_create();
+        let target = image(module);
+        begin_compute(module, &[target]);
+
+        let mut out = [INVALID; 2];
+        assert_eq!(
+            vir_module_end_compute(module, out.as_mut_ptr(), 2),
+            vk::Result::ERROR_UNKNOWN
+        );
+        assert!(last_error().contains("declared 1 resources but its result expects 2"));
+
+        vir_module_destroy(module);
+    }
+}
+
+#[test]
+fn empty_begin_compute_is_an_error() {
+    unsafe {
+        let module = vir_module_create();
+        vir_module_begin_compute(module, ptr::null(), 0);
+        assert!(last_error().contains("at least one resource"));
+        vir_module_destroy(module);
+    }
+}
+
+#[test]
+fn end_compute_while_rendering_is_an_error() {
+    unsafe {
+        let module = vir_module_create();
+        let target = image(module);
+        begin_pass(module, target);
+
+        let mut out = [INVALID];
+        assert_eq!(
+            vir_module_end_compute(module, out.as_mut_ptr(), 1),
+            vk::Result::ERROR_UNKNOWN
+        );
+        assert!(!last_error().is_empty());
+
+        vir_module_destroy(module);
+    }
+}
+
+#[test]
+fn bad_compute_inputs_report_errors() {
+    unsafe {
+        let module = vir_module_create();
+        let target = image(module);
+        begin_compute(module, &[target]);
+
+        vir_module_specialize_constant(module, 0, 9, 0);
+        assert!(last_error().contains("specialization constant kind"));
+
+        let mut info = VirTransientImageInfo {
+            width: 8,
+            height: 8,
+            depth: 1,
+            format: vk::Format::R8G8B8A8_UNORM.as_raw(),
+            usage: vk::ImageUsageFlags::STORAGE.as_raw(),
+            mip_levels: 0,
+            array_layers: 1,
+            samples: 1,
+            name: ptr::null(),
+            name_len: 0,
+        };
+        assert_eq!(vir_module_transient_image(module, &info), INVALID);
+        assert!(last_error().contains("at least 1"));
+
+        info.mip_levels = 1;
+        assert_ne!(vir_module_transient_image(module, &info), INVALID);
+
+        assert_eq!(vir_module_transient_image(module, ptr::null()), INVALID);
+        assert!(last_error().contains("image info is null"));
+        assert_eq!(vir_module_transient_buffer(module, ptr::null()), INVALID);
+        assert!(last_error().contains("buffer info is null"));
+
+        vir_module_destroy(module);
+    }
+}

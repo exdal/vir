@@ -1,7 +1,7 @@
 use std::io::Cursor;
 
 use ash::vk;
-use vir::{AllocatorKind, GraphicsPipelineInfo, RenderGraph};
+use vir::{AllocatorKind, ComputePipelineInfo, GraphicsPipelineInfo, RenderGraph};
 
 use crate::{
     allocator::{VirFrameAllocator, VirPersistentAllocator},
@@ -55,6 +55,22 @@ pub unsafe extern "C" fn vir_render_graph_declare_graphics_pipeline(
         *out = graph
             .declare_pipeline(GraphicsPipelineInfo::new().with_shader(&vert).with_shader(&frag))?
             .raw();
+
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_render_graph_declare_compute_pipeline(
+    g: *mut VirRenderGraph, spirv: *const u8, spirv_len: usize, out: *mut u32,
+) -> vk::Result {
+    guard_result(|| {
+        let graph = graph(g)?;
+        let out = out_ptr(out)?;
+        let spirv = ash::util::read_spv(&mut Cursor::new(unsafe { bytes(spirv, spirv_len) }))
+            .map_err(|err| Failure::new(format!("invalid SPIR-V: {err}")))?;
+
+        *out = graph.declare_compute_pipeline(ComputePipelineInfo::new(&spirv))?.raw();
 
         Ok(())
     })

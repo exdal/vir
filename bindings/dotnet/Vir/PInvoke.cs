@@ -104,6 +104,21 @@ internal unsafe struct VirImageInfo
 }
 
 [StructLayout(LayoutKind.Sequential)]
+internal unsafe struct VirTransientImageInfo
+{
+    public uint Width;
+    public uint Height;
+    public uint Depth;
+    public int Format;
+    public uint Usage;
+    public uint MipLevels;
+    public uint ArrayLayers;
+    public uint Samples;
+    public byte* Name;
+    public nuint NameLength;
+}
+
+[StructLayout(LayoutKind.Sequential)]
 internal struct VirSamplerInfo
 {
     public int MagFilter;
@@ -136,6 +151,7 @@ internal static unsafe class NativeLayout
         && sizeof(VirDepthState) == 12
         && sizeof(VirBufferInfo) == 40
         && sizeof(VirImageInfo) == 48
+        && sizeof(VirTransientImageInfo) == 48
         && sizeof(VirSamplerInfo) == 24
         && sizeof(VirPassTiming) == 24;
 }
@@ -354,4 +370,52 @@ internal static unsafe partial class PInvoke
 
     [LibraryImport(Dll, EntryPoint = "vir_module_draw_indexed")]
     internal static partial void ModuleDrawIndexed(nint module, uint indexCount, uint instanceCount);
+
+    [LibraryImport(Dll, EntryPoint = "vir_render_graph_declare_compute_pipeline")]
+    internal static partial VkResult RenderGraphDeclareComputePipeline(nint graph, byte* spirv, nuint spirvLength, uint* pipeline);
+
+    [LibraryImport(Dll, EntryPoint = "vir_module_begin_compute")]
+    internal static partial void ModuleBeginCompute(nint module, VirAttachment* attachments, nuint count);
+
+    [LibraryImport(Dll, EntryPoint = "vir_module_end_compute")]
+    internal static partial VkResult ModuleEndCompute(nint module, uint* output, nuint count);
+
+    [LibraryImport(Dll, EntryPoint = "vir_module_bind_compute_pipeline")]
+    internal static partial void ModuleBindComputePipeline(nint module, uint pipeline);
+
+    [LibraryImport(Dll, EntryPoint = "vir_module_dispatch")]
+    internal static partial void ModuleDispatch(nint module, uint x, uint y, uint z);
+
+    [LibraryImport(Dll, EntryPoint = "vir_module_dispatch_invocations")]
+    internal static partial void ModuleDispatchInvocations(nint module, uint x, uint y, uint z);
+
+    [LibraryImport(Dll, EntryPoint = "vir_module_dispatch_invocations_per_pixel_scaled")]
+    internal static partial void ModuleDispatchInvocationsPerPixelScaled(nint module, uint image, float scaleX, float scaleY, float scaleZ);
+
+    [LibraryImport(Dll, EntryPoint = "vir_module_dispatch_invocations_per_element_scaled")]
+    internal static partial void ModuleDispatchInvocationsPerElementScaled(nint module, uint buffer, ulong elementSize, float scale);
+
+    [LibraryImport(Dll, EntryPoint = "vir_module_dispatch_indirect_at")]
+    internal static partial void ModuleDispatchIndirectAt(nint module, uint buffer, ulong offset);
+
+    [LibraryImport(Dll, EntryPoint = "vir_module_bind_image")]
+    internal static partial void ModuleBindImage(nint module, uint set, uint binding, uint image);
+
+    [LibraryImport(Dll, EntryPoint = "vir_module_bind_buffer_range")]
+    internal static partial void ModuleBindBufferRange(nint module, uint set, uint binding, uint buffer, ulong offset, ulong range);
+
+    [LibraryImport(Dll, EntryPoint = "vir_module_bind_sampler")]
+    internal static partial void ModuleBindSampler(nint module, uint set, uint binding, ulong sampler);
+
+    [LibraryImport(Dll, EntryPoint = "vir_module_push_constant_address")]
+    internal static partial void ModulePushConstantAddress(nint module, uint offset, uint buffer);
+
+    [LibraryImport(Dll, EntryPoint = "vir_module_specialize_constant")]
+    internal static partial void ModuleSpecializeConstant(nint module, uint id, uint kind, ulong bits);
+
+    [LibraryImport(Dll, EntryPoint = "vir_module_transient_image")]
+    internal static partial uint ModuleTransientImage(nint module, VirTransientImageInfo* info);
+
+    [LibraryImport(Dll, EntryPoint = "vir_module_transient_buffer")]
+    internal static partial uint ModuleTransientBuffer(nint module, VirBufferInfo* info);
 }

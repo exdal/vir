@@ -182,6 +182,164 @@ public sealed unsafe class Module : IDisposable
         (a, b, c, d) = (results[0], results[1], results[2], results[3]);
     }
 
+    public Module BeginCompute(params ReadOnlySpan<(ValueId, Access)> attachments)
+    {
+        var native = attachments.Length <= StackLimit
+            ? stackalloc VirAttachment[attachments.Length]
+            : new VirAttachment[attachments.Length];
+        for (var i = 0; i < attachments.Length; i++)
+            native[i] = new VirAttachment { Value = attachments[i].Item1.Raw, Access = (ulong)attachments[i].Item2 };
+
+        fixed (VirAttachment* ptr = native)
+            PInvoke.ModuleBeginCompute(this.Handle, ptr, (nuint)native.Length);
+
+        VirException.ThrowIfPending();
+        return this;
+    }
+
+    public Module BindComputePipeline(PipelineId pipeline)
+    {
+        PInvoke.ModuleBindComputePipeline(this.Handle, pipeline.Raw);
+        return this.Checked();
+    }
+
+    public Module Dispatch(uint x, uint y, uint z)
+    {
+        PInvoke.ModuleDispatch(this.Handle, x, y, z);
+        return this.Checked();
+    }
+
+    public Module DispatchInvocations(uint x, uint y, uint z)
+    {
+        PInvoke.ModuleDispatchInvocations(this.Handle, x, y, z);
+        return this.Checked();
+    }
+
+    public Module DispatchInvocationsPerPixel(ValueId image, float scaleX = 1, float scaleY = 1, float scaleZ = 1)
+    {
+        PInvoke.ModuleDispatchInvocationsPerPixelScaled(this.Handle, image.Raw, scaleX, scaleY, scaleZ);
+        return this.Checked();
+    }
+
+    public Module DispatchInvocationsPerElement(ValueId buffer, ulong elementSize, float scale = 1)
+    {
+        PInvoke.ModuleDispatchInvocationsPerElementScaled(this.Handle, buffer.Raw, elementSize, scale);
+        return this.Checked();
+    }
+
+    public Module DispatchIndirect(ValueId buffer, ulong offset = 0)
+    {
+        PInvoke.ModuleDispatchIndirectAt(this.Handle, buffer.Raw, offset);
+        return this.Checked();
+    }
+
+    public Module BindImage(uint set, uint binding, ValueId image)
+    {
+        PInvoke.ModuleBindImage(this.Handle, set, binding, image.Raw);
+        return this.Checked();
+    }
+
+    public Module BindBuffer(uint set, uint binding, ValueId buffer, ulong offset = 0, ulong range = ulong.MaxValue)
+    {
+        PInvoke.ModuleBindBufferRange(this.Handle, set, binding, buffer.Raw, offset, range);
+        return this.Checked();
+    }
+
+    public Module BindSampler(uint set, uint binding, Sampler sampler)
+    {
+        PInvoke.ModuleBindSampler(this.Handle, set, binding, sampler.Raw);
+        return this.Checked();
+    }
+
+    public Module PushConstantAddress(uint offset, ValueId buffer)
+    {
+        PInvoke.ModulePushConstantAddress(this.Handle, offset, buffer.Raw);
+        return this.Checked();
+    }
+
+    public Module SpecializeConstant(uint id, bool value) => this.SpecializeConstant(id, 0, value ? 1UL : 0UL);
+
+    public Module SpecializeConstant(uint id, uint value) => this.SpecializeConstant(id, 1, value);
+
+    public Module SpecializeConstant(uint id, int value) => this.SpecializeConstant(id, 2, (uint)value);
+
+    public Module SpecializeConstant(uint id, float value) => this.SpecializeConstant(id, 3, BitConverter.SingleToUInt32Bits(value));
+
+    public Module SpecializeConstant(uint id, double value) => this.SpecializeConstant(id, 4, BitConverter.DoubleToUInt64Bits(value));
+
+    private Module SpecializeConstant(uint id, uint kind, ulong bits)
+    {
+        PInvoke.ModuleSpecializeConstant(this.Handle, id, kind, bits);
+        return this.Checked();
+    }
+
+    public ValueId TransientImage(in TransientImageInfo info)
+    {
+        var name = Utf8Buffer.Encode(info.Name ?? "", stackalloc byte[StackLimit]);
+        fixed (byte* namePtr = name)
+        {
+            var native = new VirTransientImageInfo
+            {
+                Width = info.Width,
+                Height = info.Height,
+                Depth = info.Depth,
+                Format = (int)info.Format,
+                Usage = (uint)info.Usage,
+                MipLevels = info.MipLevels,
+                ArrayLayers = info.ArrayLayers,
+                Samples = (uint)info.Samples,
+                Name = namePtr,
+                NameLength = (nuint)name.Length,
+            };
+            return VirException.CheckId(PInvoke.ModuleTransientImage(this.Handle, &native));
+        }
+    }
+
+    public ValueId TransientBuffer(in BufferInfo info)
+    {
+        var name = Utf8Buffer.Encode(info.Name ?? "", stackalloc byte[StackLimit]);
+        fixed (byte* namePtr = name)
+        {
+            var native = new VirBufferInfo
+            {
+                Size = info.Size,
+                Usage = (uint)info.Usage,
+                Location = (uint)info.Location,
+                Alignment = info.Alignment,
+                Name = namePtr,
+                NameLength = (nuint)name.Length,
+            };
+            return VirException.CheckId(PInvoke.ModuleTransientBuffer(this.Handle, &native));
+        }
+    }
+
+    public void EndCompute(Span<ValueId> results)
+    {
+        fixed (ValueId* ptr = results)
+            VirException.ThrowIfFailed(PInvoke.ModuleEndCompute(this.Handle, (uint*)ptr, (nuint)results.Length));
+    }
+
+    public void EndCompute(out ValueId a)
+    {
+        Span<ValueId> results = stackalloc ValueId[1];
+        this.EndCompute(results);
+        a = results[0];
+    }
+
+    public void EndCompute(out ValueId a, out ValueId b)
+    {
+        Span<ValueId> results = stackalloc ValueId[2];
+        this.EndCompute(results);
+        (a, b) = (results[0], results[1]);
+    }
+
+    public void EndCompute(out ValueId a, out ValueId b, out ValueId c)
+    {
+        Span<ValueId> results = stackalloc ValueId[3];
+        this.EndCompute(results);
+        (a, b, c) = (results[0], results[1], results[2]);
+    }
+
     public ValueId SetCondition(ValueId condition, Func<Module, ValueId> then, Func<Module, ValueId> otherwise)
     {
         Span<ValueId> results = stackalloc ValueId[1];
