@@ -518,3 +518,201 @@ fn bad_compute_inputs_report_errors() {
         vir_module_destroy(module);
     }
 }
+
+#[test]
+fn records_every_graphics_draw_form() {
+    unsafe {
+        let module = vir_module_create();
+        let target = image(module);
+        let commands = transient_buffer(module);
+        let counts = transient_buffer(module);
+        let indices = transient_buffer(module);
+        assert_ne!(commands, INVALID);
+
+        begin_pass(module, target);
+        vir_module_bind_index_buffer_at(module, indices, 16, vk::IndexType::UINT16.as_raw());
+        vir_module_draw_range(module, 3, 2, 1, 4);
+        vir_module_draw_indexed_range(module, 6, 2, 3, -1, 4);
+        vir_module_draw_indirect_at(module, commands, 32, 4, 16);
+        vir_module_draw_indexed_indirect_at(module, commands, 32, 4, 20);
+        vir_module_draw_indirect_count_at(module, commands, 0, counts, 8, 16, 16);
+        vir_module_draw_indexed_indirect_count_at(module, commands, 0, counts, 8, 16, 20);
+
+        let mut out = [INVALID];
+        assert_eq!(
+            vir_module_end_rendering(module, out.as_mut_ptr(), 1),
+            vk::Result::SUCCESS
+        );
+        assert_ne!(out[0], INVALID);
+
+        vir_module_destroy(module);
+    }
+}
+
+#[test]
+fn copies_between_buffers() {
+    unsafe {
+        let module = vir_module_create();
+        let src = transient_buffer(module);
+        let dst = transient_buffer(module);
+
+        let regions = [
+            VirBufferCopy {
+                src_offset: 0,
+                dst_offset: 16,
+                size: 32,
+            },
+            VirBufferCopy {
+                src_offset: 64,
+                dst_offset: 0,
+                size: 8,
+            },
+        ];
+        assert_ne!(vir_module_copy_buffer(module, src, dst, regions.as_ptr(), 2), INVALID);
+        assert_eq!(vir_module_copy_buffer(module, src, dst, ptr::null(), 0), dst);
+        assert_eq!(vir_module_copy_buffer(module, src, dst, ptr::null(), 1), INVALID);
+        assert!(last_error().contains("array pointer is null"));
+
+        vir_module_destroy(module);
+    }
+}
+
+#[test]
+fn declares_buffer_and_u32_variables() {
+    unsafe {
+        let module = vir_module_create();
+        let buffer_name = "geometry";
+        let buffer = vir_module_declare_buffer_var(
+            module,
+            buffer_name.as_ptr(),
+            buffer_name.len(),
+            Access::ComputeRead.bits(),
+        );
+        assert_ne!(buffer, INVALID);
+
+        let count_name = "count";
+        let count = vir_module_declare_u32_var(module, count_name.as_ptr(), count_name.len(), 7);
+        assert_ne!(count, INVALID);
+        assert_ne!(count, buffer);
+
+        let invalid_utf8 = [0xffu8, 0xfe];
+        assert_eq!(vir_module_declare_u32_var(module, invalid_utf8.as_ptr(), 2, 0), INVALID);
+        assert!(last_error().contains("UTF-8"));
+
+        vir_module_destroy(module);
+    }
+}
+
+#[test]
+fn copies_buffer_to_image_regions() {
+    unsafe {
+        let module = vir_module_create();
+        let target = image(module);
+        let staging = transient_buffer(module);
+
+        let regions = [
+            VirBufferImageCopy {
+                buffer_offset: 0,
+                mip_level: 0,
+                offset_x: 0,
+                offset_y: 0,
+                offset_z: 0,
+                width: 64,
+                height: 32,
+                depth: 1,
+            },
+            VirBufferImageCopy {
+                buffer_offset: 8192,
+                mip_level: 1,
+                offset_x: 0,
+                offset_y: 0,
+                offset_z: 0,
+                width: 32,
+                height: 16,
+                depth: 1,
+            },
+        ];
+        assert_ne!(
+            vir_module_copy_buffer_to_image_region(module, staging, target, regions.as_ptr(), 2),
+            INVALID
+        );
+        assert_eq!(
+            vir_module_copy_buffer_to_image_region(module, staging, target, ptr::null(), 0),
+            target
+        );
+        assert_eq!(
+            vir_module_copy_buffer_to_image_region(module, staging, target, ptr::null(), 1),
+            INVALID
+        );
+        assert!(last_error().contains("array pointer is null"));
+
+        vir_module_destroy(module);
+    }
+}
+
+#[test]
+fn resource_queries_report_null_handles() {
+    unsafe {
+        assert_eq!(vir_buffer_device_address(ptr::null()), 0);
+        assert!(last_error().contains("buffer is null"));
+        assert_eq!(vir_buffer_size(ptr::null()), 0);
+        assert!(last_error().contains("buffer is null"));
+        assert_eq!(vir_image_view_handle(ptr::null()), 0);
+        assert!(last_error().contains("image is null"));
+        assert_eq!(vir_image_handle(ptr::null()), 0);
+        assert!(last_error().contains("image is null"));
+
+        let buffer = VirBuffer(vir::Buffer::default());
+        assert_eq!(vir_buffer_size(&buffer), 0);
+        assert_eq!(vir_buffer_device_address(&buffer), 0);
+    }
+}
+
+#[test]
+fn program_set_u32_and_buffer_check_the_variable_type() {
+    unsafe {
+        let module = vir_module_create();
+        let count_name = "count";
+        let count = vir_module_declare_u32_var(module, count_name.as_ptr(), count_name.len(), 0);
+        let buffer_name = "geometry";
+        let buffer_var = vir_module_declare_buffer_var(
+            module,
+            buffer_name.as_ptr(),
+            buffer_name.len(),
+            Access::ComputeRead.bits(),
+        );
+        let flag_name = "flag";
+        let flag = vir_module_declare_bool_var(module, flag_name.as_ptr(), flag_name.len(), false);
+        let target = image(module);
+        let present = vir_module_present(module, target);
+
+        let program = (*module).0.compile(&Unchecked, ValueId(present)).unwrap();
+        let program = Box::into_raw(Box::new(VirProgram(program)));
+        let buffer = VirBuffer(vir::Buffer::default());
+
+        assert_eq!(vir_program_set_u32(program, count, 5), vk::Result::SUCCESS);
+        assert_eq!(
+            vir_program_set_buffer(program, buffer_var, &buffer),
+            vk::Result::SUCCESS
+        );
+
+        assert_eq!(vir_program_set_u32(program, flag, 5), vk::Result::ERROR_UNKNOWN);
+        assert!(last_error().contains("holds"));
+        assert_eq!(vir_program_set_u32(program, 9999, 5), vk::Result::ERROR_UNKNOWN);
+        assert!(last_error().contains("not a variable"));
+
+        assert_eq!(
+            vir_program_set_buffer(program, count, &buffer),
+            vk::Result::ERROR_UNKNOWN
+        );
+        assert!(last_error().contains("holds"));
+        assert_eq!(
+            vir_program_set_buffer(program, buffer_var, ptr::null()),
+            vk::Result::ERROR_UNKNOWN
+        );
+        assert!(last_error().contains("buffer is null"));
+
+        vir_program_destroy(program);
+        vir_module_destroy(module);
+    }
+}

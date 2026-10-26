@@ -1,6 +1,6 @@
-use std::io::Cursor;
+use std::{io::Cursor, ptr};
 
-use ash::vk;
+use ash::{vk, vk::Handle};
 use vir::{AllocatorKind, ComputePipelineInfo, GraphicsPipelineInfo, RenderGraph};
 
 use crate::{
@@ -12,6 +12,19 @@ use crate::{
 };
 
 pub struct VirRenderGraph(pub RenderGraph);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VirBindlessSet {
+    pub index: u32,
+    pub layout: u64,
+    pub set: u64,
+}
+
+fn read_spirv(ptr: *const u8, len: usize) -> Result<Vec<u32>, Failure> {
+    ash::util::read_spv(&mut Cursor::new(unsafe { bytes(ptr, len) }))
+        .map_err(|err| Failure::new(format!("invalid SPIR-V: {err}")))
+}
 
 pub(crate) fn graph<'a>(g: *mut VirRenderGraph) -> Result<&'a mut RenderGraph, Failure> {
     unsafe { g.as_mut() }
@@ -43,18 +56,30 @@ pub unsafe extern "C" fn vir_render_graph_destroy(g: *mut VirRenderGraph) {
 pub unsafe extern "C" fn vir_render_graph_declare_graphics_pipeline(
     g: *mut VirRenderGraph, vert: *const u8, vert_len: usize, frag: *const u8, frag_len: usize, out: *mut u32,
 ) -> vk::Result {
+    unsafe { vir_render_graph_declare_graphics_pipeline_bindless(g, vert, vert_len, frag, frag_len, ptr::null(), out) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_render_graph_declare_graphics_pipeline_bindless(
+    g: *mut VirRenderGraph, vert: *const u8, vert_len: usize, frag: *const u8, frag_len: usize,
+    bindless: *const VirBindlessSet, out: *mut u32,
+) -> vk::Result {
     guard_result(|| {
         let graph = graph(g)?;
         let out = out_ptr(out)?;
-        let read = |blob: &[u8]| {
-            ash::util::read_spv(&mut Cursor::new(blob)).map_err(|err| Failure::new(format!("invalid SPIR-V: {err}")))
-        };
-        let vert = read(unsafe { bytes(vert, vert_len) })?;
-        let frag = read(unsafe { bytes(frag, frag_len) })?;
+        let vert = read_spirv(vert, vert_len)?;
+        let frag = read_spirv(frag, frag_len)?;
 
-        *out = graph
-            .declare_pipeline(GraphicsPipelineInfo::new().with_shader(&vert).with_shader(&frag))?
-            .raw();
+        let mut info = GraphicsPipelineInfo::new().with_shader(&vert).with_shader(&frag);
+        if let Some(set) = unsafe { bindless.as_ref() } {
+            info = info.with_bindless_set(
+                set.index,
+                vk::DescriptorSetLayout::from_raw(set.layout),
+                vk::DescriptorSet::from_raw(set.set),
+            );
+        }
+
+        *out = graph.declare_pipeline(info)?.raw();
 
         Ok(())
     })
@@ -64,13 +89,28 @@ pub unsafe extern "C" fn vir_render_graph_declare_graphics_pipeline(
 pub unsafe extern "C" fn vir_render_graph_declare_compute_pipeline(
     g: *mut VirRenderGraph, spirv: *const u8, spirv_len: usize, out: *mut u32,
 ) -> vk::Result {
+    unsafe { vir_render_graph_declare_compute_pipeline_bindless(g, spirv, spirv_len, ptr::null(), out) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_render_graph_declare_compute_pipeline_bindless(
+    g: *mut VirRenderGraph, spirv: *const u8, spirv_len: usize, bindless: *const VirBindlessSet, out: *mut u32,
+) -> vk::Result {
     guard_result(|| {
         let graph = graph(g)?;
         let out = out_ptr(out)?;
-        let spirv = ash::util::read_spv(&mut Cursor::new(unsafe { bytes(spirv, spirv_len) }))
-            .map_err(|err| Failure::new(format!("invalid SPIR-V: {err}")))?;
+        let spirv = read_spirv(spirv, spirv_len)?;
 
-        *out = graph.declare_compute_pipeline(ComputePipelineInfo::new(&spirv))?.raw();
+        let mut info = ComputePipelineInfo::new(&spirv);
+        if let Some(set) = unsafe { bindless.as_ref() } {
+            info = info.with_bindless_set(
+                set.index,
+                vk::DescriptorSetLayout::from_raw(set.layout),
+                vk::DescriptorSet::from_raw(set.set),
+            );
+        }
+
+        *out = graph.declare_compute_pipeline(info)?.raw();
 
         Ok(())
     })

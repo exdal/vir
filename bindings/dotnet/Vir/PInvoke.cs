@@ -119,6 +119,35 @@ internal unsafe struct VirTransientImageInfo
 }
 
 [StructLayout(LayoutKind.Sequential)]
+internal struct VirBindlessSet
+{
+    public uint Index;
+    public ulong Layout;
+    public ulong Set;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct VirBufferCopy
+{
+    public ulong SrcOffset;
+    public ulong DstOffset;
+    public ulong Size;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct VirBufferImageCopy
+{
+    public ulong BufferOffset;
+    public uint MipLevel;
+    public int OffsetX;
+    public int OffsetY;
+    public int OffsetZ;
+    public uint Width;
+    public uint Height;
+    public uint Depth;
+}
+
+[StructLayout(LayoutKind.Sequential)]
 internal struct VirSamplerInfo
 {
     public int MagFilter;
@@ -153,6 +182,9 @@ internal static unsafe class NativeLayout
         && sizeof(VirImageInfo) == 48
         && sizeof(VirTransientImageInfo) == 48
         && sizeof(VirSamplerInfo) == 24
+        && sizeof(VirBindlessSet) == 24
+        && sizeof(VirBufferCopy) == 24
+        && sizeof(VirBufferImageCopy) == 40
         && sizeof(VirPassTiming) == 24;
 }
 
@@ -418,4 +450,98 @@ internal static unsafe partial class PInvoke
 
     [LibraryImport(Dll, EntryPoint = "vir_module_transient_buffer")]
     internal static partial uint ModuleTransientBuffer(nint module, VirBufferInfo* info);
+
+    [LibraryImport(Dll, EntryPoint = "vir_render_graph_declare_graphics_pipeline_bindless")]
+    internal static partial VkResult RenderGraphDeclareGraphicsPipelineBindless(
+        nint graph,
+        byte* vertex,
+        nuint vertexLength,
+        byte* fragment,
+        nuint fragmentLength,
+        VirBindlessSet* bindless,
+        uint* pipeline
+    );
+
+    [LibraryImport(Dll, EntryPoint = "vir_render_graph_declare_compute_pipeline_bindless")]
+    internal static partial VkResult RenderGraphDeclareComputePipelineBindless(
+        nint graph,
+        byte* spirv,
+        nuint spirvLength,
+        VirBindlessSet* bindless,
+        uint* pipeline
+    );
+
+    [LibraryImport(Dll, EntryPoint = "vir_module_draw_range")]
+    internal static partial void ModuleDrawRange(nint module, uint vertexCount, uint instanceCount, uint firstVertex, uint firstInstance);
+
+    [LibraryImport(Dll, EntryPoint = "vir_module_draw_indexed_range")]
+    internal static partial void ModuleDrawIndexedRange(
+        nint module,
+        uint indexCount,
+        uint instanceCount,
+        uint firstIndex,
+        int vertexOffset,
+        uint firstInstance
+    );
+
+    [LibraryImport(Dll, EntryPoint = "vir_module_draw_indirect_at")]
+    internal static partial void ModuleDrawIndirectAt(nint module, uint buffer, ulong offset, uint drawCount, uint stride);
+
+    [LibraryImport(Dll, EntryPoint = "vir_module_draw_indexed_indirect_at")]
+    internal static partial void ModuleDrawIndexedIndirectAt(nint module, uint buffer, ulong offset, uint drawCount, uint stride);
+
+    [LibraryImport(Dll, EntryPoint = "vir_module_draw_indirect_count_at")]
+    internal static partial void ModuleDrawIndirectCountAt(
+        nint module,
+        uint buffer,
+        ulong offset,
+        uint countBuffer,
+        ulong countOffset,
+        uint maxDrawCount,
+        uint stride
+    );
+
+    [LibraryImport(Dll, EntryPoint = "vir_module_draw_indexed_indirect_count_at")]
+    internal static partial void ModuleDrawIndexedIndirectCountAt(
+        nint module,
+        uint buffer,
+        ulong offset,
+        uint countBuffer,
+        ulong countOffset,
+        uint maxDrawCount,
+        uint stride
+    );
+
+    [LibraryImport(Dll, EntryPoint = "vir_module_bind_index_buffer_at")]
+    internal static partial void ModuleBindIndexBufferAt(nint module, uint buffer, ulong offset, int indexType);
+
+    [LibraryImport(Dll, EntryPoint = "vir_module_copy_buffer")]
+    internal static partial uint ModuleCopyBuffer(nint module, uint src, uint dst, VirBufferCopy* regions, nuint count);
+
+    [LibraryImport(Dll, EntryPoint = "vir_module_copy_buffer_to_image_region")]
+    internal static partial uint ModuleCopyBufferToImageRegion(nint module, uint buffer, uint image, VirBufferImageCopy* regions, nuint count);
+
+    [LibraryImport(Dll, EntryPoint = "vir_module_declare_buffer_var")]
+    internal static partial uint ModuleDeclareBufferVar(nint module, byte* name, nuint nameLength, ulong access);
+
+    [LibraryImport(Dll, EntryPoint = "vir_module_declare_u32_var")]
+    internal static partial uint ModuleDeclareU32Var(nint module, byte* name, nuint nameLength, uint value);
+
+    [LibraryImport(Dll, EntryPoint = "vir_program_set_u32")]
+    internal static partial VkResult ProgramSetU32(nint program, uint variable, uint value);
+
+    [LibraryImport(Dll, EntryPoint = "vir_program_set_buffer")]
+    internal static partial VkResult ProgramSetBuffer(nint program, uint variable, nint buffer);
+
+    [LibraryImport(Dll, EntryPoint = "vir_buffer_device_address")]
+    internal static partial ulong BufferDeviceAddress(nint buffer);
+
+    [LibraryImport(Dll, EntryPoint = "vir_buffer_size")]
+    internal static partial ulong BufferSize(nint buffer);
+
+    [LibraryImport(Dll, EntryPoint = "vir_image_view_handle")]
+    internal static partial ulong ImageViewHandle(nint image);
+
+    [LibraryImport(Dll, EntryPoint = "vir_image_handle")]
+    internal static partial ulong ImageHandle(nint image);
 }

@@ -69,6 +69,10 @@ pub(crate) fn guard_id(f: impl FnOnce() -> Result<u32, Failure>) -> u32 {
     run(f).unwrap_or(u32::MAX)
 }
 
+pub(crate) fn guard_u64(f: impl FnOnce() -> Result<u64, Failure>) -> u64 {
+    run(f).unwrap_or(0)
+}
+
 pub(crate) fn guard_void(f: impl FnOnce() -> Result<(), Failure>) {
     let _ = run(f);
 }

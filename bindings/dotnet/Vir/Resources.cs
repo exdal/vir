@@ -590,6 +590,35 @@ public readonly record struct TransientImageInfo(
     public TransientImageInfo WithSamples(SampleCount samples) => this with { Samples = samples };
 }
 
+public readonly record struct BindlessSet(uint Index, ulong Layout, ulong Set)
+{
+    internal VirBindlessSet ToNative() =>
+        new()
+        {
+            Index = this.Index,
+            Layout = this.Layout,
+            Set = this.Set,
+        };
+}
+
+public readonly record struct BufferCopy(ulong SrcOffset, ulong DstOffset, ulong Size);
+
+public readonly record struct BufferImageCopy(
+    uint Width,
+    uint Height,
+    ulong BufferOffset = 0,
+    uint MipLevel = 0
+)
+{
+    public int OffsetX { get; init; }
+
+    public int OffsetY { get; init; }
+
+    public int OffsetZ { get; init; }
+
+    public uint Depth { get; init; } = 1;
+}
+
 public sealed unsafe class GpuBuffer
 {
     private nint handle;
@@ -597,6 +626,10 @@ public sealed unsafe class GpuBuffer
     internal GpuBuffer(nint handle) => this.handle = handle;
 
     internal nint Handle => this.handle != 0 ? this.handle : throw new ObjectDisposedException(nameof(GpuBuffer));
+
+    public ulong DeviceAddress => PInvoke.BufferDeviceAddress(this.Handle);
+
+    public ulong Size => PInvoke.BufferSize(this.Handle);
 
     internal nint Release()
     {
@@ -621,6 +654,10 @@ public sealed class GpuImage
     internal GpuImage(nint handle) => this.handle = handle;
 
     internal nint Handle => this.handle != 0 ? this.handle : throw new ObjectDisposedException(nameof(GpuImage));
+
+    public ulong ImageHandle => PInvoke.ImageHandle(this.Handle);
+
+    public ulong ViewHandle => PInvoke.ImageViewHandle(this.Handle);
 
     internal nint Release()
     {

@@ -132,3 +132,65 @@ impl From<VirDepthState> for vir::DepthState {
 pub unsafe extern "C" fn vir_access_image_layout(access: u64) -> i32 {
     vk::ImageLayout::from(Access::from_bits_retain(access)).as_raw()
 }
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VirBufferCopy {
+    pub src_offset: u64,
+    pub dst_offset: u64,
+    pub size: u64,
+}
+
+impl From<VirBufferCopy> for vir::BufferCopy {
+    fn from(copy: VirBufferCopy) -> Self {
+        Self {
+            src_offset: copy.src_offset,
+            dst_offset: copy.dst_offset,
+            size: copy.size,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VirBufferImageCopy {
+    pub buffer_offset: u64,
+    pub mip_level: u32,
+    pub offset_x: i32,
+    pub offset_y: i32,
+    pub offset_z: i32,
+    pub width: u32,
+    pub height: u32,
+    pub depth: u32,
+}
+
+impl From<VirBufferImageCopy> for vir::BufferImageCopy {
+    fn from(copy: VirBufferImageCopy) -> Self {
+        Self {
+            buffer_offset: copy.buffer_offset,
+            image_offset: vk::Offset3D {
+                x: copy.offset_x,
+                y: copy.offset_y,
+                z: copy.offset_z,
+            },
+            image_extent: vk::Extent3D {
+                width: copy.width,
+                height: copy.height,
+                depth: copy.depth,
+            },
+            mip_level: copy.mip_level,
+        }
+    }
+}
+
+pub(crate) unsafe fn slice<'a, T>(ptr: *const T, len: usize) -> Result<&'a [T], Failure> {
+    if len == 0 {
+        return Ok(&[]);
+    }
+
+    if ptr.is_null() {
+        return Err(Failure::new("array pointer is null"));
+    }
+
+    Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
+}

@@ -1,7 +1,7 @@
 use std::ffi::c_void;
 
 use ash::{vk, vk::Handle};
-use vir::{Access, ClearValue, DomainFlag, ImageAttachment, Module, PipelineId, SpecValue, ValueId};
+use vir::{Access, BufferCopy, ClearValue, DomainFlag, ImageAttachment, Module, PipelineId, SpecValue, ValueId};
 
 use crate::{
     context::out_ptr,
@@ -11,8 +11,8 @@ use crate::{
     resource::{VirBuffer, VirBufferInfo, VirImage, VirTransientImageInfo, buffer_info, transient_image_info},
     swapchain::VirSwapChain,
     types::{
-        VirAttachment, VirDepthState, VirRasterizationState, VirRect2D, VirViewport, blend_preset, bytes,
-        dynamic_state, text,
+        VirAttachment, VirBufferCopy, VirBufferImageCopy, VirDepthState, VirRasterizationState, VirRect2D, VirViewport,
+        blend_preset, bytes, dynamic_state, slice, text,
     },
 };
 
@@ -515,4 +515,135 @@ pub unsafe extern "C" fn vir_module_transient_buffer(m: *mut VirModule, info: *c
         let info = unsafe { buffer_info(info) }?;
         Ok(module(m)?.transient_buffer(&info).0)
     })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_module_declare_buffer_var(
+    m: *mut VirModule, name: *const u8, name_len: usize, access: u64,
+) -> u32 {
+    guard_id(|| {
+        let name = unsafe { text(name, name_len) }?;
+        Ok(module(m)?.declare_buffer_var(name, Access::from_bits_retain(access)).0)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_module_declare_u32_var(
+    m: *mut VirModule, name: *const u8, name_len: usize, default: u32,
+) -> u32 {
+    guard_id(|| {
+        let name = unsafe { text(name, name_len) }?;
+        Ok(module(m)?.declare_u32_var(name, default).0)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_module_copy_buffer(
+    m: *mut VirModule, src: u32, dst: u32, regions: *const VirBufferCopy, count: usize,
+) -> u32 {
+    guard_id(|| {
+        let regions = unsafe { slice(regions, count) }?
+            .iter()
+            .map(|&region| region.into())
+            .collect::<Vec<BufferCopy>>();
+        Ok(module(m)?.copy_buffer(ValueId(src), ValueId(dst), &regions).0)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_module_copy_buffer_to_image_region(
+    m: *mut VirModule, buffer: u32, image: u32, regions: *const VirBufferImageCopy, count: usize,
+) -> u32 {
+    guard_id(|| {
+        let regions = unsafe { slice(regions, count) }?;
+        let module = module(m)?;
+        let mut copied = ValueId(image);
+        for &region in regions {
+            copied = module.copy_buffer_to_image_region(ValueId(buffer), copied, region.into());
+        }
+
+        Ok(copied.0)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_module_draw_range(
+    m: *mut VirModule, vertex_count: u32, instance_count: u32, first_vertex: u32, first_instance: u32,
+) {
+    guard_void(|| {
+        module(m)?.draw_range(vertex_count, instance_count, first_vertex, first_instance);
+        Ok(())
+    });
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_module_draw_indexed_range(
+    m: *mut VirModule, index_count: u32, instance_count: u32, first_index: u32, vertex_offset: i32, first_instance: u32,
+) {
+    guard_void(|| {
+        module(m)?.draw_indexed_range(index_count, instance_count, first_index, vertex_offset, first_instance);
+        Ok(())
+    });
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_module_draw_indirect_at(
+    m: *mut VirModule, buffer: u32, offset: u64, draw_count: u32, stride: u32,
+) {
+    guard_void(|| {
+        module(m)?.draw_indirect_at(ValueId(buffer), offset, draw_count, stride);
+        Ok(())
+    });
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_module_draw_indexed_indirect_at(
+    m: *mut VirModule, buffer: u32, offset: u64, draw_count: u32, stride: u32,
+) {
+    guard_void(|| {
+        module(m)?.draw_indexed_indirect_at(ValueId(buffer), offset, draw_count, stride);
+        Ok(())
+    });
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_module_draw_indirect_count_at(
+    m: *mut VirModule, buffer: u32, offset: u64, count_buffer: u32, count_offset: u64, max_draw_count: u32, stride: u32,
+) {
+    guard_void(|| {
+        module(m)?.draw_indirect_count_at(
+            ValueId(buffer),
+            offset,
+            ValueId(count_buffer),
+            count_offset,
+            max_draw_count,
+            stride,
+        );
+        Ok(())
+    });
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_module_draw_indexed_indirect_count_at(
+    m: *mut VirModule, buffer: u32, offset: u64, count_buffer: u32, count_offset: u64, max_draw_count: u32, stride: u32,
+) {
+    guard_void(|| {
+        module(m)?.draw_indexed_indirect_count_at(
+            ValueId(buffer),
+            offset,
+            ValueId(count_buffer),
+            count_offset,
+            max_draw_count,
+            stride,
+        );
+        Ok(())
+    });
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_module_bind_index_buffer_at(m: *mut VirModule, buffer: u32, offset: u64, index_type: i32) {
+    guard_void(|| {
+        module(m)?.bind_index_buffer_at(ValueId(buffer), offset, vk::IndexType::from_raw(index_type));
+        Ok(())
+    });
 }

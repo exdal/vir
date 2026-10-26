@@ -4,7 +4,7 @@ use vir::{BufferInfo, Image, ImageInfo, MemoryLocation, SamplerInfo, allocator::
 use crate::{
     allocator::VirPersistentAllocator,
     context::out_ptr,
-    error::{Failure, guard_result, guard_void},
+    error::{Failure, guard_result, guard_u64, guard_void},
     types::{bytes, text},
 };
 
@@ -239,4 +239,36 @@ pub unsafe extern "C" fn vir_persistent_allocator_deallocate_sampler(a: *mut Vir
         persistent(a)?.deallocate_sampler(vk::Sampler::from_raw(sampler));
         Ok(())
     });
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_buffer_device_address(b: *const VirBuffer) -> u64 {
+    guard_u64(|| {
+        let buffer = unsafe { b.as_ref() }.ok_or_else(|| Failure::new("buffer is null"))?;
+        Ok(buffer.0.device_address())
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_buffer_size(b: *const VirBuffer) -> u64 {
+    guard_u64(|| {
+        let buffer = unsafe { b.as_ref() }.ok_or_else(|| Failure::new("buffer is null"))?;
+        Ok(buffer.0.size())
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_image_view_handle(img: *const VirImage) -> u64 {
+    guard_u64(|| {
+        let image = unsafe { img.as_ref() }.ok_or_else(|| Failure::new("image is null"))?;
+        Ok(image.view.as_raw())
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vir_image_handle(img: *const VirImage) -> u64 {
+    guard_u64(|| {
+        let image = unsafe { img.as_ref() }.ok_or_else(|| Failure::new("image is null"))?;
+        Ok(image.image.handle().as_raw())
+    })
 }

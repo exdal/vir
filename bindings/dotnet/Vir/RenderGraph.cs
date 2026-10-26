@@ -22,32 +22,56 @@ public sealed unsafe class RenderGraph : IDisposable
         this.handle = 0;
     }
 
-    public PipelineId DeclareGraphicsPipeline(ReadOnlySpan<byte> vertexSpirv, ReadOnlySpan<byte> fragmentSpirv)
+    public PipelineId DeclareGraphicsPipeline(
+        ReadOnlySpan<byte> vertexSpirv,
+        ReadOnlySpan<byte> fragmentSpirv,
+        BindlessSet? bindless = null
+    )
     {
         uint pipeline;
+        var native = bindless is { } set ? set.ToNative() : default;
+        var nativePtr = bindless.HasValue ? &native : null;
         fixed (byte* vertex = vertexSpirv)
         fixed (byte* fragment = fragmentSpirv)
         {
             VirException.ThrowIfFailed(
-                PInvoke.RenderGraphDeclareGraphicsPipeline(
-                    this.Handle,
-                    vertex,
-                    (nuint)vertexSpirv.Length,
-                    fragment,
-                    (nuint)fragmentSpirv.Length,
-                    &pipeline
-                )
+                nativePtr is null
+                    ? PInvoke.RenderGraphDeclareGraphicsPipeline(
+                        this.Handle,
+                        vertex,
+                        (nuint)vertexSpirv.Length,
+                        fragment,
+                        (nuint)fragmentSpirv.Length,
+                        &pipeline
+                    )
+                    : PInvoke.RenderGraphDeclareGraphicsPipelineBindless(
+                        this.Handle,
+                        vertex,
+                        (nuint)vertexSpirv.Length,
+                        fragment,
+                        (nuint)fragmentSpirv.Length,
+                        nativePtr,
+                        &pipeline
+                    )
             );
         }
 
         return new PipelineId(pipeline);
     }
 
-    public PipelineId DeclareComputePipeline(ReadOnlySpan<byte> spirv)
+    public PipelineId DeclareComputePipeline(ReadOnlySpan<byte> spirv, BindlessSet? bindless = null)
     {
         uint pipeline;
+        var native = bindless is { } set ? set.ToNative() : default;
+        var nativePtr = bindless.HasValue ? &native : null;
         fixed (byte* ptr = spirv)
-            VirException.ThrowIfFailed(PInvoke.RenderGraphDeclareComputePipeline(this.Handle, ptr, (nuint)spirv.Length, &pipeline));
+        {
+            VirException.ThrowIfFailed(
+                nativePtr is null
+                    ? PInvoke.RenderGraphDeclareComputePipeline(this.Handle, ptr, (nuint)spirv.Length, &pipeline)
+                    : PInvoke.RenderGraphDeclareComputePipelineBindless(this.Handle, ptr, (nuint)spirv.Length, nativePtr, &pipeline)
+            );
+        }
 
         return new PipelineId(pipeline);
     }

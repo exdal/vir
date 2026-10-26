@@ -20,6 +20,12 @@ public sealed unsafe class Program : IDisposable
     public void Set(ValueId variable, bool value) =>
         VirException.ThrowIfFailed(PInvoke.ProgramSetBool(this.Handle, variable.Raw, value ? (byte)1 : (byte)0));
 
+    public void Set(ValueId variable, uint value) =>
+        VirException.ThrowIfFailed(PInvoke.ProgramSetU32(this.Handle, variable.Raw, value));
+
+    public void Set(ValueId variable, GpuBuffer buffer) =>
+        VirException.ThrowIfFailed(PInvoke.ProgramSetBuffer(this.Handle, variable.Raw, buffer.Handle));
+
     public void SetBytes<T>(ValueId variable, in T value)
         where T : unmanaged
     {

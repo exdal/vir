@@ -57,6 +57,20 @@ public sealed unsafe class Module : IDisposable
     public ValueId DeclareBytesVar<T>(string name)
         where T : unmanaged => this.DeclareBytesVar(name, (uint)sizeof(T));
 
+    public ValueId DeclareBufferVar(string name, Access access)
+    {
+        var utf8 = Utf8Buffer.Encode(name, stackalloc byte[StackLimit]);
+        fixed (byte* ptr = utf8)
+            return VirException.CheckId(PInvoke.ModuleDeclareBufferVar(this.Handle, ptr, (nuint)utf8.Length, (ulong)access));
+    }
+
+    public ValueId DeclareU32Var(string name, uint value)
+    {
+        var utf8 = Utf8Buffer.Encode(name, stackalloc byte[StackLimit]);
+        fixed (byte* ptr = utf8)
+            return VirException.CheckId(PInvoke.ModuleDeclareU32Var(this.Handle, ptr, (nuint)utf8.Length, value));
+    }
+
     public ValueId Clear(ValueId attachment, ClearValue color) =>
         VirException.CheckId(PInvoke.ModuleClear(this.Handle, attachment.Raw, color.ToNative()));
 
@@ -488,6 +502,106 @@ public sealed unsafe class Module : IDisposable
         return this.Checked();
     }
 
+    public Module BindIndexBuffer(ValueId buffer, ulong offset, IndexType indexType)
+    {
+        PInvoke.ModuleBindIndexBufferAt(this.Handle, buffer.Raw, offset, (int)indexType);
+        return this.Checked();
+    }
+
+    public Module DrawRange(uint vertexCount, uint instanceCount, uint firstVertex = 0, uint firstInstance = 0)
+    {
+        PInvoke.ModuleDrawRange(this.Handle, vertexCount, instanceCount, firstVertex, firstInstance);
+        return this.Checked();
+    }
+
+    public Module DrawIndexedRange(
+        uint indexCount,
+        uint instanceCount,
+        uint firstIndex = 0,
+        int vertexOffset = 0,
+        uint firstInstance = 0
+    )
+    {
+        PInvoke.ModuleDrawIndexedRange(this.Handle, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
+        return this.Checked();
+    }
+
+    public Module DrawIndirect(ValueId buffer, uint drawCount, ulong offset = 0, uint stride = 16)
+    {
+        PInvoke.ModuleDrawIndirectAt(this.Handle, buffer.Raw, offset, drawCount, stride);
+        return this.Checked();
+    }
+
+    public Module DrawIndexedIndirect(ValueId buffer, uint drawCount, ulong offset = 0, uint stride = 20)
+    {
+        PInvoke.ModuleDrawIndexedIndirectAt(this.Handle, buffer.Raw, offset, drawCount, stride);
+        return this.Checked();
+    }
+
+    public Module DrawIndirectCount(
+        ValueId buffer,
+        ValueId countBuffer,
+        uint maxDrawCount,
+        ulong offset = 0,
+        ulong countOffset = 0,
+        uint stride = 16
+    )
+    {
+        PInvoke.ModuleDrawIndirectCountAt(this.Handle, buffer.Raw, offset, countBuffer.Raw, countOffset, maxDrawCount, stride);
+        return this.Checked();
+    }
+
+    public Module DrawIndexedIndirectCount(
+        ValueId buffer,
+        ValueId countBuffer,
+        uint maxDrawCount,
+        ulong offset = 0,
+        ulong countOffset = 0,
+        uint stride = 20
+    )
+    {
+        PInvoke.ModuleDrawIndexedIndirectCountAt(this.Handle, buffer.Raw, offset, countBuffer.Raw, countOffset, maxDrawCount, stride);
+        return this.Checked();
+    }
+
+    public ValueId CopyBuffer(ValueId src, ValueId dst, params ReadOnlySpan<BufferCopy> regions)
+    {
+        Span<VirBufferCopy> native = regions.Length <= StackLimit / sizeof(VirBufferCopy)
+            ? stackalloc VirBufferCopy[regions.Length]
+            : new VirBufferCopy[regions.Length];
+        for (var i = 0; i < regions.Length; i++)
+            native[i] = new VirBufferCopy
+            {
+                SrcOffset = regions[i].SrcOffset,
+                DstOffset = regions[i].DstOffset,
+                Size = regions[i].Size,
+            };
+
+        fixed (VirBufferCopy* ptr = native)
+            return VirException.CheckId(PInvoke.ModuleCopyBuffer(this.Handle, src.Raw, dst.Raw, ptr, (nuint)native.Length));
+    }
+
+    public ValueId CopyBufferToImage(ValueId buffer, ValueId image, params ReadOnlySpan<BufferImageCopy> regions)
+    {
+        var native = new VirBufferImageCopy[regions.Length];
+        for (var i = 0; i < regions.Length; i++)
+            native[i] = new VirBufferImageCopy
+            {
+                BufferOffset = regions[i].BufferOffset,
+                MipLevel = regions[i].MipLevel,
+                OffsetX = regions[i].OffsetX,
+                OffsetY = regions[i].OffsetY,
+                OffsetZ = regions[i].OffsetZ,
+                Width = regions[i].Width,
+                Height = regions[i].Height,
+                Depth = regions[i].Depth,
+            };
+
+        fixed (VirBufferImageCopy* ptr = native)
+            return VirException.CheckId(
+                PInvoke.ModuleCopyBufferToImageRegion(this.Handle, buffer.Raw, image.Raw, ptr, (nuint)native.Length)
+            );
+    }
     private sealed class ConditionState
     {
         public required Func<Module, ITuple> Then;
