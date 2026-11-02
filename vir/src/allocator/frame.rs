@@ -4,14 +4,15 @@ use ash::vk::{self, Handle};
 
 use super::{
     Allocator, MemoryAllocator,
-    buffer_pool::align_up,
+    buffer_pool::{align_up, grown_block_size},
     image_cache::FrameImageCache,
     persistent::{PersistentAllocator, allocation_alignment},
     timestamps::{PassTiming, TimestampPool},
 };
 use crate::{Buffer, BufferInfo, CommandBuffer, Context, DomainFlag, Image, ImageInfo, MemoryLocation, SamplerInfo};
 
-const FRAME_BLOCK_SIZE: u64 = 16 * 1024 * 1024;
+const MIN_FRAME_SEGMENT_SIZE: u64 = 256 * 1024;
+const MAX_FRAME_SEGMENT_SIZE: u64 = 16 * 1024 * 1024;
 const IDLE_FRAMES: usize = 16;
 
 #[derive(Debug)]
@@ -252,8 +253,15 @@ impl Allocator for FrameAllocator {
             }
         }
 
-        let size = align_up(info.size.max(FRAME_BLOCK_SIZE), FRAME_BLOCK_SIZE)
-            .ok_or(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)?;
+        let size = if info.size > MAX_FRAME_SEGMENT_SIZE {
+            align_up(info.size, MAX_FRAME_SEGMENT_SIZE).ok_or(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)?
+        } else {
+            let largest = self.buffer_segments.get(&key).map_or(0, |segments| {
+                segments.iter().map(|segment| segment.backing.size()).max().unwrap_or(0)
+            });
+
+            grown_block_size(largest, info.size, MIN_FRAME_SEGMENT_SIZE, MAX_FRAME_SEGMENT_SIZE)
+        };
         let backing = self.upstream.borrow_mut().allocate_buffer(&BufferInfo {
             size,
             usage: info.usage,

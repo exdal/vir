@@ -6,10 +6,15 @@ use gpu_allocator::{
     vulkan::{Allocation, AllocationCreateDesc, AllocationScheme},
 };
 
-use super::{Allocator, MemoryAllocator, buffer_pool::Ranges, map_allocation_error};
+use super::{
+    Allocator, MemoryAllocator,
+    buffer_pool::{Ranges, grown_block_size},
+    map_allocation_error,
+};
 use crate::{Buffer, BufferInfo, CommandBuffer, Image, ImageInfo, MemoryLocation, SamplerInfo};
 
-const BUFFER_BLOCK_SIZE: u64 = 64 * 1024 * 1024;
+const MIN_BUFFER_BLOCK_SIZE: u64 = 1024 * 1024;
+const MAX_BUFFER_BLOCK_SIZE: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, PartialEq, Eq)]
 struct HeapFallback {
@@ -381,7 +386,7 @@ impl Allocator for PersistentAllocator {
         }
         let alignment = allocation_alignment(info, &self.limits).ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
         let id = self.take_allocation_id()?;
-        if info.size >= BUFFER_BLOCK_SIZE {
+        if info.size >= MAX_BUFFER_BLOCK_SIZE {
             let raw = self.allocate_raw_buffer(info)?;
             let buffer = raw.slice(0, info.size, id).expect("dedicated buffer matches its size");
             self.buffer_allocations.insert(
@@ -409,14 +414,18 @@ impl Allocator for PersistentAllocator {
         let (backing, offset) = match existing {
             Some(pair) => pair,
             None => {
+                let largest = self.buffer_blocks.get(&key).map_or(0, |blocks| {
+                    blocks.iter().map(|block| block.buffer.size()).max().unwrap_or(0)
+                });
+                let block_size = grown_block_size(largest, info.size, MIN_BUFFER_BLOCK_SIZE, MAX_BUFFER_BLOCK_SIZE);
                 let raw = self.allocate_raw_buffer(&BufferInfo {
-                    size: BUFFER_BLOCK_SIZE,
+                    size: block_size,
                     usage: info.usage,
                     location: info.location,
                     alignment: 1,
                     name: format!("buffer pool {:?}", key),
                 })?;
-                let mut ranges = Ranges::new(BUFFER_BLOCK_SIZE);
+                let mut ranges = Ranges::new(block_size);
                 let offset = ranges
                     .allocate(info.size, alignment)
                     .expect("a sub-block allocation must fit an empty block");

@@ -70,9 +70,27 @@ pub(super) fn align_up(value: u64, alignment: u64) -> Option<u64> {
     value.checked_add((alignment - value % alignment) % alignment)
 }
 
+// this func works like libcxx vector growth method, basically double and give it to the next person
+pub(super) fn grown_block_size(largest: u64, size: u64, min: u64, max: u64) -> u64 {
+    largest
+        .saturating_mul(2)
+        .max(size.checked_next_power_of_two().unwrap_or(u64::MAX))
+        .clamp(min, max)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blocks_start_small_and_double_up_to_the_maximum() {
+        assert_eq!(grown_block_size(0, 4, 16, 256), 16);
+        assert_eq!(grown_block_size(0, 40, 16, 256), 64);
+        assert_eq!(grown_block_size(16, 4, 16, 256), 32);
+        assert_eq!(grown_block_size(32, 100, 16, 256), 128);
+        assert_eq!(grown_block_size(256, 4, 16, 256), 256);
+        assert_eq!(grown_block_size(0, 200, 16, 256), 256);
+    }
 
     #[test]
     fn ranges_align_do_not_overlap_and_coalesce() {
