@@ -2,7 +2,7 @@ use std::{cell::RefCell, ptr::NonNull, rc::Rc, sync::Arc};
 
 use ash::{ext, khr, vk};
 use gpu_allocator::{
-    AllocatorDebugSettings,
+    AllocationSizes, AllocatorDebugSettings,
     vulkan::{Allocator as GpuAllocator, AllocatorCreateDesc},
 };
 
@@ -15,6 +15,28 @@ pub use command_buffer::CommandBuffer;
 pub use command_queue::{CommandQueue, DomainFlag};
 
 use crate::{PersistentAllocator, SuperFrameAllocator, allocator::MemoryAllocator};
+
+const MIB: u64 = 1024 * 1024;
+const DEFAULT_DEVICE_MEMBLOCK_SIZE: u64 = 256 * MIB;
+const HOST_MEMBLOCK_SIZE: u64 = 64 * MIB;
+
+// gpu-allocator sizes blocks of every non-host-visible type with this, so the smallest heap holding one bounds it
+fn device_memblock_size(properties: &vk::PhysicalDeviceMemoryProperties) -> u64 {
+    let smallest_heap = properties.memory_types[..properties.memory_type_count as usize]
+        .iter()
+        .filter(|memory_type| {
+            !memory_type
+                .property_flags
+                .contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
+        })
+        .map(|memory_type| properties.memory_heaps[memory_type.heap_index as usize].size)
+        .min();
+
+    match smallest_heap {
+        Some(size) if size <= 1024 * MIB => size / 8,
+        _ => DEFAULT_DEVICE_MEMBLOCK_SIZE,
+    }
+}
 
 pub struct Context {
     device: Arc<ash::Device>,
@@ -60,6 +82,9 @@ impl Context {
                     }
                 });
 
+        let memory_properties = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+        let device_memblock = device_memblock_size(&memory_properties);
+
         // one memory allocator per device; every allocator handed out below shares it
         let memory = GpuAllocator::new(&AllocatorCreateDesc {
             instance: instance.clone(),
@@ -67,7 +92,8 @@ impl Context {
             physical_device,
             debug_settings: AllocatorDebugSettings::default(),
             buffer_device_address: true,
-            allocation_sizes: Default::default(),
+            allocation_sizes: AllocationSizes::new(device_memblock, HOST_MEMBLOCK_SIZE)
+                .with_max_device_memblock_size(device_memblock),
         })
         .map_err(crate::allocator::map_allocation_error)?;
 
@@ -149,6 +175,13 @@ impl Context {
         self.command_queues.push(queue);
     }
 
+    fn memory_properties(&self) -> vk::PhysicalDeviceMemoryProperties {
+        unsafe {
+            self.instance
+                .get_physical_device_memory_properties(self.physical_device)
+        }
+    }
+
     pub fn create_persistent_allocator(&self) -> PersistentAllocator {
         let limits = unsafe { self.instance.get_physical_device_properties(self.physical_device) }.limits;
         let queue_families = self.command_queues.iter().map(CommandQueue::family_index).collect();
@@ -156,6 +189,7 @@ impl Context {
             NonNull::from(self.device.as_ref()),
             self.memory.clone(),
             limits,
+            self.memory_properties(),
             queue_families,
         )
     }
@@ -167,8 +201,56 @@ impl Context {
             NonNull::from(self.device.as_ref()),
             self.memory.clone(),
             limits,
+            self.memory_properties(),
             queue_families,
             frame_count,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use vk::MemoryPropertyFlags as Flags;
+
+    const GIB: u64 = 1024 * MIB;
+
+    const DL: Flags = Flags::DEVICE_LOCAL;
+    const HV_HC: Flags = Flags::from_raw(Flags::HOST_VISIBLE.as_raw() | Flags::HOST_COHERENT.as_raw());
+    const DL_HV_HC: Flags = Flags::from_raw(DL.as_raw() | HV_HC.as_raw());
+
+    fn properties(heaps: &[u64], types: &[(Flags, u32)]) -> vk::PhysicalDeviceMemoryProperties {
+        let mut properties = vk::PhysicalDeviceMemoryProperties::default();
+        properties.memory_heap_count = heaps.len() as u32;
+        for (slot, &size) in properties.memory_heaps.iter_mut().zip(heaps) {
+            slot.size = size;
+        }
+
+        properties.memory_type_count = types.len() as u32;
+        for (slot, &(property_flags, heap_index)) in properties.memory_types.iter_mut().zip(types) {
+            slot.property_flags = property_flags;
+            slot.heap_index = heap_index;
+        }
+
+        properties
+    }
+
+    #[test]
+    fn small_device_heap_gets_small_blocks() {
+        let apu = properties(&[256 * MIB, 8 * GIB], &[(DL, 0), (DL_HV_HC, 0), (HV_HC, 1)]);
+        assert_eq!(device_memblock_size(&apu), 32 * MIB);
+    }
+
+    #[test]
+    fn device_local_system_heap_does_not_hide_the_small_heap() {
+        let apu = properties(&[256 * MIB, 8 * GIB], &[(DL, 0), (DL, 1), (DL_HV_HC, 1)]);
+        assert_eq!(device_memblock_size(&apu), 32 * MIB);
+    }
+
+    #[test]
+    fn large_device_heap_keeps_default_blocks() {
+        let discrete = properties(&[8 * GIB, 16 * GIB, 256 * MIB], &[(DL, 0), (HV_HC, 1), (DL_HV_HC, 2)]);
+        assert_eq!(device_memblock_size(&discrete), DEFAULT_DEVICE_MEMBLOCK_SIZE);
     }
 }

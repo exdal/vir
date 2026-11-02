@@ -292,13 +292,14 @@ pub struct SuperFrameAllocator {
 impl SuperFrameAllocator {
     pub fn new(
         device: NonNull<ash::Device>, memory: MemoryAllocator, limits: vk::PhysicalDeviceLimits,
-        queue_families: Vec<u32>, frames_in_flight: usize,
+        memory_properties: vk::PhysicalDeviceMemoryProperties, queue_families: Vec<u32>, frames_in_flight: usize,
     ) -> Self {
         assert!(frames_in_flight > 0, "a super-frame allocator needs at least one frame");
         let upstream = Rc::new(RefCell::new(PersistentAllocator::new(
             device,
             memory,
             limits,
+            memory_properties,
             queue_families,
         )));
         let frames = (0..frames_in_flight)
