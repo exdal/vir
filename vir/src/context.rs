@@ -221,8 +221,10 @@ mod tests {
     const DL_HV_HC: Flags = Flags::from_raw(DL.as_raw() | HV_HC.as_raw());
 
     fn properties(heaps: &[u64], types: &[(Flags, u32)]) -> vk::PhysicalDeviceMemoryProperties {
-        let mut properties = vk::PhysicalDeviceMemoryProperties::default();
-        properties.memory_heap_count = heaps.len() as u32;
+        let mut properties = vk::PhysicalDeviceMemoryProperties {
+            memory_heap_count: heaps.len() as u32,
+            ..Default::default()
+        };
         for (slot, &size) in properties.memory_heaps.iter_mut().zip(heaps) {
             slot.size = size;
         }
